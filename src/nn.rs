@@ -78,6 +78,28 @@ impl Linear {
         opt.step(&mut self.w, tape.grad(out.w).unwrap());
         opt.step(&mut self.b, tape.grad(out.b).unwrap());
     }
+
+    /// Flattens to raw floats for checkpointing - no headers or shape
+    /// metadata, since the same architecture code that saves also loads,
+    /// so shapes are already known statically rather than needing to be
+    /// self-described in the file.
+    pub fn to_flat(&self) -> Vec<f32> {
+        let mut out = self.w.data.clone();
+        out.extend_from_slice(&self.b.data);
+        out
+    }
+
+    /// Inverse of to_flat. `offset` is threaded through by the caller
+    /// (e.g. TransformerBlock::from_flat) so composite structs can just
+    /// concatenate calls to their children's from_flat in order.
+    pub fn from_flat(data: &[f32], offset: &mut usize, in_dim: usize, out_dim: usize) -> Self {
+        let w_len = in_dim * out_dim;
+        let w = NdArray::new(data[*offset..*offset + w_len].to_vec(), vec![in_dim, out_dim]);
+        *offset += w_len;
+        let b = NdArray::new(data[*offset..*offset + out_dim].to_vec(), vec![out_dim]);
+        *offset += out_dim;
+        Self { w, b }
+    }
 }
 
 pub struct EmbeddingOut {
@@ -119,6 +141,17 @@ impl Embedding {
 
     pub fn apply_grad(&mut self, tape: &Tape, out: &EmbeddingOut, opt: &Sgd) {
         opt.step(&mut self.table, tape.grad(out.table).unwrap());
+    }
+
+    pub fn to_flat(&self) -> Vec<f32> {
+        self.table.data.clone()
+    }
+
+    pub fn from_flat(data: &[f32], offset: &mut usize, vocab_size: usize, d_model: usize) -> Self {
+        let len = vocab_size * d_model;
+        let table = NdArray::new(data[*offset..*offset + len].to_vec(), vec![vocab_size, d_model]);
+        *offset += len;
+        Self { table }
     }
 }
 
@@ -185,6 +218,22 @@ impl LayerNorm {
     pub fn apply_grad(&mut self, tape: &Tape, out: &LayerNormOut, opt: &Sgd) {
         opt.step(&mut self.gamma, tape.grad(out.gamma).unwrap());
         opt.step(&mut self.beta, tape.grad(out.beta).unwrap());
+    }
+
+    pub fn to_flat(&self) -> Vec<f32> {
+        let mut out = self.gamma.data.clone();
+        out.extend_from_slice(&self.beta.data);
+        out
+    }
+
+    /// eps isn't serialized - it's always the same fixed constant `new`
+    /// sets, not something training ever changes.
+    pub fn from_flat(data: &[f32], offset: &mut usize, d_model: usize) -> Self {
+        let gamma = NdArray::new(data[*offset..*offset + d_model].to_vec(), vec![1, d_model]);
+        *offset += d_model;
+        let beta = NdArray::new(data[*offset..*offset + d_model].to_vec(), vec![1, d_model]);
+        *offset += d_model;
+        Self { gamma, beta, eps: 1e-5 }
     }
 }
 
@@ -317,6 +366,43 @@ impl TransformerBlock {
         self.ln2.apply_grad(tape, &out.ln2_out, opt);
         self.ffn1.apply_grad(tape, &out.ffn1_out, opt);
         self.ffn2.apply_grad(tape, &out.ffn2_out, opt);
+    }
+
+    /// Purely mechanical - concatenates each sub-component's own to_flat in
+    /// a fixed order. No special logic needed since every leaf here is
+    /// already a plain NdArray.
+    pub fn to_flat(&self) -> Vec<f32> {
+        let mut out = self.ln1.to_flat();
+        for l in &self.q_heads {
+            out.extend(l.to_flat());
+        }
+        for l in &self.k_heads {
+            out.extend(l.to_flat());
+        }
+        for l in &self.v_heads {
+            out.extend(l.to_flat());
+        }
+        out.extend(self.out_proj.to_flat());
+        out.extend(self.ln2.to_flat());
+        out.extend(self.ffn1.to_flat());
+        out.extend(self.ffn2.to_flat());
+        out
+    }
+
+    /// Same (d_model, n_heads, d_ff) arguments as `new` - shapes aren't
+    /// self-described in the file, so the caller must reconstruct with the
+    /// identical architecture that produced the checkpoint.
+    pub fn from_flat(data: &[f32], offset: &mut usize, d_model: usize, n_heads: usize, d_ff: usize) -> Self {
+        let d_k = d_model / n_heads;
+        let ln1 = LayerNorm::from_flat(data, offset, d_model);
+        let q_heads = (0..n_heads).map(|_| Linear::from_flat(data, offset, d_model, d_k)).collect();
+        let k_heads = (0..n_heads).map(|_| Linear::from_flat(data, offset, d_model, d_k)).collect();
+        let v_heads = (0..n_heads).map(|_| Linear::from_flat(data, offset, d_model, d_k)).collect();
+        let out_proj = Linear::from_flat(data, offset, d_model, d_model);
+        let ln2 = LayerNorm::from_flat(data, offset, d_model);
+        let ffn1 = Linear::from_flat(data, offset, d_model, d_ff);
+        let ffn2 = Linear::from_flat(data, offset, d_ff, d_model);
+        Self { n_heads, d_k, ln1, q_heads, k_heads, v_heads, out_proj, ln2, ffn1, ffn2 }
     }
 }
 
