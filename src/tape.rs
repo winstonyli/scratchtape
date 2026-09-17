@@ -52,6 +52,22 @@ impl Tape {
         Self { nodes: Vec::new() }
     }
 
+    /// Opt-in for perf-sensitive callers who know roughly how many nodes
+    /// their graph will have - avoids Vec reallocation as the arena grows.
+    /// Not the default for `new()`: a hardcoded capacity baked in for every
+    /// caller regardless of actual graph size would be an unearned guess
+    /// (a tiny XOR demo doesn't need the same hint as a full transformer
+    /// block), not a genuine optimization.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self { nodes: Vec::with_capacity(cap) }
+    }
+
+    /// Number of nodes currently in the arena - lets a caller measure a
+    /// real graph's size to inform a with_capacity hint, rather than guess.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub fn leaf(&mut self, value: NdArray) -> Var {
         self.nodes.push(Node { value, grad: None, op: OpKind::Leaf });
         Var { idx: self.nodes.len() - 1 }

@@ -18,9 +18,24 @@ fn bench_transformer_block_forward_backward(c: &mut Criterion) {
     let block = TransformerBlock::new(&mut rng, d_model, n_heads, d_ff);
     let x_data: Vec<f32> = (0..seq_len * d_model).map(|i| ((i as f32) * 0.37).sin() * 0.5).collect();
 
-    c.bench_function("transformer_block_forward_backward", |b| {
+    c.bench_function("transformer_block_forward_backward (Tape::new)", |b| {
         b.iter(|| {
             let mut tape = Tape::new();
+            let x = tape.leaf(NdArray::new(x_data.clone(), vec![seq_len, d_model]));
+            let out = block.forward(&mut tape, x);
+            let loss = tape.sum(out.y);
+            tape.backward(loss);
+        });
+    });
+
+    // 134 nodes measured for one block's forward pass (backward adds none,
+    // only processes existing ones) - 150 gives headroom without guessing.
+    // Same benchmark group as the Tape::new() variant above, run back to
+    // back under identical conditions - a direct A/B, not a comparison
+    // across separate invocations at different times.
+    c.bench_function("transformer_block_forward_backward (Tape::with_capacity)", |b| {
+        b.iter(|| {
+            let mut tape = Tape::with_capacity(150);
             let x = tape.leaf(NdArray::new(x_data.clone(), vec![seq_len, d_model]));
             let out = block.forward(&mut tape, x);
             let loss = tape.sum(out.y);
