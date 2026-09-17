@@ -20,6 +20,61 @@ fn sample_window(rng: &mut Rng, corpus: &[usize], seq_len: usize) -> (Vec<usize>
     (corpus[start..start + seq_len].to_vec(), corpus[start + 1..start + seq_len + 1].to_vec())
 }
 
+/// Plain Lloyd's k-means, post-hoc analysis only - deliberately not routed
+/// through NdArray/Tape, since there's no gradient anywhere in this: it
+/// operates on the trained embedding table AFTER training finishes, not
+/// during it. First step of the symbolic/KR&R boundary this project's
+/// design log has flagged since early on: a flat partition (which byte
+/// falls into which cluster) is the minimal honest representation of what
+/// k-means actually produces - not dressed up as a knowledge graph or
+/// ontology when the underlying analysis is just flat clustering.
+fn kmeans(points: &[Vec<f32>], k: usize, iterations: usize, rng: &mut Rng) -> Vec<usize> {
+    let n = points.len();
+    let dim = points[0].len();
+
+    let mut centroid_idxs: Vec<usize> = Vec::new();
+    while centroid_idxs.len() < k {
+        let idx = (rng.next_f32() * n as f32) as usize;
+        if !centroid_idxs.contains(&idx) {
+            centroid_idxs.push(idx);
+        }
+    }
+    let mut centroids: Vec<Vec<f32>> = centroid_idxs.iter().map(|&i| points[i].clone()).collect();
+    let mut assignments = vec![0usize; n];
+
+    for _ in 0..iterations {
+        for (i, p) in points.iter().enumerate() {
+            let mut best = 0;
+            let mut best_dist = f32::INFINITY;
+            for (c, centroid) in centroids.iter().enumerate() {
+                let dist: f32 = p.iter().zip(centroid.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = c;
+                }
+            }
+            assignments[i] = best;
+        }
+        for c in 0..k {
+            let members: Vec<&Vec<f32>> =
+                points.iter().zip(assignments.iter()).filter(|&(_, &a)| a == c).map(|(p, _)| p).collect();
+            if !members.is_empty() {
+                let mut mean = vec![0.0f32; dim];
+                for m in &members {
+                    for d in 0..dim {
+                        mean[d] += m[d];
+                    }
+                }
+                for v in mean.iter_mut() {
+                    *v /= members.len() as f32;
+                }
+                centroids[c] = mean;
+            }
+        }
+    }
+    assignments
+}
+
 const CORPUS: &str = "Shall I compare thee to a summer's day?\n\
 Thou art more lovely and more temperate.\n\
 Rough winds do shake the darling buds of May,\n\
@@ -177,4 +232,34 @@ fn main() {
     let seed = encode_bytes("Shall I");
     let generated = generate(&mut rng, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &seed, 80, seq_len, 0.8);
     println!("{}", decode_bytes(&generated));
+
+    // Symbolic/KR&R boundary layer, first step: cluster the trained
+    // embeddings of the bytes actually seen during training. Restricted to
+    // those bytes specifically - every other row in the 256-entry table
+    // never received a gradient (never appeared in any sampled window), so
+    // including them would just be clustering untrained noise alongside
+    // real structure.
+    let mut distinct_bytes: Vec<usize> = encoded.clone();
+    distinct_bytes.sort_unstable();
+    distinct_bytes.dedup();
+
+    let embedding_rows: Vec<Vec<f32>> =
+        distinct_bytes.iter().map(|&b| token_emb.table.data[b * d_model..b * d_model + d_model].to_vec()).collect();
+
+    let k = 5;
+    let assignments = kmeans(&embedding_rows, k, 50, &mut rng);
+
+    println!(
+        "\nk-means clusters (k={k}) over the {} bytes actually seen during training:",
+        distinct_bytes.len()
+    );
+    for c in 0..k {
+        let members: Vec<String> = distinct_bytes
+            .iter()
+            .zip(assignments.iter())
+            .filter(|&(_, &a)| a == c)
+            .map(|(&b, _)| format!("{:?}", (b as u8) as char))
+            .collect();
+        println!("  cluster {c}: {}", members.join(" "));
+    }
 }
