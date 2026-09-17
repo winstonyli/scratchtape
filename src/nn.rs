@@ -39,6 +39,7 @@ pub struct LinearOut {
     pub b: Var,
 }
 
+#[derive(Clone)]
 pub struct Linear {
     pub w: NdArray, // [in_dim, out_dim]
     pub b: NdArray, // [out_dim]
@@ -92,6 +93,7 @@ pub struct EmbeddingOut {
 /// In the library, not example-local like the tokenizer - both token and
 /// positional embeddings need this, clearing the "2+ consumers" bar before
 /// any code was written, same as Gather itself.
+#[derive(Clone)]
 pub struct Embedding {
     pub table: NdArray, // [vocab_size, d_model]
 }
@@ -137,6 +139,7 @@ pub struct LayerNormOut {
 /// normalizing is the already-broadcasting Div. The one new primitive
 /// this needed was a differentiable Sqrt (Tape only had NdArray::sqrt,
 /// built non-differentiable for Adam's use).
+#[derive(Clone)]
 pub struct LayerNorm {
     pub gamma: NdArray, // [1, d_model]
     pub beta: NdArray,  // [1, d_model]
@@ -228,6 +231,7 @@ pub struct TransformerBlockOut {
 /// Linear(d_model, d_k) for Q/K/V, same as every other Linear in this
 /// codebase. Kept inlined rather than factored into its own
 /// MultiHeadAttention struct - this block is currently its only consumer.
+#[derive(Clone)]
 pub struct TransformerBlock {
     n_heads: usize,
     d_k: usize,
