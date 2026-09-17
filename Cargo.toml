@@ -5,6 +5,13 @@ edition = "2024"
 
 [dependencies]
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "matmul"
+harness = false
+
 # Release optimizations + debug symbols kept in, so `samply record` gets
 # symbolized stacks instead of addresses. Build with `cargo build --profile profiling`.
 [profile.profiling]
