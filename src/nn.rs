@@ -16,6 +16,16 @@ impl Rng {
         self.0 ^= self.0 << 17;
         (self.0 as f64 / u64::MAX as f64) as f32
     }
+
+    /// Box-Muller: two independent uniforms -> one standard normal sample.
+    /// Simplest transform to get right from scratch (vs Marsaglia polar /
+    /// ziggurat) - not a hot path, so the discarded-sin-half inefficiency
+    /// doesn't matter. Guards u1 away from exactly 0 (ln(0) = -inf).
+    pub fn next_gaussian(&mut self) -> f32 {
+        let u1 = self.next_f32().max(1e-9);
+        let u2 = self.next_f32();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+    }
 }
 
 /// Output of a Linear layer's forward pass. Carries the leaf `Var`s
@@ -66,5 +76,25 @@ impl Linear {
     pub fn apply_grad(&mut self, tape: &Tape, out: &LinearOut, opt: &Sgd) {
         opt.step(&mut self.w, tape.grad(out.w).unwrap());
         opt.step(&mut self.b, tape.grad(out.b).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Statistical, not exact-match - next_gaussian is inherently stochastic.
+    /// Large sample size keeps this from being flaky: standard error of the
+    /// mean here is ~1/sqrt(20000) =~ 0.007, so a 0.05 tolerance is well clear
+    /// of normal sampling noise, not a hand-tuned threshold.
+    #[test]
+    fn next_gaussian_has_mean_zero_var_one() {
+        let mut rng = Rng::new(7);
+        let n = 20_000;
+        let samples: Vec<f32> = (0..n).map(|_| rng.next_gaussian()).collect();
+        let mean: f32 = samples.iter().sum::<f32>() / n as f32;
+        let var: f32 = samples.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32;
+        assert!(mean.abs() < 0.05, "mean {mean} too far from 0");
+        assert!((var - 1.0).abs() < 0.1, "variance {var} too far from 1");
     }
 }
