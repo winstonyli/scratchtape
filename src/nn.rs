@@ -21,11 +21,12 @@ impl Rng {
 /// Output of a Linear layer's forward pass. Carries the leaf `Var`s
 /// (not just the result `y`) because the training loop needs them to read
 /// gradients back off the tape and step the optimizer - no hidden state,
-/// same explicit style as the tape itself.
+/// same explicit style as the tape itself. w/b are pub - Adam's training
+/// loop needs them directly (bypasses apply_grad, which is Sgd-specific).
 pub struct LinearOut {
     pub y: Var,
-    w: Var,
-    b: Var,
+    pub w: Var,
+    pub b: Var,
 }
 
 pub struct Linear {

@@ -67,6 +67,17 @@ impl NdArray {
         Self::scalar(self.data.iter().sum())
     }
 
+    /// Elementwise sqrt. NaN on negative input (IEEE 754 passthrough, no
+    /// guard) - not reachable via Adam's use (v is an EMA of squares, always
+    /// >= 0, no cancellation possible), and adding a defensive check here
+    /// would just be validating an invariant that already holds upstream.
+    pub fn sqrt(&self) -> Self {
+        Self {
+            data: self.data.iter().map(|&x| x.sqrt()).collect(),
+            shape: self.shape.clone(),
+        }
+    }
+
     pub fn scale(&self, c: f32) -> Self {
         Self {
             data: self.data.iter().map(|&x| x * c).collect(),
@@ -191,5 +202,41 @@ impl NdArray {
         let a = self.broadcast_to(&shape);
         let b = other.broadcast_to(&shape);
         Self { data: a.data.iter().zip(b.data.iter()).map(|(x, y)| x * y).collect(), shape }
+    }
+
+    /// Broadcasting, same as add/sub/mul - reuses the same machinery rather
+    /// than being the one sibling op that behaves differently. +/-inf on
+    /// division by zero (IEEE 754 passthrough, no guard): Adam's `+ eps`
+    /// upstream is what prevents an exact zero denominator, not this op.
+    pub fn div(&self, other: &Self) -> Self {
+        let shape = Self::broadcast_shape(&self.shape, &other.shape);
+        let a = self.broadcast_to(&shape);
+        let b = other.broadcast_to(&shape);
+        Self { data: a.data.iter().zip(b.data.iter()).map(|(x, y)| x / y).collect(), shape }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqrt_is_elementwise() {
+        let a = NdArray::new(vec![4.0, 9.0, 0.0], vec![3]);
+        assert_eq!(a.sqrt().data, vec![2.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn div_broadcasts_like_mul() {
+        let a = NdArray::new(vec![2.0, 4.0, 6.0, 8.0], vec![2, 2]);
+        let b = NdArray::new(vec![2.0], vec![1]);
+        assert_eq!(a.div(&b).data, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn div_by_zero_is_inf_not_panic() {
+        let a = NdArray::new(vec![1.0], vec![1]);
+        let b = NdArray::new(vec![0.0], vec![1]);
+        assert!(a.div(&b).data[0].is_infinite());
     }
 }
