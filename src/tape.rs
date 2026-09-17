@@ -20,6 +20,10 @@ enum OpKind {
     Relu(usize),
     Sum(usize),
     Scale(usize, f32),
+    Transpose(usize),
+    Exp(usize),
+    SumLastAxis(usize),
+    Div(usize, usize),
 }
 
 struct Node {
@@ -93,6 +97,43 @@ impl Tape {
         self.push(val, OpKind::Scale(a.idx, c))
     }
 
+    /// Distinct from Tape::transpose only used inside MatMul's own backward
+    /// (that one operates on raw NdArray values, not a graph node). This is
+    /// a first-class differentiable op - needed so Kᵀ in attention's QKᵀ has
+    /// its own gradient path back to whatever produced K.
+    pub fn transpose(&mut self, a: Var) -> Var {
+        let val = self.nodes[a.idx].value.transpose();
+        self.push(val, OpKind::Transpose(a.idx))
+    }
+
+    pub fn exp(&mut self, a: Var) -> Var {
+        let val = self.nodes[a.idx].value.exp();
+        self.push(val, OpKind::Exp(a.idx))
+    }
+
+    pub fn sum_last_axis(&mut self, a: Var) -> Var {
+        let val = self.nodes[a.idx].value.sum_last_axis();
+        self.push(val, OpKind::SumLastAxis(a.idx))
+    }
+
+    /// Differentiable division - distinct from NdArray::div, which stays
+    /// non-differentiable/optimizer-only (Adam's parameter update runs
+    /// outside the graph entirely, doesn't need a gradient of its own).
+    pub fn div(&mut self, a: Var, b: Var) -> Var {
+        let val = self.nodes[a.idx].value.div(&self.nodes[b.idx].value);
+        self.push(val, OpKind::Div(a.idx, b.idx))
+    }
+
+    /// No max-subtraction stability trick (would need a differentiable
+    /// MaxLastAxis op that doesn't exist yet) - fine for small controlled
+    /// demo magnitudes, would need addressing before real unnormalized
+    /// logits at scale.
+    pub fn softmax(&mut self, a: Var) -> Var {
+        let e = self.exp(a);
+        let s = self.sum_last_axis(e);
+        self.div(e, s)
+    }
+
     /// A node's value may feed multiple downstream ops, so incoming gradient
     /// contributions must sum (multivariable chain rule), never overwrite.
     fn accumulate(&mut self, idx: usize, g: NdArray) {
@@ -154,6 +195,33 @@ impl Tape {
                 }
                 OpKind::Scale(a, c) => {
                     self.accumulate(a, grad.scale(c));
+                }
+                OpKind::Transpose(a) => {
+                    // Transpose is self-inverse: transposing the incoming
+                    // gradient back undoes the forward transpose exactly.
+                    self.accumulate(a, grad.transpose());
+                }
+                OpKind::Exp(a) => {
+                    // d(exp(x))/dx = exp(x) - which is this very node's own
+                    // forward value (node i IS y=exp(x)), not a's value.
+                    let out_val = self.nodes[i].value.clone();
+                    self.accumulate(a, grad.mul(&out_val));
+                }
+                OpKind::SumLastAxis(a) => {
+                    // d(sum)/dx_j = 1 for every summed element - grad
+                    // (shape [...,1]) broadcasts (copies) back across the
+                    // reduced axis via the existing broadcast machinery.
+                    let a_shape = self.nodes[a].value.shape.clone();
+                    self.accumulate(a, grad.broadcast_to(&a_shape));
+                }
+                OpKind::Div(a, b) => {
+                    let a_val = self.nodes[a].value.clone();
+                    let b_val = self.nodes[b].value.clone();
+                    // d(a/b)/da = 1/b
+                    self.accumulate(a, grad.div(&b_val));
+                    // d(a/b)/db = -a/b^2
+                    let b_sq = b_val.mul(&b_val);
+                    self.accumulate(b, grad.mul(&a_val).div(&b_sq).scale(-1.0));
                 }
             }
         }
@@ -224,6 +292,73 @@ mod tests {
                 (numerical - b_grad.data[i]).abs() < 1e-2,
                 "b grad[{i}] mismatch: numerical {numerical} vs analytical {}",
                 b_grad.data[i]
+            );
+        }
+    }
+
+    /// Same gold-standard check, exercising the full attention formula:
+    /// Transpose, MatMul, Scale, then Exp+SumLastAxis+Div (softmax) chained
+    /// together, then a final MatMul. Checks Q and K, which is where the
+    /// new ops (transpose into scores, softmax normalization) actually get
+    /// exercised - V's gradient is a plain MatMul backward, already covered
+    /// by the test above.
+    fn attention_loss(q_data: &[f32], k_data: &[f32], v_data: &[f32]) -> f32 {
+        let mut tape = Tape::new();
+        let q = tape.leaf(NdArray::new(q_data.to_vec(), vec![2, 3]));
+        let k = tape.leaf(NdArray::new(k_data.to_vec(), vec![2, 3]));
+        let v = tape.leaf(NdArray::new(v_data.to_vec(), vec![2, 3]));
+        let kt = tape.transpose(k);
+        let scores = tape.matmul(q, kt);
+        let scaled = tape.scale(scores, 1.0 / (3.0f32).sqrt());
+        let weights = tape.softmax(scaled);
+        let out = tape.matmul(weights, v);
+        let loss = tape.sum(out);
+        tape.value(loss).data[0]
+    }
+
+    #[test]
+    fn attention_backward_matches_finite_difference() {
+        let q0 = vec![0.5, -0.3, 0.2, 0.7, 0.1, -0.4];
+        let k0 = vec![0.2, 0.4, -0.1, -0.3, 0.6, 0.2];
+        let v0 = vec![1.0, 0.5, -0.5, 0.2, 0.3, -0.1];
+
+        let mut tape = Tape::new();
+        let q = tape.leaf(NdArray::new(q0.clone(), vec![2, 3]));
+        let k = tape.leaf(NdArray::new(k0.clone(), vec![2, 3]));
+        let v = tape.leaf(NdArray::new(v0.clone(), vec![2, 3]));
+        let kt = tape.transpose(k);
+        let scores = tape.matmul(q, kt);
+        let scaled = tape.scale(scores, 1.0 / (3.0f32).sqrt());
+        let weights = tape.softmax(scaled);
+        let out = tape.matmul(weights, v);
+        let loss = tape.sum(out);
+        tape.backward(loss);
+        let q_grad = tape.grad(q).unwrap().clone();
+        let k_grad = tape.grad(k).unwrap().clone();
+
+        let eps = 1e-3;
+        for i in 0..q0.len() {
+            let mut qp = q0.clone();
+            qp[i] += eps;
+            let mut qm = q0.clone();
+            qm[i] -= eps;
+            let numerical = (attention_loss(&qp, &k0, &v0) - attention_loss(&qm, &k0, &v0)) / (2.0 * eps);
+            assert!(
+                (numerical - q_grad.data[i]).abs() < 1e-2,
+                "q grad[{i}] mismatch: numerical {numerical} vs analytical {}",
+                q_grad.data[i]
+            );
+        }
+        for i in 0..k0.len() {
+            let mut kp = k0.clone();
+            kp[i] += eps;
+            let mut km = k0.clone();
+            km[i] -= eps;
+            let numerical = (attention_loss(&q0, &kp, &v0) - attention_loss(&q0, &km, &v0)) / (2.0 * eps);
+            assert!(
+                (numerical - k_grad.data[i]).abs() < 1e-2,
+                "k grad[{i}] mismatch: numerical {numerical} vs analytical {}",
+                k_grad.data[i]
             );
         }
     }

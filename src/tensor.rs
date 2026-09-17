@@ -67,6 +67,33 @@ impl NdArray {
         Self::scalar(self.data.iter().sum())
     }
 
+    pub fn exp(&self) -> Self {
+        Self {
+            data: self.data.iter().map(|&x| x.exp()).collect(),
+            shape: self.shape.clone(),
+        }
+    }
+
+    /// Sums along the last axis only, keeping it as size 1 (not dropped) -
+    /// so the result broadcasts back against the un-reduced tensor with the
+    /// existing broadcast_to machinery, no axis-insertion logic needed.
+    pub fn sum_last_axis(&self) -> Self {
+        let nd = self.shape.len();
+        assert!(nd >= 1, "sum_last_axis needs at least 1 dim");
+        let mut out_shape = self.shape.clone();
+        out_shape[nd - 1] = 1;
+        let mut out = vec![0.0f32; out_shape.iter().product()];
+        let total: usize = self.shape.iter().product();
+        for lin in 0..total {
+            let idx = unravel_index(lin, &self.shape);
+            let mut out_idx = idx;
+            out_idx[nd - 1] = 0;
+            let out_lin = ravel_index(&out_idx, &out_shape);
+            out[out_lin] += self.data[lin];
+        }
+        Self { data: out, shape: out_shape }
+    }
+
     /// Elementwise sqrt. NaN on negative input (IEEE 754 passthrough, no
     /// guard) - not reachable via Adam's use (v is an EMA of squares, always
     /// >= 0, no cancellation possible), and adding a defensive check here
