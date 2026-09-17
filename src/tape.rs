@@ -7,10 +7,14 @@ pub struct Var {
     idx: usize,
 }
 
-/// All fields are Copy (usize/f32) so OpKind itself derives Copy -
-/// lets `backward` read an op by value and release the borrow on `nodes[i]`
-/// before it needs a second, mutable borrow to accumulate into a parent.
-#[derive(Clone, Copy, Debug)]
+/// Every field used to be usize/f32 (Copy), letting `backward` read an op
+/// by value and release the borrow on `nodes[i]` before it needs a second,
+/// mutable borrow to accumulate into a parent. Concat is variadic (arity
+/// isn't known ahead of time, unlike every binary/unary op above it), so it
+/// needs a Vec - which breaks the Copy derive for the whole enum. `backward`
+/// now clones the op instead of copying it; same effect (borrow released
+/// before mutating), just one Vec clone instead of a bitwise copy.
+#[derive(Clone, Debug)]
 enum OpKind {
     Leaf,
     Add(usize, usize),
@@ -24,6 +28,7 @@ enum OpKind {
     Exp(usize),
     SumLastAxis(usize),
     Div(usize, usize),
+    Concat(Vec<usize>),
 }
 
 struct Node {
@@ -124,6 +129,17 @@ impl Tape {
         self.push(val, OpKind::Div(a.idx, b.idx))
     }
 
+    /// Concatenates along the last axis - e.g. recombining multi-head
+    /// attention's per-head outputs before a final output projection.
+    pub fn concat(&mut self, vars: &[Var]) -> Var {
+        let val = {
+            let values: Vec<&NdArray> = vars.iter().map(|v| &self.nodes[v.idx].value).collect();
+            NdArray::concat_last_axis(&values)
+        };
+        let parents: Vec<usize> = vars.iter().map(|v| v.idx).collect();
+        self.push(val, OpKind::Concat(parents))
+    }
+
     /// No max-subtraction stability trick (would need a differentiable
     /// MaxLastAxis op that doesn't exist yet) - fine for small controlled
     /// demo magnitudes, would need addressing before real unnormalized
@@ -158,7 +174,7 @@ impl Tape {
                 Some(g) => g.clone(),
                 None => continue, // node not on path from loss - no gradient to propagate
             };
-            let op = self.nodes[i].op;
+            let op = self.nodes[i].op.clone();
             match op {
                 OpKind::Leaf => {}
                 OpKind::Add(a, b) => {
@@ -222,6 +238,18 @@ impl Tape {
                     // d(a/b)/db = -a/b^2
                     let b_sq = b_val.mul(&b_val);
                     self.accumulate(b, grad.mul(&a_val).div(&b_sq).scale(-1.0));
+                }
+                OpKind::Concat(parents) => {
+                    // Concat doesn't mix values, just places them side by
+                    // side - so the incoming gradient just gets sliced back
+                    // into the same ranges, no cross-contamination between
+                    // parents. Simplest backward rule so far.
+                    let mut offset = 0usize;
+                    for p in parents {
+                        let width = *self.nodes[p].value.shape.last().unwrap();
+                        self.accumulate(p, grad.slice_last_axis(offset, width));
+                        offset += width;
+                    }
                 }
             }
         }
@@ -359,6 +387,69 @@ mod tests {
                 (numerical - k_grad.data[i]).abs() < 1e-2,
                 "k grad[{i}] mismatch: numerical {numerical} vs analytical {}",
                 k_grad.data[i]
+            );
+        }
+    }
+
+    /// Two independent "heads" (own matmul each), concatenated, then a
+    /// shared loss - checks Concat's backward correctly routes gradient
+    /// back to each head's own input without cross-contamination.
+    fn concat_loss(a_data: &[f32], b_data: &[f32], wa: &[f32], wb: &[f32]) -> f32 {
+        let mut tape = Tape::new();
+        let a = tape.leaf(NdArray::new(a_data.to_vec(), vec![2, 2]));
+        let b = tape.leaf(NdArray::new(b_data.to_vec(), vec![2, 2]));
+        let wa_v = tape.leaf(NdArray::new(wa.to_vec(), vec![2, 3]));
+        let wb_v = tape.leaf(NdArray::new(wb.to_vec(), vec![2, 3]));
+        let out_a = tape.matmul(a, wa_v);
+        let out_b = tape.matmul(b, wb_v);
+        let cat = tape.concat(&[out_a, out_b]);
+        let loss = tape.sum(cat);
+        tape.value(loss).data[0]
+    }
+
+    #[test]
+    fn concat_backward_matches_finite_difference() {
+        let a0 = vec![0.5, -0.3, 0.2, 0.7];
+        let b0 = vec![0.1, -0.2, 0.4, -0.5];
+        let wa = vec![0.2, 0.4, -0.1, -0.3, 0.6, 0.2];
+        let wb = vec![-0.4, 0.1, 0.3, 0.2, -0.2, 0.5];
+
+        let mut tape = Tape::new();
+        let a = tape.leaf(NdArray::new(a0.clone(), vec![2, 2]));
+        let b = tape.leaf(NdArray::new(b0.clone(), vec![2, 2]));
+        let wa_v = tape.leaf(NdArray::new(wa.clone(), vec![2, 3]));
+        let wb_v = tape.leaf(NdArray::new(wb.clone(), vec![2, 3]));
+        let out_a = tape.matmul(a, wa_v);
+        let out_b = tape.matmul(b, wb_v);
+        let cat = tape.concat(&[out_a, out_b]);
+        let loss = tape.sum(cat);
+        tape.backward(loss);
+        let a_grad = tape.grad(a).unwrap().clone();
+        let b_grad = tape.grad(b).unwrap().clone();
+
+        let eps = 1e-3;
+        for i in 0..a0.len() {
+            let mut ap = a0.clone();
+            ap[i] += eps;
+            let mut am = a0.clone();
+            am[i] -= eps;
+            let numerical = (concat_loss(&ap, &b0, &wa, &wb) - concat_loss(&am, &b0, &wa, &wb)) / (2.0 * eps);
+            assert!(
+                (numerical - a_grad.data[i]).abs() < 1e-2,
+                "a grad[{i}] mismatch: numerical {numerical} vs analytical {}",
+                a_grad.data[i]
+            );
+        }
+        for i in 0..b0.len() {
+            let mut bp = b0.clone();
+            bp[i] += eps;
+            let mut bm = b0.clone();
+            bm[i] -= eps;
+            let numerical = (concat_loss(&a0, &bp, &wa, &wb) - concat_loss(&a0, &bm, &wa, &wb)) / (2.0 * eps);
+            assert!(
+                (numerical - b_grad.data[i]).abs() < 1e-2,
+                "b grad[{i}] mismatch: numerical {numerical} vs analytical {}",
+                b_grad.data[i]
             );
         }
     }

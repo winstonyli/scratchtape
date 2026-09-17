@@ -94,6 +94,58 @@ impl NdArray {
         Self { data: out, shape: out_shape }
     }
 
+    /// Concatenates along the last axis only - all other dims must match.
+    /// Variadic (unlike add/mul/etc), which is why the corresponding tape op
+    /// can't keep OpKind::Copy (see tape.rs).
+    pub fn concat_last_axis(arrays: &[&NdArray]) -> Self {
+        assert!(!arrays.is_empty(), "concat_last_axis needs at least one array");
+        let nd = arrays[0].shape.len();
+        let mut out_shape = arrays[0].shape.clone();
+        let mut total_last = 0usize;
+        for a in arrays {
+            assert_eq!(a.shape.len(), nd, "concat_last_axis: rank mismatch");
+            for d in 0..nd - 1 {
+                assert_eq!(
+                    a.shape[d], arrays[0].shape[d],
+                    "concat_last_axis: shapes must match on all but the last axis"
+                );
+            }
+            total_last += a.shape[nd - 1];
+        }
+        out_shape[nd - 1] = total_last;
+        let mut out = vec![0.0f32; out_shape.iter().product()];
+        let mut offset = 0usize;
+        for a in arrays {
+            let total: usize = a.shape.iter().product();
+            for lin in 0..total {
+                let mut idx = unravel_index(lin, &a.shape);
+                idx[nd - 1] += offset;
+                let out_lin = ravel_index(&idx, &out_shape);
+                out[out_lin] = a.data[lin];
+            }
+            offset += a.shape[nd - 1];
+        }
+        Self { data: out, shape: out_shape }
+    }
+
+    /// Inverse of concat_last_axis for one piece - extracts a [start,
+    /// start+width) range along the last axis. Used by Concat's backward to
+    /// route each gradient slice back to the parent that produced it.
+    pub fn slice_last_axis(&self, start: usize, width: usize) -> Self {
+        let nd = self.shape.len();
+        let mut out_shape = self.shape.clone();
+        out_shape[nd - 1] = width;
+        let total_out: usize = out_shape.iter().product();
+        let mut out = vec![0.0f32; total_out];
+        for lin in 0..total_out {
+            let mut idx = unravel_index(lin, &out_shape);
+            idx[nd - 1] += start;
+            let src_lin = ravel_index(&idx, &self.shape);
+            out[lin] = self.data[src_lin];
+        }
+        Self { data: out, shape: out_shape }
+    }
+
     /// Elementwise sqrt. NaN on negative input (IEEE 754 passthrough, no
     /// guard) - not reachable via Adam's use (v is an EMA of squares, always
     /// >= 0, no cancellation possible), and adding a defensive check here
@@ -265,5 +317,16 @@ mod tests {
         let a = NdArray::new(vec![1.0], vec![1]);
         let b = NdArray::new(vec![0.0], vec![1]);
         assert!(a.div(&b).data[0].is_infinite());
+    }
+
+    #[test]
+    fn concat_then_slice_round_trips() {
+        let a = NdArray::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let b = NdArray::new(vec![5.0, 6.0], vec![2, 1]);
+        let cat = NdArray::concat_last_axis(&[&a, &b]);
+        assert_eq!(cat.shape, vec![2, 3]);
+        assert_eq!(cat.data, vec![1.0, 2.0, 5.0, 3.0, 4.0, 6.0]);
+        assert_eq!(cat.slice_last_axis(0, 2).data, a.data);
+        assert_eq!(cat.slice_last_axis(2, 1).data, b.data);
     }
 }
