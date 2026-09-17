@@ -1,0 +1,12 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+# Release optimizations + debug symbols kept in, so `samply record` gets
+# symbolized stacks instead of addresses. Build with `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = true
