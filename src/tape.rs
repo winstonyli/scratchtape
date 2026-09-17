@@ -29,6 +29,7 @@ enum OpKind {
     SumLastAxis(usize),
     Div(usize, usize),
     Concat(Vec<usize>),
+    Gather(usize, Vec<usize>),
 }
 
 struct Node {
@@ -138,6 +139,18 @@ impl Tape {
         };
         let parents: Vec<usize> = vars.iter().map(|v| v.idx).collect();
         self.push(val, OpKind::Concat(parents))
+    }
+
+    /// Row-selection by index (e.g. token/positional embedding lookup).
+    /// `indices` is plain data, not a Var - nobody differentiates with
+    /// respect to which row got looked up, only the table itself is
+    /// trainable. Deliberately added to the library rather than kept in an
+    /// example first: unlike ES/SSM/PC (genuine single-use explorations),
+    /// this has multiple known consumers from the start (token embedding,
+    /// positional embedding, cross-entropy's target-selection).
+    pub fn gather(&mut self, table: Var, indices: &[usize]) -> Var {
+        let val = self.nodes[table.idx].value.gather_rows(indices);
+        self.push(val, OpKind::Gather(table.idx, indices.to_vec()))
     }
 
     /// No max-subtraction stability trick (would need a differentiable
@@ -250,6 +263,14 @@ impl Tape {
                         self.accumulate(p, grad.slice_last_axis(offset, width));
                         offset += width;
                     }
+                }
+                OpKind::Gather(table, indices) => {
+                    // Scatter-add, not scatter-overwrite: a repeated index
+                    // (the same token looked up twice) must accumulate both
+                    // contributions into that table row, not have the
+                    // second lookup's gradient replace the first's.
+                    let table_rows = self.nodes[table].value.shape[0];
+                    self.accumulate(table, NdArray::scatter_add_rows(&indices, &grad, table_rows));
                 }
             }
         }
@@ -452,5 +473,58 @@ mod tests {
                 b_grad.data[i]
             );
         }
+    }
+
+    /// Deliberately uses a REPEATED index (2 looked up twice) - the one
+    /// scenario where a scatter-overwrite bug would silently produce a
+    /// wrong-but-plausible gradient instead of an obvious crash.
+    fn gather_loss(table_data: &[f32], indices: &[usize]) -> f32 {
+        let mut tape = Tape::new();
+        let table = tape.leaf(NdArray::new(table_data.to_vec(), vec![5, 3]));
+        let gathered = tape.gather(table, indices);
+        let sq = tape.mul(gathered, gathered);
+        let loss = tape.sum(sq);
+        tape.value(loss).data[0]
+    }
+
+    #[test]
+    fn gather_backward_matches_finite_difference_with_repeated_index() {
+        let table0: Vec<f32> = vec![
+            0.5, -0.3, 0.2, //
+            0.1, 0.4, -0.6, //
+            -0.2, 0.7, 0.3, //
+            0.9, -0.1, 0.5, //
+            -0.4, 0.2, 0.8,
+        ];
+        let indices = [2usize, 0, 2, 4];
+
+        let mut tape = Tape::new();
+        let table = tape.leaf(NdArray::new(table0.clone(), vec![5, 3]));
+        let gathered = tape.gather(table, &indices);
+        let sq = tape.mul(gathered, gathered);
+        let loss = tape.sum(sq);
+        tape.backward(loss);
+        let table_grad = tape.grad(table).unwrap().clone();
+
+        let eps = 1e-3;
+        for i in 0..table0.len() {
+            let mut tp = table0.clone();
+            tp[i] += eps;
+            let mut tm = table0.clone();
+            tm[i] -= eps;
+            let numerical = (gather_loss(&tp, &indices) - gather_loss(&tm, &indices)) / (2.0 * eps);
+            assert!(
+                (numerical - table_grad.data[i]).abs() < 1e-2,
+                "table grad[{i}] mismatch: numerical {numerical} vs analytical {}",
+                table_grad.data[i]
+            );
+        }
+        // Row 2 was looked up twice - its gradient must reflect BOTH uses
+        // (2x what a single lookup would produce), not just one.
+        assert!(
+            table_grad.data[6].abs() > 0.1 && table_grad.data[7].abs() > 0.1 && table_grad.data[8].abs() > 0.1,
+            "row 2's gradient looks like only one of its two lookups contributed: {:?}",
+            &table_grad.data[6..9]
+        );
     }
 }

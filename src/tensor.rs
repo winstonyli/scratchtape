@@ -146,6 +146,35 @@ impl NdArray {
         Self { data: out, shape: out_shape }
     }
 
+    /// Row-selection by index - e.g. looking up embedding vectors by token
+    /// id. `self` is the table (2D: [vocab_size, d_model]); each entry in
+    /// `indices` selects one row, producing output [indices.len(), d_model].
+    pub fn gather_rows(&self, indices: &[usize]) -> Self {
+        assert_eq!(self.shape.len(), 2, "gather_rows expects a 2D table, got {:?}", self.shape);
+        let d = self.shape[1];
+        let mut out = Vec::with_capacity(indices.len() * d);
+        for &idx in indices {
+            assert!(idx < self.shape[0], "gather_rows: index {idx} out of bounds for {} rows", self.shape[0]);
+            out.extend_from_slice(&self.data[idx * d..idx * d + d]);
+        }
+        Self { data: out, shape: vec![indices.len(), d] }
+    }
+
+    /// Inverse of gather_rows for backward: routes each row of `updates`
+    /// back to the table row it came from, ADDING rather than overwriting -
+    /// the same index can appear more than once in a lookup (a repeated
+    /// token), and both uses must accumulate into that row's gradient.
+    pub fn scatter_add_rows(indices: &[usize], updates: &NdArray, table_rows: usize) -> Self {
+        let d = updates.shape[1];
+        let mut out = vec![0.0f32; table_rows * d];
+        for (i, &idx) in indices.iter().enumerate() {
+            for c in 0..d {
+                out[idx * d + c] += updates.data[i * d + c];
+            }
+        }
+        Self { data: out, shape: vec![table_rows, d] }
+    }
+
     /// Elementwise sqrt. NaN on negative input (IEEE 754 passthrough, no
     /// guard) - not reachable via Adam's use (v is an EMA of squares, always
     /// >= 0, no cancellation possible), and adding a defensive check here
@@ -328,5 +357,18 @@ mod tests {
         assert_eq!(cat.data, vec![1.0, 2.0, 5.0, 3.0, 4.0, 6.0]);
         assert_eq!(cat.slice_last_axis(0, 2).data, a.data);
         assert_eq!(cat.slice_last_axis(2, 1).data, b.data);
+    }
+
+    #[test]
+    fn gather_then_scatter_add_accumulates_repeated_rows() {
+        let table = NdArray::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2]); // rows: [1,2] [3,4] [5,6]
+        let gathered = table.gather_rows(&[1, 0, 1]);
+        assert_eq!(gathered.shape, vec![3, 2]);
+        assert_eq!(gathered.data, vec![3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
+
+        let updates = NdArray::new(vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0], vec![3, 2]);
+        let scattered = NdArray::scatter_add_rows(&[1, 0, 1], &updates, 3);
+        // row 1 received two contributions (indices 0 and 2 both target it), row 0 one, row 2 none.
+        assert_eq!(scattered.data, vec![1.0, 1.0, 2.0, 2.0, 0.0, 0.0]);
     }
 }
