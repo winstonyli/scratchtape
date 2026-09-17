@@ -12,6 +12,10 @@ criterion = "0.5"
 name = "matmul"
 harness = false
 
+[[bench]]
+name = "transformer_block"
+harness = false
+
 # Release optimizations + debug symbols kept in, so `samply record` gets
 # symbolized stacks instead of addresses. Build with `cargo build --profile profiling`.
 [profile.profiling]
