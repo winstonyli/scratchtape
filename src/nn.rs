@@ -79,6 +79,71 @@ impl Linear {
     }
 }
 
+pub struct LayerNormOut {
+    pub y: Var,
+    pub gamma: Var,
+    pub beta: Var,
+}
+
+/// Normalizes across the last (feature) axis to mean 0, variance 1, then
+/// applies a learned per-feature scale/shift. Structurally like Linear (has
+/// persistent trainable state), not like Tape::softmax (a stateless, purely
+/// compositional function) - that's why this is a struct with its own
+/// forward/apply_grad, not a bare Tape method.
+///
+/// Composed almost entirely from existing ops - mean/variance are just
+/// SumLastAxis + Scale(1/d), centering is the already-broadcasting Sub,
+/// normalizing is the already-broadcasting Div. The one new primitive
+/// this needed was a differentiable Sqrt (Tape only had NdArray::sqrt,
+/// built non-differentiable for Adam's use).
+pub struct LayerNorm {
+    pub gamma: NdArray, // [1, d_model]
+    pub beta: NdArray,  // [1, d_model]
+    eps: f32,
+}
+
+impl LayerNorm {
+    /// gamma=1, beta=0 (identity transform beyond normalization) - not
+    /// randomized like Linear's He-init. Linear needed randomness to break
+    /// symmetry between hidden units; gamma/beta are a single row broadcast
+    /// identically over every position, so there's no symmetry-collapse
+    /// risk here to break.
+    pub fn new(d_model: usize) -> Self {
+        Self {
+            gamma: NdArray::new(vec![1.0; d_model], vec![1, d_model]),
+            beta: NdArray::new(vec![0.0; d_model], vec![1, d_model]),
+            eps: 1e-5,
+        }
+    }
+
+    pub fn forward(&self, tape: &mut Tape, x: Var) -> LayerNormOut {
+        let d = tape.value(x).shape[1] as f32;
+        let gamma = tape.leaf(self.gamma.clone());
+        let beta = tape.leaf(self.beta.clone());
+
+        let sum = tape.sum_last_axis(x);
+        let mean = tape.scale(sum, 1.0 / d);
+        let centered = tape.sub(x, mean);
+        let sq = tape.mul(centered, centered);
+        let sum_sq = tape.sum_last_axis(sq);
+        // Biased variance (divide by d, not d-1) - matches real LayerNorm
+        // implementations; Bessel's correction would be the wrong "fix" here.
+        let variance = tape.scale(sum_sq, 1.0 / d);
+        let eps_leaf = tape.leaf(NdArray::scalar(self.eps));
+        let variance_eps = tape.add(variance, eps_leaf);
+        let std_dev = tape.sqrt(variance_eps);
+        let normalized = tape.div(centered, std_dev);
+        let scaled = tape.mul(normalized, gamma);
+        let y = tape.add(scaled, beta);
+        LayerNormOut { y, gamma, beta }
+    }
+
+    pub fn apply_grad(&mut self, tape: &Tape, out: &LayerNormOut, opt: &Sgd) {
+        opt.step(&mut self.gamma, tape.grad(out.gamma).unwrap());
+        opt.step(&mut self.beta, tape.grad(out.beta).unwrap());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

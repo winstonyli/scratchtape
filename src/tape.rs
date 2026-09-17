@@ -30,6 +30,7 @@ enum OpKind {
     Div(usize, usize),
     Concat(Vec<usize>),
     Gather(usize, Vec<usize>),
+    Sqrt(usize),
 }
 
 struct Node {
@@ -153,6 +154,14 @@ impl Tape {
         self.push(val, OpKind::Gather(table.idx, indices.to_vec()))
     }
 
+    /// Differentiable sqrt - distinct from NdArray::sqrt, which stays
+    /// non-differentiable/optimizer-only (Adam's parameter update runs
+    /// outside the graph). Needed for layer norm's variance normalization.
+    pub fn sqrt(&mut self, a: Var) -> Var {
+        let val = self.nodes[a.idx].value.sqrt();
+        self.push(val, OpKind::Sqrt(a.idx))
+    }
+
     /// No max-subtraction stability trick (would need a differentiable
     /// MaxLastAxis op that doesn't exist yet) - fine for small controlled
     /// demo magnitudes, would need addressing before real unnormalized
@@ -271,6 +280,13 @@ impl Tape {
                     // second lookup's gradient replace the first's.
                     let table_rows = self.nodes[table].value.shape[0];
                     self.accumulate(table, NdArray::scatter_add_rows(&indices, &grad, table_rows));
+                }
+                OpKind::Sqrt(a) => {
+                    // d(sqrt(x))/dx = 1/(2*sqrt(x)) - and sqrt(x) is this
+                    // very node's own forward value, same self-referencing
+                    // trick as Exp's backward.
+                    let out_val = self.nodes[i].value.clone();
+                    self.accumulate(a, grad.div(&out_val).scale(0.5));
                 }
             }
         }
@@ -526,5 +542,103 @@ mod tests {
             "row 2's gradient looks like only one of its two lookups contributed: {:?}",
             &table_grad.data[6..9]
         );
+    }
+
+    /// Exercises the full layer-norm-shaped chain: SumLastAxis -> Scale ->
+    /// Sub -> Mul -> SumLastAxis -> Scale -> Add(eps) -> Sqrt -> Div ->
+    /// Mul(gamma) -> Add(beta). Checks x, gamma, and beta - Sqrt is the
+    /// only genuinely new op in this chain, everything else was already
+    /// covered by earlier tests, but this confirms they compose correctly.
+    fn layer_norm_loss(x_data: &[f32], gamma_data: &[f32], beta_data: &[f32]) -> f32 {
+        let mut tape = Tape::new();
+        let x = tape.leaf(NdArray::new(x_data.to_vec(), vec![2, 3]));
+        let gamma = tape.leaf(NdArray::new(gamma_data.to_vec(), vec![1, 3]));
+        let beta = tape.leaf(NdArray::new(beta_data.to_vec(), vec![1, 3]));
+        let d = 3.0f32;
+        let sum = tape.sum_last_axis(x);
+        let mean = tape.scale(sum, 1.0 / d);
+        let centered = tape.sub(x, mean);
+        let sq = tape.mul(centered, centered);
+        let sum_sq = tape.sum_last_axis(sq);
+        let variance = tape.scale(sum_sq, 1.0 / d);
+        let eps_leaf = tape.leaf(NdArray::scalar(1e-5));
+        let variance_eps = tape.add(variance, eps_leaf);
+        let std_dev = tape.sqrt(variance_eps);
+        let normalized = tape.div(centered, std_dev);
+        let scaled = tape.mul(normalized, gamma);
+        let y = tape.add(scaled, beta);
+        let loss = tape.sum(y);
+        tape.value(loss).data[0]
+    }
+
+    #[test]
+    fn layer_norm_backward_matches_finite_difference() {
+        let x0 = vec![0.5, -0.3, 1.2, 2.0, -1.0, 0.4];
+        let gamma0 = vec![1.2, 0.8, 1.5];
+        let beta0 = vec![0.1, -0.2, 0.05];
+
+        let mut tape = Tape::new();
+        let x = tape.leaf(NdArray::new(x0.clone(), vec![2, 3]));
+        let gamma = tape.leaf(NdArray::new(gamma0.clone(), vec![1, 3]));
+        let beta = tape.leaf(NdArray::new(beta0.clone(), vec![1, 3]));
+        let d = 3.0f32;
+        let sum = tape.sum_last_axis(x);
+        let mean = tape.scale(sum, 1.0 / d);
+        let centered = tape.sub(x, mean);
+        let sq = tape.mul(centered, centered);
+        let sum_sq = tape.sum_last_axis(sq);
+        let variance = tape.scale(sum_sq, 1.0 / d);
+        let eps_leaf = tape.leaf(NdArray::scalar(1e-5));
+        let variance_eps = tape.add(variance, eps_leaf);
+        let std_dev = tape.sqrt(variance_eps);
+        let normalized = tape.div(centered, std_dev);
+        let scaled = tape.mul(normalized, gamma);
+        let y = tape.add(scaled, beta);
+        let loss = tape.sum(y);
+        tape.backward(loss);
+        let x_grad = tape.grad(x).unwrap().clone();
+        let gamma_grad = tape.grad(gamma).unwrap().clone();
+        let beta_grad = tape.grad(beta).unwrap().clone();
+
+        let eps = 1e-3;
+        for i in 0..x0.len() {
+            let mut xp = x0.clone();
+            xp[i] += eps;
+            let mut xm = x0.clone();
+            xm[i] -= eps;
+            let numerical =
+                (layer_norm_loss(&xp, &gamma0, &beta0) - layer_norm_loss(&xm, &gamma0, &beta0)) / (2.0 * eps);
+            assert!(
+                (numerical - x_grad.data[i]).abs() < 1e-2,
+                "x grad[{i}] mismatch: numerical {numerical} vs analytical {}",
+                x_grad.data[i]
+            );
+        }
+        for i in 0..gamma0.len() {
+            let mut gp = gamma0.clone();
+            gp[i] += eps;
+            let mut gm = gamma0.clone();
+            gm[i] -= eps;
+            let numerical =
+                (layer_norm_loss(&x0, &gp, &beta0) - layer_norm_loss(&x0, &gm, &beta0)) / (2.0 * eps);
+            assert!(
+                (numerical - gamma_grad.data[i]).abs() < 1e-2,
+                "gamma grad[{i}] mismatch: numerical {numerical} vs analytical {}",
+                gamma_grad.data[i]
+            );
+        }
+        for i in 0..beta0.len() {
+            let mut bp = beta0.clone();
+            bp[i] += eps;
+            let mut bm = beta0.clone();
+            bm[i] -= eps;
+            let numerical =
+                (layer_norm_loss(&x0, &gamma0, &bp) - layer_norm_loss(&x0, &gamma0, &bm)) / (2.0 * eps);
+            assert!(
+                (numerical - beta_grad.data[i]).abs() < 1e-2,
+                "beta grad[{i}] mismatch: numerical {numerical} vs analytical {}",
+                beta_grad.data[i]
+            );
+        }
     }
 }
