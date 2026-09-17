@@ -203,6 +203,12 @@ fn causal_mask(seq_len: usize) -> NdArray {
 
 pub struct TransformerBlockOut {
     pub y: Var,
+    /// Per-head softmax attention weights - computed internally regardless,
+    /// exposed here since diagnostic access to attention patterns is a
+    /// broadly reusable capability, not unique to any one analysis. Not
+    /// used by apply_grad (no separate parameters of its own), only by
+    /// callers wanting to inspect what the block actually attended to.
+    pub head_weights: Vec<Var>,
     ln1_out: LayerNormOut,
     q_outs: Vec<LinearOut>,
     k_outs: Vec<LinearOut>,
@@ -264,6 +270,7 @@ impl TransformerBlock {
         let mut k_outs = Vec::with_capacity(self.n_heads);
         let mut v_outs = Vec::with_capacity(self.n_heads);
         let mut head_outputs = Vec::with_capacity(self.n_heads);
+        let mut head_weights = Vec::with_capacity(self.n_heads);
         for h in 0..self.n_heads {
             let q_out = self.q_heads[h].forward(tape, normed1);
             let k_out = self.k_heads[h].forward(tape, normed1);
@@ -275,6 +282,7 @@ impl TransformerBlock {
             let masked = tape.add(scaled, mask);
             let weights = tape.softmax(masked);
             head_outputs.push(tape.matmul(weights, v_out.y));
+            head_weights.push(weights);
 
             q_outs.push(q_out);
             k_outs.push(k_out);
@@ -291,7 +299,7 @@ impl TransformerBlock {
         let ffn2_out = self.ffn2.forward(tape, hidden);
         let y = tape.add(x1, ffn2_out.y); // residual
 
-        TransformerBlockOut { y, ln1_out, q_outs, k_outs, v_outs, out_proj_out, ln2_out, ffn1_out, ffn2_out }
+        TransformerBlockOut { y, head_weights, ln1_out, q_outs, k_outs, v_outs, out_proj_out, ln2_out, ffn1_out, ffn2_out }
     }
 
     pub fn apply_grad(&mut self, tape: &Tape, out: &TransformerBlockOut, opt: &Sgd) {

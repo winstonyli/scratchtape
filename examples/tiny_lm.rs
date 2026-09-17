@@ -1,6 +1,7 @@
 use engine::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
 use engine::optim::Sgd;
 use engine::tape::{Tape, Var};
+use std::collections::HashMap;
 
 /// Byte-level: fixed 256 vocab, token id = byte value. Duplicated from
 /// byte_tokenizer.rs rather than shared - each is a couple of lines,
@@ -261,5 +262,60 @@ fn main() {
             .map(|(&b, _)| format!("{:?}", (b as u8) as char))
             .collect();
         println!("  cluster {c}: {}", members.join(" "));
+    }
+
+    // Second, independent extraction from the same trained model - nodes
+    // are individual bytes, not the k-means clusters above, so this result
+    // doesn't compound whatever uncertainty is already in the clustering.
+    // Scope-limited to block 0, head 0 only (not all 2*4=8 combinations):
+    // different heads can attend to genuinely different things (as
+    // multihead_attention_recall.rs showed - one head blind, another
+    // sighted, on the identical query), so aggregating all heads together
+    // would blur together potentially incompatible behaviors. One
+    // representative head keeps this proportionate to an exploratory
+    // first pass; the rest is a named limitation, not a hidden one.
+    let byte_index: HashMap<usize, usize> = distinct_bytes.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let n_bytes = distinct_bytes.len();
+    let mut weight_sum = vec![0.0f32; n_bytes * n_bytes];
+    let mut weight_count = vec![0u32; n_bytes * n_bytes];
+
+    let window_count = encoded.len() - seq_len;
+    for start in 0..window_count {
+        let window = encoded[start..start + seq_len].to_vec();
+        let mut tape = Tape::new();
+        let (_, out) = forward(&mut tape, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &window);
+        let weights = tape.value(out.block_outs[0].head_weights[0]);
+        for qi in 0..seq_len {
+            let qi_idx = byte_index[&window[qi]];
+            for ki in 0..seq_len {
+                let ki_idx = byte_index[&window[ki]];
+                weight_sum[qi_idx * n_bytes + ki_idx] += weights.data[qi * seq_len + ki];
+                weight_count[qi_idx * n_bytes + ki_idx] += 1;
+            }
+        }
+    }
+
+    // Discretize into top-2 edges per byte - this is the actual
+    // implicit-to-explicit crossing; the raw weighted matrix above is
+    // still just a numeric summary, not yet a symbolic artifact.
+    println!("\nattention-derived relational graph (block 0, head 0), top-2 targets per byte:");
+    for (i, &b) in distinct_bytes.iter().enumerate() {
+        let mut targets: Vec<(usize, f32)> = (0..n_bytes)
+            .filter_map(|j| {
+                let c = weight_count[i * n_bytes + j];
+                if c == 0 {
+                    None
+                } else {
+                    Some((j, weight_sum[i * n_bytes + j] / c as f32))
+                }
+            })
+            .collect();
+        targets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let top: Vec<String> = targets
+            .iter()
+            .take(2)
+            .map(|&(j, w)| format!("{:?}({:.2})", (distinct_bytes[j] as u8) as char, w))
+            .collect();
+        println!("  {:?} -> {}", (b as u8) as char, top.join(", "));
     }
 }
