@@ -94,6 +94,32 @@ impl NdArray {
         Self { data: out, shape: out_shape }
     }
 
+    /// Max along the last axis only, keeping it as size 1 (mirrors
+    /// sum_last_axis exactly - same structure, tracks max instead of sum).
+    /// Deliberately non-differentiable, not a Tape op: softmax is
+    /// shift-invariant (softmax(x) = softmax(x - c) for any per-row
+    /// constant c), so the gradient contribution that would flow back
+    /// through this term's own dependence on the input is provably exactly
+    /// zero - not an approximation. Treating it as a detached constant
+    /// (a leaf, in Tape::softmax) gives the exact correct gradient with no
+    /// argmax-routing backward rule needed at all.
+    pub fn max_last_axis(&self) -> Self {
+        let nd = self.shape.len();
+        assert!(nd >= 1, "max_last_axis needs at least 1 dim");
+        let mut out_shape = self.shape.clone();
+        out_shape[nd - 1] = 1;
+        let mut out = vec![f32::NEG_INFINITY; out_shape.iter().product()];
+        let total: usize = self.shape.iter().product();
+        for lin in 0..total {
+            let idx = unravel_index(lin, &self.shape);
+            let mut out_idx = idx;
+            out_idx[nd - 1] = 0;
+            let out_lin = ravel_index(&out_idx, &out_shape);
+            out[out_lin] = out[out_lin].max(self.data[lin]);
+        }
+        Self { data: out, shape: out_shape }
+    }
+
     /// Concatenates along the last axis only - all other dims must match.
     /// Variadic (unlike add/mul/etc), which is why the corresponding tape op
     /// can't keep OpKind::Copy (see tape.rs).

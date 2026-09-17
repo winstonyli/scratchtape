@@ -163,12 +163,22 @@ impl Tape {
         self.push(val, OpKind::Sqrt(a.idx))
     }
 
-    /// No max-subtraction stability trick (would need a differentiable
-    /// MaxLastAxis op that doesn't exist yet) - fine for small controlled
-    /// demo magnitudes, would need addressing before real unnormalized
-    /// logits at scale.
+    /// Max-subtraction stability trick, forced by concrete evidence (an
+    /// unregularized training run's logits grew until exp() overflowed,
+    /// producing NaN that corrupted the whole model) rather than built
+    /// speculatively. The max is a detached constant (a leaf), not routed
+    /// through a differentiable MaxLastAxis op - softmax is shift-invariant
+    /// (softmax(x) = softmax(x-c) for any per-row c), so the gradient
+    /// contribution that would flow through the max's own dependence on the
+    /// input is provably exactly zero. This fixes overflow (exp of a large
+    /// positive logit) specifically - it does NOT fix underflow (a
+    /// legitimately tiny probability rounding to exact 0.0), which is a
+    /// separate failure mode cross_entropy's epsilon guard still handles.
     pub fn softmax(&mut self, a: Var) -> Var {
-        let e = self.exp(a);
+        let max_val = self.nodes[a.idx].value.max_last_axis();
+        let max_leaf = self.leaf(max_val);
+        let shifted = self.sub(a, max_leaf);
+        let e = self.exp(shifted);
         let s = self.sum_last_axis(e);
         self.div(e, s)
     }
@@ -183,11 +193,15 @@ impl Tape {
     /// a forced-uniform distribution. Side benefit: also slightly more
     /// robust than plain softmax against the all-very-negative-logits case
     /// - the +1 floors the denominator at 1, so it can't collapse toward
-    /// zero the way plain softmax's denominator can. Does NOT address
-    /// overflow from large positive logits - same remaining risk as
-    /// softmax, no max-subtraction trick here either.
+    /// zero the way plain softmax's denominator can. Now ALSO has the same
+    /// max-subtraction fix as softmax (updated once the overflow risk
+    /// stopped being theoretical) - same detached-leaf reasoning applies
+    /// unchanged, the "+1" in the denominator doesn't interact with it.
     pub fn softmax1(&mut self, a: Var) -> Var {
-        let e = self.exp(a);
+        let max_val = self.nodes[a.idx].value.max_last_axis();
+        let max_leaf = self.leaf(max_val);
+        let shifted = self.sub(a, max_leaf);
+        let e = self.exp(shifted);
         let s = self.sum_last_axis(e);
         let one = self.leaf(NdArray::scalar(1.0));
         let s_plus_one = self.add(s, one);
