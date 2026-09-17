@@ -1,28 +1,13 @@
-mod tensor;
-mod tape;
-mod optim;
+use engine::nn::Rng;
+use engine::optim::Sgd;
+use engine::tape::Tape;
+use engine::tensor::NdArray;
 
-use tensor::NdArray;
-use tape::Tape;
-use optim::Sgd;
-
-/// xorshift64 PRNG - not from an external crate: everything here is
-/// hand-rolled, including the noise source for synthetic training data.
-struct Rng(u64);
-impl Rng {
-    fn next_f32(&mut self) -> f32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 as f64 / u64::MAX as f64) as f32
-    }
-}
-
+/// Ground truth: y = 3x + 2, plus small noise. Simplest possible task that
+/// exercises the whole stack: MatMul, broadcast Add (bias), Sub, Mul, Sum, SGD.
 fn main() {
-    // Ground truth: y = 3x + 2, plus small noise. Simplest possible task that
-    // exercises the whole stack: MatMul, broadcast Add (bias), Sub, Mul, Sum, SGD.
     let n = 64usize;
-    let mut rng = Rng(12345);
+    let mut rng = Rng::new(12345);
     let mut xs = Vec::with_capacity(n);
     let mut ys = Vec::with_capacity(n);
     for _ in 0..n {
