@@ -172,6 +172,27 @@ impl Tape {
         self.div(e, s)
     }
 
+    /// "softmax1" / QuietAttention (Evan Miller, "Attention Is Off By One").
+    /// Adds 1 to softmax's denominator - the only change - so weights can
+    /// sum to LESS than 1 instead of always exactly 1. Plain softmax forces
+    /// a head to dump its full attention budget somewhere even when nothing
+    /// is relevant (the mechanistic explanation for the observed "attention
+    /// sink" phenomenon); this lets it express "nothing here" by driving
+    /// logits very negative, converging toward zero total weight instead of
+    /// a forced-uniform distribution. Side benefit: also slightly more
+    /// robust than plain softmax against the all-very-negative-logits case
+    /// - the +1 floors the denominator at 1, so it can't collapse toward
+    /// zero the way plain softmax's denominator can. Does NOT address
+    /// overflow from large positive logits - same remaining risk as
+    /// softmax, no max-subtraction trick here either.
+    pub fn softmax1(&mut self, a: Var) -> Var {
+        let e = self.exp(a);
+        let s = self.sum_last_axis(e);
+        let one = self.leaf(NdArray::scalar(1.0));
+        let s_plus_one = self.add(s, one);
+        self.div(e, s_plus_one)
+    }
+
     /// A node's value may feed multiple downstream ops, so incoming gradient
     /// contributions must sum (multivariable chain rule), never overwrite.
     fn accumulate(&mut self, idx: usize, g: NdArray) {
