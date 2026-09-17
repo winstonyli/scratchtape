@@ -79,6 +79,47 @@ impl Linear {
     }
 }
 
+pub struct EmbeddingOut {
+    pub y: Var,
+    pub table: Var,
+}
+
+/// Token/positional embedding table - a thin wrapper over Tape::gather,
+/// same "persisted NdArray + forward + apply_grad" shape as Linear. No new
+/// backward math here at all: correctness is already covered by Gather's
+/// own gradient-check test (including the repeated-index case), so this
+/// gets a lighter sanity test rather than a redundant finite-difference one.
+/// In the library, not example-local like the tokenizer - both token and
+/// positional embeddings need this, clearing the "2+ consumers" bar before
+/// any code was written, same as Gather itself.
+pub struct Embedding {
+    pub table: NdArray, // [vocab_size, d_model]
+}
+
+impl Embedding {
+    /// Small-scale uniform init (+/- 0.02), not He/Kaiming like Linear.
+    /// He-init's fan-in variance-preservation reasoning is about signal
+    /// passing through a matmul into a nonlinearity - it doesn't apply to a
+    /// lookup table, where each row is an independently learned vector with
+    /// no fan-in at all. Small init keeps initial embedding norms modest,
+    /// standard practice (e.g. GPT-2 uses a similar small-scale init).
+    pub fn new(rng: &mut Rng, vocab_size: usize, d_model: usize) -> Self {
+        let scale = 0.02;
+        let data = (0..vocab_size * d_model).map(|_| (rng.next_f32() * 2.0 - 1.0) * scale).collect();
+        Self { table: NdArray::new(data, vec![vocab_size, d_model]) }
+    }
+
+    pub fn forward(&self, tape: &mut Tape, indices: &[usize]) -> EmbeddingOut {
+        let table = tape.leaf(self.table.clone());
+        let y = tape.gather(table, indices);
+        EmbeddingOut { y, table }
+    }
+
+    pub fn apply_grad(&mut self, tape: &Tape, out: &EmbeddingOut, opt: &Sgd) {
+        opt.step(&mut self.table, tape.grad(out.table).unwrap());
+    }
+}
+
 pub struct LayerNormOut {
     pub y: Var,
     pub gamma: Var,
@@ -358,5 +399,28 @@ mod tests {
             "ffn1.w[0] grad mismatch: numerical {numerical} vs analytical {}",
             ffn1_w_grad.data[0]
         );
+    }
+
+    /// Sanity check, not a finite-difference test - Embedding has no new
+    /// backward math, it delegates entirely to Gather's already-verified
+    /// backward. Checks forward correctness (right rows selected) and that
+    /// gradient reaches the table at all, including for a repeated index.
+    #[test]
+    fn embedding_forward_and_gradient_reach_table() {
+        let mut rng = Rng::new(1);
+        let emb = Embedding::new(&mut rng, 5, 3);
+
+        let mut tape = Tape::new();
+        let out = emb.forward(&mut tape, &[2, 0, 2]);
+        let y = tape.value(out.y);
+        assert_eq!(y.shape, vec![3, 3]);
+        assert_eq!(&y.data[0..3], &emb.table.data[2 * 3..2 * 3 + 3]);
+        assert_eq!(&y.data[3..6], &emb.table.data[0..3]);
+
+        let loss = tape.sum(out.y);
+        tape.backward(loss);
+        let table_grad = tape.grad(out.table).unwrap();
+        // Row 2 was looked up twice - its gradient should reflect both uses.
+        assert!(table_grad.data[2 * 3] > table_grad.data[0 * 3]);
     }
 }
