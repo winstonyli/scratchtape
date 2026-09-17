@@ -193,6 +193,28 @@ impl NdArray {
         }
     }
 
+    /// Elementwise natural log. -inf at exactly 0, NaN below 0 (IEEE 754
+    /// passthrough) - cross-entropy's caller adds a small eps before this
+    /// to keep inputs away from exactly 0 (cheap guard, parked: a properly
+    /// max-subtraction-stable softmax would prevent needing it at all).
+    pub fn log(&self) -> Self {
+        Self {
+            data: self.data.iter().map(|&x| x.ln()).collect(),
+            shape: self.shape.clone(),
+        }
+    }
+
+    /// One-hot encoding of class indices - plain constant data, not a Tape
+    /// op (never differentiated with respect to which class is "true").
+    pub fn one_hot(indices: &[usize], num_classes: usize) -> Self {
+        let mut data = vec![0.0f32; indices.len() * num_classes];
+        for (i, &idx) in indices.iter().enumerate() {
+            assert!(idx < num_classes, "one_hot: index {idx} out of bounds for {num_classes} classes");
+            data[i * num_classes + idx] = 1.0;
+        }
+        Self { data, shape: vec![indices.len(), num_classes] }
+    }
+
     /// 2D matmul only. Broadcasting deliberately unsupported here -
     /// batched matmul is a separate future decision (einsum-style vs explicit batch loop).
     pub fn matmul(&self, other: &Self) -> Self {

@@ -31,6 +31,7 @@ enum OpKind {
     Concat(Vec<usize>),
     Gather(usize, Vec<usize>),
     Sqrt(usize),
+    Log(usize),
 }
 
 struct Node {
@@ -193,6 +194,37 @@ impl Tape {
         self.div(e, s_plus_one)
     }
 
+    /// Differentiable log. Unlike Exp/Sqrt, this needs the PARENT's value,
+    /// not its own output - d(log(x))/dx = 1/x uses x itself, not log(x).
+    /// Reusing "self.nodes[i].value" out of habit from Exp/Sqrt's backward
+    /// would be wrong here.
+    pub fn log(&mut self, a: Var) -> Var {
+        let val = self.nodes[a.idx].value.log();
+        self.push(val, OpKind::Log(a.idx))
+    }
+
+    /// Mean cross-entropy loss over `logits` [N, vocab_size] against integer
+    /// class labels. Composed entirely from existing ops (softmax, one-hot
+    /// * log, sum, scale) - no dedicated "select the true class's
+    /// probability" op needed, since one-hot-multiply-then-sum achieves the
+    /// same result using machinery that already exists. A small eps guards
+    /// log(0) = -inf (a real risk once softmax's output can genuinely
+    /// underflow to exact 0.0 over a real vocabulary) - cheap fix, not the
+    /// full max-subtraction-stable softmax, which is parked for later.
+    pub fn cross_entropy(&mut self, logits: Var, targets: &[usize]) -> Var {
+        let vocab_size = self.nodes[logits.idx].value.shape[1];
+        let n = targets.len();
+        let one_hot = self.leaf(NdArray::one_hot(targets, vocab_size));
+        let probs = self.softmax(logits);
+        let eps = self.leaf(NdArray::scalar(1e-9));
+        let probs_eps = self.add(probs, eps);
+        let log_probs = self.log(probs_eps);
+        let selected = self.mul(log_probs, one_hot);
+        let selected_sum = self.sum_last_axis(selected);
+        let total = self.sum(selected_sum);
+        self.scale(total, -1.0 / n as f32)
+    }
+
     /// A node's value may feed multiple downstream ops, so incoming gradient
     /// contributions must sum (multivariable chain rule), never overwrite.
     fn accumulate(&mut self, idx: usize, g: NdArray) {
@@ -308,6 +340,12 @@ impl Tape {
                     // trick as Exp's backward.
                     let out_val = self.nodes[i].value.clone();
                     self.accumulate(a, grad.div(&out_val).scale(0.5));
+                }
+                OpKind::Log(a) => {
+                    // d(log(x))/dx = 1/x - needs the PARENT's value, not
+                    // this node's own output, unlike Exp/Sqrt above.
+                    let a_val = self.nodes[a].value.clone();
+                    self.accumulate(a, grad.div(&a_val));
                 }
             }
         }
@@ -659,6 +697,48 @@ mod tests {
                 (numerical - beta_grad.data[i]).abs() < 1e-2,
                 "beta grad[{i}] mismatch: numerical {numerical} vs analytical {}",
                 beta_grad.data[i]
+            );
+        }
+    }
+
+    fn cross_entropy_loss(logits_data: &[f32], targets: &[usize]) -> f32 {
+        let mut tape = Tape::new();
+        let logits = tape.leaf(NdArray::new(logits_data.to_vec(), vec![3, 4]));
+        let loss = tape.cross_entropy(logits, targets);
+        tape.value(loss).data[0]
+    }
+
+    /// Checks dL/d(logits) - cross_entropy composes softmax (already
+    /// covered elsewhere) with the two genuinely new pieces here (Log,
+    /// one-hot-then-sum-last-axis selection), so this is really a check
+    /// that Log's "needs the parent's value, not its own output" backward
+    /// rule is actually implemented correctly, not just documented that way.
+    #[test]
+    fn cross_entropy_backward_matches_finite_difference() {
+        let logits0 = vec![
+            0.5, -0.3, 1.2, 0.1, //
+            -0.2, 0.8, 0.1, 0.4, //
+            1.0, 0.2, -0.5, 0.3,
+        ];
+        let targets = [2usize, 1, 0];
+
+        let mut tape = Tape::new();
+        let logits = tape.leaf(NdArray::new(logits0.clone(), vec![3, 4]));
+        let loss = tape.cross_entropy(logits, &targets);
+        tape.backward(loss);
+        let logits_grad = tape.grad(logits).unwrap().clone();
+
+        let eps = 1e-3;
+        for i in 0..logits0.len() {
+            let mut lp = logits0.clone();
+            lp[i] += eps;
+            let mut lm = logits0.clone();
+            lm[i] -= eps;
+            let numerical = (cross_entropy_loss(&lp, &targets) - cross_entropy_loss(&lm, &targets)) / (2.0 * eps);
+            assert!(
+                (numerical - logits_grad.data[i]).abs() < 1e-2,
+                "logits grad[{i}] mismatch: numerical {numerical} vs analytical {}",
+                logits_grad.data[i]
             );
         }
     }
