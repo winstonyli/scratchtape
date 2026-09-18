@@ -199,10 +199,11 @@ fn generate(
 }
 
 /// Same wiring as main()'s training loop, minus every diagnostic (no
-/// grad_accum, no periodic eval, no generation) - only the trained token
-/// embedding table is needed from these runs, used purely to re-derive
-/// `assignments` at a different init/sampling seed for the cross-seed
-/// stability check below.
+/// grad_accum, no periodic eval, no generation). Returns the full model,
+/// not just token_emb - the cross-seed attention-graph check needs a real
+/// forward() pass (pos_emb, blocks, final_ln, output_proj), the same
+/// requirement that turned train_with_diagnostics's return type into
+/// TrainedModel earlier.
 fn train_token_embedding(
     seed: u64,
     train: &[usize],
@@ -213,7 +214,7 @@ fn train_token_embedding(
     n_blocks: usize,
     vocab_size: usize,
     steps: usize,
-) -> Embedding {
+) -> TrainedModel {
     let mut rng = Rng::new(seed);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);
     let mut pos_emb = Embedding::new(&mut rng, seq_len, d_model);
@@ -231,7 +232,7 @@ fn train_token_embedding(
         tape.backward(loss);
         apply_grad(&tape, &out, &mut token_emb, &mut pos_emb, &mut blocks, &mut final_ln, &mut output_proj, &opt);
     }
-    token_emb
+    TrainedModel { token_emb, pos_emb, blocks, final_ln, output_proj }
 }
 
 /// Connected components of an adjacency matrix via BFS - used twice below
@@ -280,6 +281,69 @@ struct TrainedModel {
 /// deterministic and un-interleaved when this runs concurrently with the
 /// other seeds under thread::scope - each thread has its own stdout calls
 /// otherwise racing for output order with no benefit.
+/// Averages block-0/head-0 attention weight from query byte to key byte
+/// over `attn_windows` random samples from `train`, restricted to
+/// `filtered_bytes` (same noise-exclusion reasoning as the clustering
+/// step). Returns, per filtered_bytes index, a descending-by-weight list
+/// of (target index, average weight) pairs - empty if that byte never
+/// appeared in a usable sampled window. `window_seed` is shared across
+/// calls with different models so every seed sees the exact same sampled
+/// windows - isolates the model-training seed as the only varying input,
+/// the same control kmeans_rng=999 gives the clustering cross-seed check.
+fn attention_graph(
+    model: &TrainedModel,
+    train: &[usize],
+    filtered_bytes: &[usize],
+    seq_len: usize,
+    attn_windows: usize,
+    window_seed: u64,
+) -> (Vec<Vec<(usize, f32)>>, usize) {
+    let byte_index: HashMap<usize, usize> = filtered_bytes.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let n_bytes = filtered_bytes.len();
+    let mut weight_sum = vec![0.0f32; n_bytes * n_bytes];
+    let mut weight_count = vec![0u32; n_bytes * n_bytes];
+
+    let mut attn_rng = Rng::new(window_seed);
+    let mut windows_used = 0;
+    for _ in 0..attn_windows {
+        let (window, _) = sample_window(&mut attn_rng, train, seq_len);
+        if window.iter().any(|b| !byte_index.contains_key(b)) {
+            continue;
+        }
+        windows_used += 1;
+        let mut tape = Tape::new();
+        let (_, out) =
+            forward(&mut tape, &model.token_emb, &model.pos_emb, &model.blocks, &model.final_ln, &model.output_proj, &window);
+        let weights = tape.value(out.block_outs[0].head_weights[0]);
+        for qi in 0..seq_len {
+            let qi_idx = byte_index[&window[qi]];
+            for ki in 0..seq_len {
+                let ki_idx = byte_index[&window[ki]];
+                weight_sum[qi_idx * n_bytes + ki_idx] += weights.data[qi * seq_len + ki];
+                weight_count[qi_idx * n_bytes + ki_idx] += 1;
+            }
+        }
+    }
+
+    let graph = (0..n_bytes)
+        .map(|i| {
+            let mut targets: Vec<(usize, f32)> = (0..n_bytes)
+                .filter_map(|j| {
+                    let c = weight_count[i * n_bytes + j];
+                    if c == 0 {
+                        None
+                    } else {
+                        Some((j, weight_sum[i * n_bytes + j] / c as f32))
+                    }
+                })
+                .collect();
+            targets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            targets
+        })
+        .collect();
+    (graph, windows_used)
+}
+
 fn train_with_diagnostics(
     seed: u64,
     train: &[usize],
@@ -380,7 +444,7 @@ fn main() {
     // (parallelizing independent runs, not speeding up one run).
     println!("\ntraining 3 seeds concurrently for cross-seed cluster stability...");
     let wall_clock_start = Instant::now();
-    let (primary, seed2_emb, seed3_emb) = thread::scope(|scope| {
+    let (primary, seed2_model, seed3_model) = thread::scope(|scope| {
         let primary_handle = scope.spawn(|| {
             train_with_diagnostics(1, train, held_out, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps)
         });
@@ -463,9 +527,11 @@ fn main() {
     // the same cluster together, regardless of which numbered cluster that
     // is. That sidesteps the label-permutation problem entirely.
     let mut all_assignments: Vec<Vec<usize>> = vec![assignments.clone()];
-    for emb in [&seed2_emb, &seed3_emb] {
-        let rows: Vec<Vec<f32>> =
-            filtered_bytes.iter().map(|&b| emb.table.data[b * d_model..b * d_model + d_model].to_vec()).collect();
+    for seed_model in [&seed2_model, &seed3_model] {
+        let rows: Vec<Vec<f32>> = filtered_bytes
+            .iter()
+            .map(|&b| seed_model.token_emb.table.data[b * d_model..b * d_model + d_model].to_vec())
+            .collect();
         let mut seed_kmeans_rng = Rng::new(999);
         let a = kmeans(&rows, k, 50, &mut seed_kmeans_rng);
         all_assignments.push(a);
@@ -549,70 +615,68 @@ fn main() {
 
     // Second, independent KR&R extraction from tiny_lm.rs, rerun here on
     // the scaled corpus: averaged attention weights (block 0, head 0 only -
-    // same named limitation as tiny_lm.rs, not yet re-checked) discretized
+    // same named limitation as tiny_lm.rs, still not re-checked) discretized
     // into a top-2-targets-per-byte relational graph. Restricted to
     // filtered_bytes, the same noise-excluded set the clustering above
-    // uses, for the same reason (untrained/near-untrained rows aren't
-    // signal). Exhaustive coverage (every window position) was tractable on
+    // uses. Exhaustive coverage (every window position) was tractable on
     // tiny_lm.rs's 172-byte corpus (~156 windows); this corpus's train
     // region has ~214,000 possible window positions, so exhaustive coverage
     // would mean ~214,000 forward passes - random sampling instead, same
-    // proportionate-scope reasoning as eval_loss's 20-window sample, just a
-    // bigger sample since this needs per-byte-pair coverage, not one
-    // aggregate number. Uses the primary model only (seed 1) - this is the
-    // "does it hold up on a bigger corpus" check, not yet the cross-seed
-    // stability check the clustering above already went through.
-    let byte_index: HashMap<usize, usize> = filtered_bytes.iter().enumerate().map(|(i, &b)| (b, i)).collect();
-    let n_bytes = filtered_bytes.len();
-    let mut weight_sum = vec![0.0f32; n_bytes * n_bytes];
-    let mut weight_count = vec![0u32; n_bytes * n_bytes];
-
+    // proportionate-scope reasoning as eval_loss's 20-window sample.
     let attn_windows = 20000;
-    let mut attn_rng = Rng::new(777);
-    let mut windows_used = 0;
-    for _ in 0..attn_windows {
-        let (window, _) = sample_window(&mut attn_rng, train, seq_len);
-        // Skip windows containing a filtered-out (noise) byte entirely,
-        // rather than silently dropping just that byte's rows/cols mid-
-        // window - keeps every included window's qi/ki pairs restricted to
-        // the same known set byte_index expects.
-        if window.iter().any(|b| !byte_index.contains_key(b)) {
-            continue;
-        }
-        windows_used += 1;
-        let mut tape = Tape::new();
-        let (_, out) = forward(&mut tape, &model.token_emb, &model.pos_emb, &model.blocks, &model.final_ln, &model.output_proj, &window);
-        let weights = tape.value(out.block_outs[0].head_weights[0]);
-        for qi in 0..seq_len {
-            let qi_idx = byte_index[&window[qi]];
-            for ki in 0..seq_len {
-                let ki_idx = byte_index[&window[ki]];
-                weight_sum[qi_idx * n_bytes + ki_idx] += weights.data[qi * seq_len + ki];
-                weight_count[qi_idx * n_bytes + ki_idx] += 1;
-            }
-        }
-    }
+    let (primary_graph, windows_used) = attention_graph(&model, train, &filtered_bytes, seq_len, attn_windows, 777);
 
     println!(
         "\nattention-derived relational graph (block 0, head 0), top-2 targets per byte, {windows_used} sampled windows:"
     );
     for (i, &b) in filtered_bytes.iter().enumerate() {
-        let mut targets: Vec<(usize, f32)> = (0..n_bytes)
-            .filter_map(|j| {
-                let c = weight_count[i * n_bytes + j];
-                if c == 0 {
-                    None
-                } else {
-                    Some((j, weight_sum[i * n_bytes + j] / c as f32))
-                }
-            })
-            .collect();
-        targets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let top: Vec<String> = targets
-            .iter()
-            .take(2)
-            .map(|&(j, w)| format!("{:?}({:.2})", (filtered_bytes[j] as u8) as char, w))
-            .collect();
+        let top: Vec<String> =
+            primary_graph[i].iter().take(2).map(|&(j, w)| format!("{:?}({:.2})", (filtered_bytes[j] as u8) as char, w)).collect();
         println!("  {:?} -> {}", (b as u8) as char, top.join(", "));
     }
+
+    // Cross-seed stability on the attention graph - same rigor already
+    // applied to clustering, never applied to this extraction. Unlike
+    // k-means cluster labels, a target here IS a byte identity (not an
+    // arbitrary cluster number), so there's no label-permutation problem to
+    // sidestep - top-1 targets are directly comparable across seeds.
+    // Same window_seed (777) for every seed model: isolates the model's
+    // own training seed as the only varying input, the same control
+    // kmeans_rng=999 gives the clustering check.
+    let (seed2_graph, _) = attention_graph(&seed2_model, train, &filtered_bytes, seq_len, attn_windows, 777);
+    let (seed3_graph, _) = attention_graph(&seed3_model, train, &filtered_bytes, seq_len, attn_windows, 777);
+
+    println!("\nattention-graph cross-seed top-1 target stability (byte -> seed1 | seed2 | seed3 top-1 target):");
+    let mut unanimous_count = 0;
+    let mut majority_count = 0;
+    let mut none_count = 0;
+    let mut gap_count = 0;
+    for (i, &b) in filtered_bytes.iter().enumerate() {
+        let top1 = |g: &[Vec<(usize, f32)>]| g[i].first().map(|&(j, _)| filtered_bytes[j]);
+        let (t1, t2, t3) = (top1(&primary_graph), top1(&seed2_graph), top1(&seed3_graph));
+        let label = match (t1, t2, t3) {
+            (Some(a), Some(bb), Some(c)) if a == bb && bb == c => {
+                unanimous_count += 1;
+                "unanimous"
+            }
+            (Some(a), Some(bb), Some(c)) if a == bb || a == c || bb == c => {
+                majority_count += 1;
+                "majority"
+            }
+            (Some(_), Some(_), Some(_)) => {
+                none_count += 1;
+                "none"
+            }
+            _ => {
+                gap_count += 1;
+                "gap"
+            }
+        };
+        let fmt = |t: Option<usize>| t.map_or("-".to_string(), |x| format!("{:?}", (x as u8) as char));
+        println!("  {:?} -> {} | {} | {} ({label})", (b as u8) as char, fmt(t1), fmt(t2), fmt(t3));
+    }
+    println!(
+        "summary: {unanimous_count} unanimous, {majority_count} majority (2/3), {none_count} all-different, {gap_count} sampling-gap, out of {} bytes",
+        filtered_bytes.len()
+    );
 }
