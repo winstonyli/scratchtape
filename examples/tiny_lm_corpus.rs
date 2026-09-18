@@ -1,6 +1,7 @@
 use engine::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
 use engine::optim::{Adam, AdamState, Sgd};
 use engine::tape::{Tape, Var};
+use engine::tensor::NdArray;
 use std::collections::HashMap;
 use std::thread;
 use std::time::Instant;
@@ -23,6 +24,113 @@ fn shuffle(items: &mut [usize], rng: &mut Rng) {
         let j = (rng.next_f32() * (i + 1) as f32) as usize;
         items.swap(i, j);
     }
+}
+
+/// Stratified k-fold linear-probe comparison (frozen embedding-only vs
+/// graph-augmented with attention-graph neighbor mean), extracted from the
+/// original is-vowel probe ([178af66]) so the same held-out rigor applies
+/// to other externally-checkable categories without re-deriving the fold
+/// logic each time. Returns (mean baseline accuracy, mean graph-augmented
+/// accuracy, majority-class baseline accuracy) for the caller to compare
+/// across categories.
+fn run_kfold_probe(
+    category: &str,
+    labels: &[usize],
+    node_features: &NdArray,
+    neighbor1: &[usize],
+    neighbor2: &[usize],
+    d_model: usize,
+    k_folds: usize,
+    fold_seed: u64,
+) -> (f32, f32, f32) {
+    let n_nodes = labels.len();
+    let positive_count = labels.iter().filter(|&&l| l == 1).count();
+    let majority_baseline = (n_nodes - positive_count).max(positive_count) as f32 / n_nodes as f32;
+    println!("\n{category} probe: {positive_count} positive / {n_nodes} nodes (majority-class baseline = {majority_baseline:.3})");
+
+    // Stratified: positive and negative indices shuffled and round-robin'd
+    // into folds separately, so every fold gets a proportional share of
+    // whichever class is rarer instead of risking an all-one-class test
+    // fold under plain random splitting.
+    let mut fold_rng = Rng::new(fold_seed);
+    let mut pos_idxs: Vec<usize> = (0..n_nodes).filter(|&i| labels[i] == 1).collect();
+    let mut neg_idxs: Vec<usize> = (0..n_nodes).filter(|&i| labels[i] == 0).collect();
+    shuffle(&mut pos_idxs, &mut fold_rng);
+    shuffle(&mut neg_idxs, &mut fold_rng);
+    let mut folds: Vec<Vec<usize>> = vec![Vec::new(); k_folds];
+    for (i, &idx) in pos_idxs.iter().chain(neg_idxs.iter()).enumerate() {
+        folds[i % k_folds].push(idx);
+    }
+
+    let hidden = 16;
+    let adam = Adam { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 };
+    let train_steps = 400;
+
+    let held_out_accuracy = |test_idx: &[usize], train_idx: &[usize], use_graph: bool, seed: u64| -> f32 {
+        let mut clf_rng = Rng::new(seed);
+        let in_dim = if use_graph { 2 * d_model } else { d_model };
+        let mut l1 = Linear::new(&mut clf_rng, in_dim, hidden);
+        let mut l2 = Linear::new(&mut clf_rng, hidden, 2);
+        let mut s1w = AdamState::zeros_like(&l1.w);
+        let mut s1b = AdamState::zeros_like(&l1.b);
+        let mut s2w = AdamState::zeros_like(&l2.w);
+        let mut s2b = AdamState::zeros_like(&l2.b);
+        let train_labels: Vec<usize> = train_idx.iter().map(|&i| labels[i]).collect();
+
+        let mut acc = 0.0;
+        for step in 0..train_steps {
+            let mut tape = Tape::new();
+            let x0 = tape.leaf(node_features.clone());
+            let features = if use_graph {
+                let n1 = tape.gather(x0, neighbor1);
+                let n2 = tape.gather(x0, neighbor2);
+                let sum_n = tape.add(n1, n2);
+                let avg_neighbor = tape.scale(sum_n, 0.5);
+                tape.concat(&[x0, avg_neighbor])
+            } else {
+                x0
+            };
+            let h1 = l1.forward(&mut tape, features);
+            let h1r = tape.relu(h1.y);
+            let h2 = l2.forward(&mut tape, h1r);
+            let train_logits = tape.gather(h2.y, train_idx);
+            let loss = tape.cross_entropy(train_logits, &train_labels);
+            tape.backward(loss);
+            adam.step(&mut l1.w, tape.grad(h1.w).unwrap(), &mut s1w);
+            adam.step(&mut l1.b, tape.grad(h1.b).unwrap(), &mut s1b);
+            adam.step(&mut l2.w, tape.grad(h2.w).unwrap(), &mut s2w);
+            adam.step(&mut l2.b, tape.grad(h2.b).unwrap(), &mut s2b);
+            if step == train_steps - 1 {
+                let logits = tape.value(h2.y);
+                let correct = test_idx
+                    .iter()
+                    .filter(|&&i| {
+                        let pred = if logits.data[i * 2 + 1] > logits.data[i * 2] { 1 } else { 0 };
+                        pred == labels[i]
+                    })
+                    .count();
+                acc = correct as f32 / test_idx.len() as f32;
+            }
+        }
+        acc
+    };
+
+    let mut baseline_accs = Vec::new();
+    let mut gnn_accs = Vec::new();
+    for fold in 0..k_folds {
+        let test_idx = &folds[fold];
+        let train_idx: Vec<usize> = (0..n_nodes).filter(|i| !test_idx.contains(i)).collect();
+        let baseline_acc = held_out_accuracy(test_idx, &train_idx, false, 1000 + fold as u64);
+        let gnn_acc = held_out_accuracy(test_idx, &train_idx, true, 2000 + fold as u64);
+        println!("  fold {fold}: test_size={}, baseline={baseline_acc:.3}, gnn={gnn_acc:.3}", test_idx.len());
+        baseline_accs.push(baseline_acc);
+        gnn_accs.push(gnn_acc);
+    }
+
+    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+    let (mean_baseline, mean_gnn) = (mean(&baseline_accs), mean(&gnn_accs));
+    println!("{k_folds}-fold held-out mean accuracy: baseline (embedding only) = {mean_baseline:.3}, graph-augmented = {mean_gnn:.3}");
+    (mean_baseline, mean_gnn, majority_baseline)
 }
 
 fn sample_window(rng: &mut Rng, corpus: &[usize], seq_len: usize) -> (Vec<usize>, Vec<usize>) {
@@ -789,101 +897,31 @@ fn main() {
     let neighbor2: Vec<usize> =
         (0..n_nodes).map(|i| primary_graph[i].get(1).map(|&(j, _)| j).unwrap_or(neighbor1[i])).collect();
 
-    let is_vowel = |b: usize| matches!((b as u8) as char, 'a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U');
-    let gnn_labels: Vec<usize> = filtered_bytes.iter().map(|&b| if is_vowel(b) { 1 } else { 0 }).collect();
-    let vowel_count = gnn_labels.iter().filter(|&&l| l == 1).count();
-    println!(
-        "\nGNN is-vowel probe: {vowel_count} vowels out of {n_nodes} nodes (majority-class baseline accuracy: {:.3})",
-        (n_nodes - vowel_count).max(vowel_count) as f32 / n_nodes as f32
-    );
-
     let node_features = model.token_emb.table.gather_rows(&filtered_bytes);
-
-    // Stratified k-fold: vowel and non-vowel indices shuffled and round-
-    // robin'd into folds separately, so every fold gets a proportional
-    // share of the (still small, ~10-vowel) positive class instead of
-    // risking an all-negative test fold under plain random splitting.
     let k_folds = 5;
-    let mut fold_rng = Rng::new(42);
-    let mut vowel_idxs: Vec<usize> = (0..n_nodes).filter(|&i| gnn_labels[i] == 1).collect();
-    let mut nonvowel_idxs: Vec<usize> = (0..n_nodes).filter(|&i| gnn_labels[i] == 0).collect();
-    shuffle(&mut vowel_idxs, &mut fold_rng);
-    shuffle(&mut nonvowel_idxs, &mut fold_rng);
-    let mut folds: Vec<Vec<usize>> = vec![Vec::new(); k_folds];
-    for (i, &idx) in vowel_idxs.iter().chain(nonvowel_idxs.iter()).enumerate() {
-        folds[i % k_folds].push(idx);
+
+    // Extended beyond the original is-vowel probe to 3 more externally-
+    // checkable categories, same k-fold rigor, reusing run_kfold_probe -
+    // does the embedding geometry (and graph augmentation) generalize past
+    // vowel-ness specifically, or was that one category special?
+    let is_vowel = |b: usize| matches!((b as u8) as char, 'a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U');
+    let is_uppercase = |b: usize| ((b as u8) as char).is_ascii_uppercase();
+    let is_digit = |b: usize| ((b as u8) as char).is_ascii_digit();
+    let is_punctuation = |b: usize| ((b as u8) as char).is_ascii_punctuation();
+
+    let categories: [(&str, &dyn Fn(usize) -> bool, u64); 4] =
+        [("is-vowel", &is_vowel, 42), ("is-uppercase", &is_uppercase, 43), ("is-digit", &is_digit, 44), ("is-punctuation", &is_punctuation, 45)];
+
+    let mut summary = Vec::new();
+    for (name, predicate, fold_seed) in categories {
+        let labels: Vec<usize> = filtered_bytes.iter().map(|&b| if predicate(b) { 1 } else { 0 }).collect();
+        let (base, gnn, majority) = run_kfold_probe(name, &labels, &node_features, &neighbor1, &neighbor2, d_model, k_folds, fold_seed);
+        summary.push((name, majority, base, gnn));
     }
-
-    let hidden = 16;
-    let adam = Adam { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 };
-    let train_steps = 400;
-
-    let held_out_accuracy = |test_idx: &[usize], train_idx: &[usize], use_graph: bool, seed: u64| -> f32 {
-        let mut clf_rng = Rng::new(seed);
-        let in_dim = if use_graph { 2 * d_model } else { d_model };
-        let mut l1 = Linear::new(&mut clf_rng, in_dim, hidden);
-        let mut l2 = Linear::new(&mut clf_rng, hidden, 2);
-        let mut s1w = AdamState::zeros_like(&l1.w);
-        let mut s1b = AdamState::zeros_like(&l1.b);
-        let mut s2w = AdamState::zeros_like(&l2.w);
-        let mut s2b = AdamState::zeros_like(&l2.b);
-        let train_labels: Vec<usize> = train_idx.iter().map(|&i| gnn_labels[i]).collect();
-
-        let mut acc = 0.0;
-        for step in 0..train_steps {
-            let mut tape = Tape::new();
-            let x0 = tape.leaf(node_features.clone());
-            let features = if use_graph {
-                let n1 = tape.gather(x0, &neighbor1);
-                let n2 = tape.gather(x0, &neighbor2);
-                let sum_n = tape.add(n1, n2);
-                let avg_neighbor = tape.scale(sum_n, 0.5);
-                tape.concat(&[x0, avg_neighbor])
-            } else {
-                x0
-            };
-            let h1 = l1.forward(&mut tape, features);
-            let h1r = tape.relu(h1.y);
-            let h2 = l2.forward(&mut tape, h1r);
-            let train_logits = tape.gather(h2.y, train_idx);
-            let loss = tape.cross_entropy(train_logits, &train_labels);
-            tape.backward(loss);
-            adam.step(&mut l1.w, tape.grad(h1.w).unwrap(), &mut s1w);
-            adam.step(&mut l1.b, tape.grad(h1.b).unwrap(), &mut s1b);
-            adam.step(&mut l2.w, tape.grad(h2.w).unwrap(), &mut s2w);
-            adam.step(&mut l2.b, tape.grad(h2.b).unwrap(), &mut s2b);
-            if step == train_steps - 1 {
-                let logits = tape.value(h2.y);
-                let correct = test_idx
-                    .iter()
-                    .filter(|&&i| {
-                        let pred = if logits.data[i * 2 + 1] > logits.data[i * 2] { 1 } else { 0 };
-                        pred == gnn_labels[i]
-                    })
-                    .count();
-                acc = correct as f32 / test_idx.len() as f32;
-            }
-        }
-        acc
-    };
-
-    let mut baseline_accs = Vec::new();
-    let mut gnn_accs = Vec::new();
-    for fold in 0..k_folds {
-        let test_idx = &folds[fold];
-        let train_idx: Vec<usize> = (0..n_nodes).filter(|i| !test_idx.contains(i)).collect();
-        let baseline_acc = held_out_accuracy(test_idx, &train_idx, false, 1000 + fold as u64);
-        let gnn_acc = held_out_accuracy(test_idx, &train_idx, true, 2000 + fold as u64);
-        println!("  fold {fold}: test_size={}, baseline={baseline_acc:.3}, gnn={gnn_acc:.3}", test_idx.len());
-        baseline_accs.push(baseline_acc);
-        gnn_accs.push(gnn_acc);
+    println!("\nlinear-probe summary (category: majority-baseline | embedding-only | graph-augmented):");
+    for (name, majority, base, gnn) in &summary {
+        println!("  {name}: {majority:.3} | {base:.3} | {gnn:.3}");
     }
-
-    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
-    println!(
-        "\n{k_folds}-fold held-out mean accuracy: baseline (embedding only) = {:.3}, graph-augmented = {:.3}",
-        mean(&baseline_accs), mean(&gnn_accs)
-    );
 
     // Direct test of the named block-0/head-0-only limitation this
     // extraction has carried since tiny_lm.rs: does every head show the
