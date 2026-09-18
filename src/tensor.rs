@@ -4,9 +4,22 @@ pub struct NdArray {
     pub shape: Vec<usize>,
 }
 
-fn unravel_index(lin: usize, shape: &[usize]) -> Vec<usize> {
+/// 2x headroom over anything ever actually used in this codebase - every
+/// shape here is rank 1 or 2 (matches the established "stay 2D" discipline).
+/// Fixed-size stack array, not Vec<usize> or a smallvec-style crate:
+/// unravel_index/ravel_index were found (via a real profile, not a guess)
+/// to be called once PER ELEMENT inside broadcast_to/reduce_to_shape/
+/// sum_last_axis/max_last_axis/concat_last_axis/slice_last_axis - a [16,32]
+/// tensor going through broadcast_to allocated 512 separate heap Vecs just
+/// for index bookkeeping. Only the first `nd` slots of the returned array
+/// are meaningful; callers must slice to `nd`, not assume the whole
+/// capacity is valid data.
+const MAX_RANK: usize = 4;
+
+fn unravel_index(lin: usize, shape: &[usize]) -> [usize; MAX_RANK] {
     let nd = shape.len();
-    let mut idx = vec![0usize; nd];
+    assert!(nd <= MAX_RANK, "shape rank {nd} exceeds MAX_RANK {MAX_RANK}");
+    let mut idx = [0usize; MAX_RANK];
     let mut rem = lin;
     for i in 0..nd {
         let stride: usize = shape[i + 1..].iter().product();
@@ -302,12 +315,11 @@ impl NdArray {
         let mut out = vec![0.0f32; total];
         for lin in 0..total {
             let t_idx = unravel_index(lin, target);
-            let s_idx: Vec<usize> = t_idx
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| if padded_shape[i] == 1 { 0 } else { v })
-                .collect();
-            let src_lin = ravel_index(&s_idx[pad..], &self.shape);
+            let mut s_idx = [0usize; MAX_RANK];
+            for i in 0..nd {
+                s_idx[i] = if padded_shape[i] == 1 { 0 } else { t_idx[i] };
+            }
+            let src_lin = ravel_index(&s_idx[pad..nd], &self.shape);
             out[lin] = self.data[src_lin];
         }
         Self { data: out, shape: target.to_vec() }
@@ -328,12 +340,11 @@ impl NdArray {
         let total_self: usize = self.shape.iter().product();
         for lin in 0..total_self {
             let s_idx = unravel_index(lin, &self.shape);
-            let d_idx: Vec<usize> = s_idx
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| if padded_target[i] == 1 { 0 } else { v })
-                .collect();
-            let dst_lin = ravel_index(&d_idx[pad..], target);
+            let mut d_idx = [0usize; MAX_RANK];
+            for i in 0..nd {
+                d_idx[i] = if padded_target[i] == 1 { 0 } else { s_idx[i] };
+            }
+            let dst_lin = ravel_index(&d_idx[pad..nd], target);
             out[dst_lin] += self.data[lin];
         }
         Self { data: out, shape: target.to_vec() }
