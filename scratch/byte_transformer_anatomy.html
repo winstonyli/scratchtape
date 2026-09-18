@@ -1,0 +1,306 @@
+<title>Byte Transformer Anatomy</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --ink: #1b2430;
+    --slate: #5b6472;
+    --line: #c7ccd4;
+    --accent: #b8722e;
+    --accent-soft: rgba(184, 114, 46, 0.10);
+    --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Consolas, monospace;
+    --sans: 'IBM Plex Sans', -apple-system, Segoe UI, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161b;
+      --panel: #1b1e25;
+      --ink: #e4e7ec;
+      --slate: #8b93a1;
+      --line: #2f333c;
+      --accent: #dd9a58;
+      --accent-soft: rgba(221, 154, 88, 0.14);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14161b;
+    --panel: #1b1e25;
+    --ink: #e4e7ec;
+    --slate: #8b93a1;
+    --line: #2f333c;
+    --accent: #dd9a58;
+    --accent-soft: rgba(221, 154, 88, 0.14);
+  }
+
+  body { background: var(--bg); color: var(--ink); font-family: var(--sans); }
+
+  .page {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 40px 24px 56px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .kicker {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(24px, 3.4vw, 32px);
+    font-weight: 600;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  .dek {
+    font-size: 15px;
+    line-height: 1.55;
+    color: var(--slate);
+    max-width: 62ch;
+  }
+
+  .diagram-frame {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 12px;
+    overflow-x: auto;
+  }
+
+  svg { display: block; width: 100%; height: auto; color: var(--ink); }
+
+  .lane-title {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    fill: var(--slate);
+    text-transform: uppercase;
+  }
+
+  .box-label {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    fill: var(--ink);
+  }
+
+  .box-sub {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    fill: var(--slate);
+  }
+
+  .edge-label {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    fill: var(--slate);
+  }
+
+  .accent-label {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    fill: var(--accent);
+    font-weight: 600;
+  }
+
+  figcaption {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--slate);
+    max-width: 78ch;
+  }
+
+  figcaption b { color: var(--ink); font-weight: 600; }
+
+  .legend {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--slate);
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 18px; height: 3px; display: inline-block; background: var(--ink); }
+  .swatch.accent { background: var(--accent); height: 3px; }
+</style>
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap">
+
+<div class="page">
+  <div>
+    <div class="kicker">ai-from-scratch &middot; tiny_lm.rs</div>
+    <h1>Byte Transformer Anatomy</h1>
+    <p class="dek">
+      The full data path a byte takes through the trained model, left, and what actually happens
+      inside one of its two stacked blocks, right &mdash; including the residual stream, drawn as the
+      through-line it is, not the box a name like &ldquo;transformer block&rdquo; would suggest.
+    </p>
+  </div>
+
+  <div class="legend">
+    <span><span class="swatch"></span> forward data path</span>
+    <span><span class="swatch accent"></span> residual stream (unbroken through the block)</span>
+  </div>
+
+  <figure class="diagram-frame" style="margin:0;">
+    <svg viewBox="0 0 1320 1000" role="img" aria-label="Left: the full pipeline from a byte input through two stacked transformer blocks, a final layer norm, an output projection to 256 logits, and either a training loss or generation sampling. Right: the internals of one block, showing the residual stream running unbroken down the left edge while layer norm, multi-head attention with a causal mask, and a feed-forward network branch off and rejoin it at two addition points.">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"></path>
+        </marker>
+        <marker id="arrowAccent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"></path>
+        </marker>
+      </defs>
+
+      <!-- ============ LEFT PANEL: overall pipeline ============ -->
+      <text x="70" y="150" class="lane-title">whole model</text>
+
+      <rect x="70" y="170" width="280" height="46" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="210" y="198" text-anchor="middle" class="box-label">BYTE INPUT (0&ndash;255)</text>
+
+      <line x1="210" y1="216" x2="210" y2="252" stroke="currentColor" marker-end="url(#arrow)"></line>
+
+      <rect x="70" y="256" width="280" height="58" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="210" y="280" text-anchor="middle" class="box-label">TOKEN EMBED + POS EMBED</text>
+      <text x="210" y="298" text-anchor="middle" class="box-sub">gather + gather, summed</text>
+
+      <line x1="210" y1="314" x2="210" y2="350" stroke="currentColor" marker-end="url(#arrow)"></line>
+
+      <rect x="70" y="354" width="280" height="70" rx="4" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"></rect>
+      <text x="210" y="384" text-anchor="middle" class="box-label">TRANSFORMER BLOCK</text>
+      <text x="210" y="402" text-anchor="middle" class="accent-label">see detail, right &rarr;</text>
+      <text x="330" y="368" text-anchor="middle" class="accent-label">&times;2</text>
+
+      <path d="M 350 424 C 400 424, 400 380, 350 372" fill="none" stroke="var(--accent)" marker-end="url(#arrowAccent)"></path>
+
+      <line x1="210" y1="424" x2="210" y2="460" stroke="currentColor" marker-end="url(#arrow)"></line>
+
+      <rect x="70" y="464" width="280" height="46" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="210" y="492" text-anchor="middle" class="box-label">FINAL LAYERNORM</text>
+
+      <line x1="210" y1="510" x2="210" y2="546" stroke="currentColor" marker-end="url(#arrow)"></line>
+
+      <rect x="70" y="550" width="280" height="58" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="210" y="574" text-anchor="middle" class="box-label">OUTPUT PROJECTION</text>
+      <text x="210" y="592" text-anchor="middle" class="box-sub">Linear &rarr; 256 logits</text>
+
+      <line x1="150" y1="608" x2="150" y2="636" stroke="currentColor" marker-end="url(#arrow)"></line>
+      <line x1="270" y1="608" x2="270" y2="636" stroke="currentColor" marker-end="url(#arrow)"></line>
+
+      <rect x="70" y="640" width="150" height="56" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="145" y="663" text-anchor="middle" class="box-label" font-size="11.5">CROSS-ENTROPY</text>
+      <text x="145" y="681" text-anchor="middle" class="box-sub">training</text>
+
+      <rect x="200" y="640" width="150" height="56" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="275" y="663" text-anchor="middle" class="box-label" font-size="11.5">SOFTMAX + SAMPLE</text>
+      <text x="275" y="681" text-anchor="middle" class="box-sub">generation</text>
+
+      <!-- divider -->
+      <line x1="404" y1="140" x2="404" y2="970" stroke="var(--line)"></line>
+
+      <!-- ============ RIGHT PANEL: inside one block ============ -->
+      <text x="440" y="70" class="lane-title">inside one transformer block (pre-norm)</text>
+
+      <!-- residual stream -->
+      <line x1="480" y1="90" x2="480" y2="940" stroke="var(--accent)" stroke-width="3"></line>
+      <circle cx="480" cy="90" r="4" fill="var(--accent)"></circle>
+      <text x="494" y="94" class="accent-label">x (block input)</text>
+
+      <!-- branch to LN1 -->
+      <line x1="480" y1="150" x2="560" y2="150" stroke="currentColor" marker-end="url(#arrow)"></line>
+      <rect x="564" y="122" width="170" height="56" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="649" y="155" text-anchor="middle" class="box-label">LAYERNORM 1</text>
+
+      <line x1="649" y1="178" x2="649" y2="206" stroke="currentColor" marker-end="url(#arrow)"></line>
+      <text x="900" y="200" class="edge-label">(&times;4 heads, one shown)</text>
+
+      <!-- Q K V -->
+      <rect x="564" y="210" width="110" height="48" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="619" y="239" text-anchor="middle" class="box-label" font-size="11.5">Q PROJ</text>
+
+      <rect x="704" y="210" width="110" height="48" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="759" y="239" text-anchor="middle" class="box-label" font-size="11.5">K PROJ</text>
+
+      <rect x="844" y="210" width="110" height="48" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="899" y="239" text-anchor="middle" class="box-label" font-size="11.5">V PROJ</text>
+
+      <line x1="649" y1="258" x2="649" y2="258" stroke="currentColor"></line>
+      <path d="M 649 178 L 619 178 L 619 210" fill="none" stroke="currentColor" marker-end="url(#arrow)"></path>
+      <path d="M 649 178 L 759 178 L 759 210" fill="none" stroke="currentColor" marker-end="url(#arrow)"></path>
+      <path d="M 649 178 L 899 178 L 899 210" fill="none" stroke="currentColor" marker-end="url(#arrow)"></path>
+
+      <!-- K transpose -->
+      <line x1="759" y1="258" x2="759" y2="284" stroke="currentColor" marker-end="url(#arrow)"></line>
+      <rect x="704" y="288" width="110" height="40" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="759" y="313" text-anchor="middle" class="box-label" font-size="11">TRANSPOSE Kᵀ</text>
+
+      <!-- scores -->
+      <path d="M 619 258 L 619 350 L 690 350" fill="none" stroke="currentColor" marker-end="url(#arrow)"></path>
+      <path d="M 759 328 L 759 350" fill="none" stroke="currentColor" marker-end="url(#arrow)"></path>
+      <rect x="694" y="354" width="150" height="44" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="769" y="381" text-anchor="middle" class="box-label" font-size="11.5">SCORES Q&middot;Kᵀ</text>
+
+      <line x1="769" y1="398" x2="769" y2="424" stroke="currentColor" marker-end="url(#arrow)"></line>
+      <rect x="674" y="428" width="190" height="44" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="769" y="455" text-anchor="middle" class="box-label" font-size="11">+ CAUSAL MASK (&minus;&infin; upper&#9651;)</text>
+
+      <line x1="769" y1="472" x2="769" y2="498" stroke="currentColor" marker-end="url(#arrow)"></line>
+      <rect x="704" y="502" width="130" height="42" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="769" y="528" text-anchor="middle" class="box-label">SOFTMAX</text>
+
+      <!-- weighted sum with V -->
+      <path d="M 769 544 L 769 580" fill="none" stroke="currentColor" marker-end="url(#arrow)"></path>
+      <path d="M 899 258 L 899 580 L 850 580" fill="none" stroke="currentColor" marker-end="url(#arrow)"></path>
+      <rect x="714" y="584" width="150" height="44" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="789" y="611" text-anchor="middle" class="box-label" font-size="11.5">WEIGHTED SUM &middot;V</text>
+
+      <line x1="789" y1="628" x2="789" y2="654" stroke="currentColor" marker-end="url(#arrow)"></line>
+      <rect x="714" y="658" width="150" height="42" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="789" y="684" text-anchor="middle" class="box-label">CONCAT &times;4 HEADS</text>
+
+      <line x1="789" y1="700" x2="789" y2="726" stroke="currentColor" marker-end="url(#arrow)"></line>
+      <rect x="714" y="730" width="150" height="42" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="789" y="756" text-anchor="middle" class="box-label">OUT PROJ (LINEAR)</text>
+
+      <!-- rejoin residual: junction 1 -->
+      <path d="M 714 751 L 480 751" fill="none" stroke="var(--accent)" marker-end="url(#arrowAccent)"></path>
+      <circle cx="480" cy="751" r="9" fill="var(--panel)" stroke="var(--accent)" stroke-width="2"></circle>
+      <text x="480" y="756" text-anchor="middle" class="accent-label" font-size="12">+</text>
+
+      <!-- branch to LN2 -->
+      <line x1="480" y1="800" x2="560" y2="800" stroke="currentColor" marker-end="url(#arrow)"></line>
+      <rect x="564" y="772" width="170" height="56" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="649" y="805" text-anchor="middle" class="box-label">LAYERNORM 2</text>
+
+      <line x1="649" y1="828" x2="649" y2="854" stroke="currentColor" marker-end="url(#arrow)"></line>
+      <rect x="564" y="858" width="220" height="58" rx="4" fill="var(--panel)" stroke="currentColor"></rect>
+      <text x="674" y="882" text-anchor="middle" class="box-label" font-size="11.5">FEED-FORWARD</text>
+      <text x="674" y="900" text-anchor="middle" class="box-sub">Linear &rarr; ReLU &rarr; Linear</text>
+
+      <!-- rejoin residual: junction 2 -->
+      <path d="M 564 887 L 480 887" fill="none" stroke="var(--accent)" marker-end="url(#arrowAccent)"></path>
+      <circle cx="480" cy="887" r="9" fill="var(--panel)" stroke="var(--accent)" stroke-width="2"></circle>
+      <text x="480" y="892" text-anchor="middle" class="accent-label" font-size="12">+</text>
+
+      <circle cx="480" cy="935" r="4" fill="var(--accent)"></circle>
+      <text x="494" y="939" class="accent-label">x&prime; (block output)</text>
+    </svg>
+  </figure>
+
+  <figcaption>
+    <b>Why the residual stream is drawn as the through-line, not a box:</b> in this pre-norm design,
+    attention and the feed-forward network each read a normalized copy of the stream but write their
+    result back by addition &mdash; the stream itself is never normalized directly. Across two stacked
+    blocks its magnitude only grows, which is the reason this model needs one more LayerNorm after the
+    last block, immediately before the output projection, to bring the accumulated scale back down to
+    what that projection's weights were initialized to expect.
+  </figcaption>
+</div>
