@@ -399,6 +399,38 @@ struct TrainedModel {
     output_proj: Linear,
 }
 
+/// Third independent KR&R extraction, after k-means clustering and the
+/// attention-derived relational graph: raw embedding-space nearest
+/// neighbors by Euclidean distance. No training dynamics involved at all -
+/// not attention weights (behavioral), not a k-means partition (a flat
+/// grouping) - pure representational geometry, computed once on the final
+/// trained table with no sampling/coverage gaps (every filtered byte has a
+/// well-defined embedding vector, unlike the attention graph's 5 sampling-
+/// gap bytes). Returns, per filtered_bytes index, an ascending-by-distance
+/// list of (neighbor index, distance) pairs, self excluded, matching the
+/// attention graph's top-k format for direct comparison.
+fn embedding_neighbor_graph(model: &TrainedModel, filtered_bytes: &[usize], d_model: usize, k: usize) -> Vec<Vec<(usize, f32)>> {
+    let n = filtered_bytes.len();
+    let rows: Vec<Vec<f32>> = filtered_bytes
+        .iter()
+        .map(|&b| model.token_emb.table.data[b * d_model..b * d_model + d_model].to_vec())
+        .collect();
+    (0..n)
+        .map(|i| {
+            let mut dists: Vec<(usize, f32)> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    let d: f32 = rows[i].iter().zip(rows[j].iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+                    (j, d)
+                })
+                .collect();
+            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            dists.truncate(k);
+            dists
+        })
+        .collect()
+}
+
 /// Averages block-0/head-0 attention weight from query byte to key byte
 /// over `attn_windows` random samples from `train`, restricted to
 /// `filtered_bytes` (same noise-exclusion reasoning as the clustering
@@ -882,9 +914,50 @@ fn main() {
         filtered_bytes.len()
     );
 
-    // Third independent extraction from this project's design log, rerun
-    // here on the scaled corpus: GNN message-passing over the attention
-    // graph ([178af66]), is-vowel prediction as an externally-checkable
+    // Third independent extraction: raw embedding-space nearest neighbors,
+    // no attention behavior or clustering partition involved at all - see
+    // embedding_neighbor_graph's doc comment. Same cross-seed rigor as the
+    // attention graph, but no label-permutation problem (neighbor identity
+    // is directly comparable) and no sampling-gap case (every byte has a
+    // well-defined embedding vector, unlike attention needing window
+    // coverage) - simpler three-way split than the attention graph's four.
+    let nn_k = 2;
+    let primary_nn = embedding_neighbor_graph(&model, &filtered_bytes, d_model, nn_k);
+    println!("\nembedding-space nearest neighbors (k={nn_k}, Euclidean distance):");
+    for (i, &b) in filtered_bytes.iter().enumerate() {
+        let top: Vec<String> =
+            primary_nn[i].iter().map(|&(j, d)| format!("{:?}({d:.2})", (filtered_bytes[j] as u8) as char)).collect();
+        println!("  {:?} -> {}", (b as u8) as char, top.join(", "));
+    }
+
+    let seed2_nn = embedding_neighbor_graph(&seed2_model, &filtered_bytes, d_model, nn_k);
+    let seed3_nn = embedding_neighbor_graph(&seed3_model, &filtered_bytes, d_model, nn_k);
+    println!("\nembedding-neighbor cross-seed top-1 nearest-neighbor stability (byte -> seed1 | seed2 | seed3):");
+    let (mut nn_unanimous, mut nn_majority, mut nn_none) = (0, 0, 0);
+    for (i, &b) in filtered_bytes.iter().enumerate() {
+        let top1 = |g: &[Vec<(usize, f32)>]| filtered_bytes[g[i][0].0];
+        let (t1, t2, t3) = (top1(&primary_nn), top1(&seed2_nn), top1(&seed3_nn));
+        let label = if t1 == t2 && t2 == t3 {
+            nn_unanimous += 1;
+            "unanimous"
+        } else if t1 == t2 || t1 == t3 || t2 == t3 {
+            nn_majority += 1;
+            "majority"
+        } else {
+            nn_none += 1;
+            "none"
+        };
+        let fmt = |x: usize| format!("{:?}", (x as u8) as char);
+        println!("  {:?} -> {} | {} | {} ({label})", (b as u8) as char, fmt(t1), fmt(t2), fmt(t3));
+    }
+    println!(
+        "summary: {nn_unanimous} unanimous, {nn_majority} majority (2/3), {nn_none} all-different, out of {} bytes",
+        filtered_bytes.len()
+    );
+
+    // Fourth extraction, building on the second (attention graph): GNN
+    // message-passing over the attention graph ([178af66]), is-vowel
+    // prediction as an externally-checkable
     // probe (not model-derived). Originally inconclusive by a stated data
     // limit, not by finding: only 34 labeled nodes / 7 positive examples
     // meant both baseline and graph-augmented classifiers hit a 100%
