@@ -1,6 +1,7 @@
 use engine::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
 use engine::optim::Sgd;
 use engine::tape::{Tape, Var};
+use std::collections::HashMap;
 use std::thread;
 use std::time::Instant;
 
@@ -224,14 +225,6 @@ fn train_token_embedding(
     token_emb
 }
 
-/// Same training loop as train_token_embedding, plus every diagnostic the
-/// primary/reference run needs (grad_accum, periodic eval, generation) -
-/// duplicated rather than parameterized with a bunch of Option<_> diagnostic
-/// flags, same reasoning as every other duplicated helper in this file.
-/// Log lines are collected rather than printed directly so output stays
-/// deterministic and un-interleaved when this runs concurrently with the
-/// other seeds under thread::scope - each thread has its own stdout calls
-/// otherwise racing for output order with no benefit.
 /// Connected components of an adjacency matrix via BFS - used twice below
 /// (majority-agreement graph and strict-unanimity graph), the two-consumer
 /// bar this project applies before factoring out a helper.
@@ -257,6 +250,27 @@ fn connected_components(adj: &[Vec<bool>], n: usize) -> Vec<usize> {
     component
 }
 
+/// Bundles the full model rather than returning 5 separate values - needed
+/// so the primary run's attention-graph extraction below (which needs
+/// pos_emb, blocks, final_ln, output_proj, not just token_emb) can run a
+/// real forward() pass after training, unlike the k-means step which only
+/// ever needed token_emb's rows.
+struct TrainedModel {
+    token_emb: Embedding,
+    pos_emb: Embedding,
+    blocks: Vec<TransformerBlock>,
+    final_ln: LayerNorm,
+    output_proj: Linear,
+}
+
+/// Same training loop as train_token_embedding, plus every diagnostic the
+/// primary/reference run needs (grad_accum, periodic eval, generation) -
+/// duplicated rather than parameterized with a bunch of Option<_> diagnostic
+/// flags, same reasoning as every other duplicated helper in this file.
+/// Log lines are collected rather than printed directly so output stays
+/// deterministic and un-interleaved when this runs concurrently with the
+/// other seeds under thread::scope - each thread has its own stdout calls
+/// otherwise racing for output order with no benefit.
 fn train_with_diagnostics(
     seed: u64,
     train: &[usize],
@@ -268,7 +282,7 @@ fn train_with_diagnostics(
     n_blocks: usize,
     vocab_size: usize,
     steps: usize,
-) -> (Embedding, Vec<f32>, Vec<String>) {
+) -> (TrainedModel, Vec<f32>, Vec<String>) {
     let mut rng = Rng::new(seed);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);
     let mut pos_emb = Embedding::new(&mut rng, seq_len, d_model);
@@ -311,7 +325,7 @@ fn train_with_diagnostics(
     let generated = generate(&mut rng, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &seed_text, 200, seq_len, 0.8);
     log.push(format!("\ngenerated (seed \"The Fox\", temperature=0.8):\n{}", decode_bytes(&generated)));
 
-    (token_emb, grad_accum, log)
+    (TrainedModel { token_emb, pos_emb, blocks, final_ln, output_proj }, grad_accum, log)
 }
 
 fn main() {
@@ -369,7 +383,7 @@ fn main() {
     });
     println!("all 3 seeds trained in {:.1}s wall-clock", wall_clock_start.elapsed().as_secs_f32());
 
-    let (token_emb, grad_accum, primary_log) = primary;
+    let (model, grad_accum, primary_log) = primary;
     for line in &primary_log {
         println!("{line}");
     }
@@ -407,7 +421,7 @@ fn main() {
     );
 
     let embedding_rows: Vec<Vec<f32>> =
-        filtered_bytes.iter().map(|&b| token_emb.table.data[b * d_model..b * d_model + d_model].to_vec()).collect();
+        filtered_bytes.iter().map(|&b| model.token_emb.table.data[b * d_model..b * d_model + d_model].to_vec()).collect();
 
     // Fixed k-means-init seed, independent of the training rng - isolates
     // model-training randomness as the only thing varying across the
@@ -522,5 +536,74 @@ fn main() {
         if !members.is_empty() {
             println!("  component {c}: {}", members.join(" "));
         }
+    }
+
+    // Second, independent KR&R extraction from tiny_lm.rs, rerun here on
+    // the scaled corpus: averaged attention weights (block 0, head 0 only -
+    // same named limitation as tiny_lm.rs, not yet re-checked) discretized
+    // into a top-2-targets-per-byte relational graph. Restricted to
+    // filtered_bytes, the same noise-excluded set the clustering above
+    // uses, for the same reason (untrained/near-untrained rows aren't
+    // signal). Exhaustive coverage (every window position) was tractable on
+    // tiny_lm.rs's 172-byte corpus (~156 windows); this corpus's train
+    // region has ~214,000 possible window positions, so exhaustive coverage
+    // would mean ~214,000 forward passes - random sampling instead, same
+    // proportionate-scope reasoning as eval_loss's 20-window sample, just a
+    // bigger sample since this needs per-byte-pair coverage, not one
+    // aggregate number. Uses the primary model only (seed 1) - this is the
+    // "does it hold up on a bigger corpus" check, not yet the cross-seed
+    // stability check the clustering above already went through.
+    let byte_index: HashMap<usize, usize> = filtered_bytes.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let n_bytes = filtered_bytes.len();
+    let mut weight_sum = vec![0.0f32; n_bytes * n_bytes];
+    let mut weight_count = vec![0u32; n_bytes * n_bytes];
+
+    let attn_windows = 20000;
+    let mut attn_rng = Rng::new(777);
+    let mut windows_used = 0;
+    for _ in 0..attn_windows {
+        let (window, _) = sample_window(&mut attn_rng, train, seq_len);
+        // Skip windows containing a filtered-out (noise) byte entirely,
+        // rather than silently dropping just that byte's rows/cols mid-
+        // window - keeps every included window's qi/ki pairs restricted to
+        // the same known set byte_index expects.
+        if window.iter().any(|b| !byte_index.contains_key(b)) {
+            continue;
+        }
+        windows_used += 1;
+        let mut tape = Tape::new();
+        let (_, out) = forward(&mut tape, &model.token_emb, &model.pos_emb, &model.blocks, &model.final_ln, &model.output_proj, &window);
+        let weights = tape.value(out.block_outs[0].head_weights[0]);
+        for qi in 0..seq_len {
+            let qi_idx = byte_index[&window[qi]];
+            for ki in 0..seq_len {
+                let ki_idx = byte_index[&window[ki]];
+                weight_sum[qi_idx * n_bytes + ki_idx] += weights.data[qi * seq_len + ki];
+                weight_count[qi_idx * n_bytes + ki_idx] += 1;
+            }
+        }
+    }
+
+    println!(
+        "\nattention-derived relational graph (block 0, head 0), top-2 targets per byte, {windows_used} sampled windows:"
+    );
+    for (i, &b) in filtered_bytes.iter().enumerate() {
+        let mut targets: Vec<(usize, f32)> = (0..n_bytes)
+            .filter_map(|j| {
+                let c = weight_count[i * n_bytes + j];
+                if c == 0 {
+                    None
+                } else {
+                    Some((j, weight_sum[i * n_bytes + j] / c as f32))
+                }
+            })
+            .collect();
+        targets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let top: Vec<String> = targets
+            .iter()
+            .take(2)
+            .map(|&(j, w)| format!("{:?}({:.2})", (filtered_bytes[j] as u8) as char, w))
+            .collect();
+        println!("  {:?} -> {}", (b as u8) as char, top.join(", "));
     }
 }
