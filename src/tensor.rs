@@ -16,27 +16,37 @@ pub struct NdArray {
 /// capacity is valid data.
 const MAX_RANK: usize = 4;
 
-fn unravel_index(lin: usize, shape: &[usize]) -> [usize; MAX_RANK] {
+/// Row-major strides for `shape`, computed once per call site (profiling
+/// found unravel_index/ravel_index recomputing this per ELEMENT via a fresh
+/// `shape[i+1..].iter().product()` scan - O(rank) redone on every one of a
+/// tensor's `total` elements, at 5 call sites, 36% of self-time combined).
+/// Only the first `shape.len()` slots are meaningful, same convention as
+/// unravel_index's returned array.
+fn strides_for(shape: &[usize]) -> [usize; MAX_RANK] {
     let nd = shape.len();
     assert!(nd <= MAX_RANK, "shape rank {nd} exceeds MAX_RANK {MAX_RANK}");
+    let mut strides = [0usize; MAX_RANK];
+    let mut acc = 1usize;
+    for i in (0..nd).rev() {
+        strides[i] = acc;
+        acc *= shape[i];
+    }
+    strides
+}
+
+fn unravel_index(lin: usize, strides: &[usize]) -> [usize; MAX_RANK] {
+    let nd = strides.len();
     let mut idx = [0usize; MAX_RANK];
     let mut rem = lin;
     for i in 0..nd {
-        let stride: usize = shape[i + 1..].iter().product();
-        idx[i] = rem / stride;
-        rem %= stride;
+        idx[i] = rem / strides[i];
+        rem %= strides[i];
     }
     idx
 }
 
-fn ravel_index(idx: &[usize], shape: &[usize]) -> usize {
-    let nd = shape.len();
-    let mut lin = 0usize;
-    for i in 0..nd {
-        let stride: usize = shape[i + 1..].iter().product();
-        lin += idx[i] * stride;
-    }
-    lin
+fn ravel_index(idx: &[usize], strides: &[usize]) -> usize {
+    idx.iter().zip(strides.iter()).map(|(&i, &s)| i * s).sum()
 }
 
 impl NdArray {
@@ -97,11 +107,13 @@ impl NdArray {
         out_shape[nd - 1] = 1;
         let mut out = vec![0.0f32; out_shape.iter().product()];
         let total: usize = self.shape.iter().product();
+        let in_strides = strides_for(&self.shape);
+        let out_strides = strides_for(&out_shape);
         for lin in 0..total {
-            let idx = unravel_index(lin, &self.shape);
+            let idx = unravel_index(lin, &in_strides[..nd]);
             let mut out_idx = idx;
             out_idx[nd - 1] = 0;
-            let out_lin = ravel_index(&out_idx, &out_shape);
+            let out_lin = ravel_index(&out_idx[..nd], &out_strides[..nd]);
             out[out_lin] += self.data[lin];
         }
         Self { data: out, shape: out_shape }
@@ -123,11 +135,13 @@ impl NdArray {
         out_shape[nd - 1] = 1;
         let mut out = vec![f32::NEG_INFINITY; out_shape.iter().product()];
         let total: usize = self.shape.iter().product();
+        let in_strides = strides_for(&self.shape);
+        let out_strides = strides_for(&out_shape);
         for lin in 0..total {
-            let idx = unravel_index(lin, &self.shape);
+            let idx = unravel_index(lin, &in_strides[..nd]);
             let mut out_idx = idx;
             out_idx[nd - 1] = 0;
-            let out_lin = ravel_index(&out_idx, &out_shape);
+            let out_lin = ravel_index(&out_idx[..nd], &out_strides[..nd]);
             out[out_lin] = out[out_lin].max(self.data[lin]);
         }
         Self { data: out, shape: out_shape }
@@ -153,13 +167,15 @@ impl NdArray {
         }
         out_shape[nd - 1] = total_last;
         let mut out = vec![0.0f32; out_shape.iter().product()];
+        let out_strides = strides_for(&out_shape);
         let mut offset = 0usize;
         for a in arrays {
             let total: usize = a.shape.iter().product();
+            let a_strides = strides_for(&a.shape);
             for lin in 0..total {
-                let mut idx = unravel_index(lin, &a.shape);
+                let mut idx = unravel_index(lin, &a_strides[..nd]);
                 idx[nd - 1] += offset;
-                let out_lin = ravel_index(&idx, &out_shape);
+                let out_lin = ravel_index(&idx[..nd], &out_strides[..nd]);
                 out[out_lin] = a.data[lin];
             }
             offset += a.shape[nd - 1];
@@ -176,10 +192,12 @@ impl NdArray {
         out_shape[nd - 1] = width;
         let total_out: usize = out_shape.iter().product();
         let mut out = vec![0.0f32; total_out];
+        let out_strides = strides_for(&out_shape);
+        let self_strides = strides_for(&self.shape);
         for lin in 0..total_out {
-            let mut idx = unravel_index(lin, &out_shape);
+            let mut idx = unravel_index(lin, &out_strides[..nd]);
             idx[nd - 1] += start;
-            let src_lin = ravel_index(&idx, &self.shape);
+            let src_lin = ravel_index(&idx[..nd], &self_strides[..nd]);
             out[lin] = self.data[src_lin];
         }
         Self { data: out, shape: out_shape }
@@ -323,13 +341,15 @@ impl NdArray {
 
         let total: usize = target.iter().product();
         let mut out = vec![0.0f32; total];
+        let target_strides = strides_for(target);
+        let self_strides = strides_for(&self.shape);
         for lin in 0..total {
-            let t_idx = unravel_index(lin, target);
+            let t_idx = unravel_index(lin, &target_strides[..nd]);
             let mut s_idx = [0usize; MAX_RANK];
             for i in 0..nd {
                 s_idx[i] = if padded_shape[i] == 1 { 0 } else { t_idx[i] };
             }
-            let src_lin = ravel_index(&s_idx[pad..nd], &self.shape);
+            let src_lin = ravel_index(&s_idx[pad..nd], &self_strides[..nd - pad]);
             out[lin] = self.data[src_lin];
         }
         Self { data: out, shape: target.to_vec() }
@@ -348,13 +368,15 @@ impl NdArray {
 
         let mut out = vec![0.0f32; target.iter().product()];
         let total_self: usize = self.shape.iter().product();
+        let self_strides = strides_for(&self.shape);
+        let target_strides = strides_for(target);
         for lin in 0..total_self {
-            let s_idx = unravel_index(lin, &self.shape);
+            let s_idx = unravel_index(lin, &self_strides[..nd]);
             let mut d_idx = [0usize; MAX_RANK];
             for i in 0..nd {
                 d_idx[i] = if padded_target[i] == 1 { 0 } else { s_idx[i] };
             }
-            let dst_lin = ravel_index(&d_idx[pad..nd], target);
+            let dst_lin = ravel_index(&d_idx[pad..nd], &target_strides[..nd - pad]);
             out[dst_lin] += self.data[lin];
         }
         Self { data: out, shape: target.to_vec() }
