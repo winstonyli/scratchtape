@@ -284,14 +284,6 @@ struct TrainedModel {
     output_proj: Linear,
 }
 
-/// Same training loop as train_token_embedding, plus every diagnostic the
-/// primary/reference run needs (grad_accum, periodic eval, generation) -
-/// duplicated rather than parameterized with a bunch of Option<_> diagnostic
-/// flags, same reasoning as every other duplicated helper in this file.
-/// Log lines are collected rather than printed directly so output stays
-/// deterministic and un-interleaved when this runs concurrently with the
-/// other seeds under thread::scope - each thread has its own stdout calls
-/// otherwise racing for output order with no benefit.
 /// Averages block-0/head-0 attention weight from query byte to key byte
 /// over `attn_windows` random samples from `train`, restricted to
 /// `filtered_bytes` (same noise-exclusion reasoning as the clustering
@@ -355,6 +347,90 @@ fn attention_graph(
     (graph, windows_used)
 }
 
+/// Same computation as attention_graph, generalized across every (block,
+/// head) pair in one pass over the sampled windows - a single forward()
+/// call already produces every block's every head's attention weights
+/// internally, so comparing all of them costs the same set of forward
+/// passes as comparing just one did, not n_blocks*n_heads times more.
+/// Returns [block][head][byte index] -> sorted (target index, avg weight).
+/// Used only on the primary model (unlike attention_graph, not needed per-
+/// seed) to test the named block-0/head-0-only limitation directly:
+/// multihead_attention_recall.rs already found one head blind and another
+/// sighted on the identical query - this checks whether that same kind of
+/// per-head specialization shows up here too.
+fn attention_graph_all_heads(
+    model: &TrainedModel,
+    train: &[usize],
+    filtered_bytes: &[usize],
+    seq_len: usize,
+    attn_windows: usize,
+    window_seed: u64,
+    n_blocks: usize,
+    n_heads: usize,
+) -> Vec<Vec<Vec<Vec<(usize, f32)>>>> {
+    let byte_index: HashMap<usize, usize> = filtered_bytes.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let n_bytes = filtered_bytes.len();
+    let mut weight_sum = vec![vec![vec![0.0f32; n_bytes * n_bytes]; n_heads]; n_blocks];
+    let mut weight_count = vec![vec![vec![0u32; n_bytes * n_bytes]; n_heads]; n_blocks];
+
+    let mut attn_rng = Rng::new(window_seed);
+    for _ in 0..attn_windows {
+        let (window, _) = sample_window(&mut attn_rng, train, seq_len);
+        if window.iter().any(|b| !byte_index.contains_key(b)) {
+            continue;
+        }
+        let mut tape = Tape::new();
+        let (_, out) =
+            forward(&mut tape, &model.token_emb, &model.pos_emb, &model.blocks, &model.final_ln, &model.output_proj, &window);
+        for block in 0..n_blocks {
+            for head in 0..n_heads {
+                let weights = tape.value(out.block_outs[block].head_weights[head]);
+                for qi in 0..seq_len {
+                    let qi_idx = byte_index[&window[qi]];
+                    for ki in 0..seq_len {
+                        let ki_idx = byte_index[&window[ki]];
+                        weight_sum[block][head][qi_idx * n_bytes + ki_idx] += weights.data[qi * seq_len + ki];
+                        weight_count[block][head][qi_idx * n_bytes + ki_idx] += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    (0..n_blocks)
+        .map(|block| {
+            (0..n_heads)
+                .map(|head| {
+                    (0..n_bytes)
+                        .map(|i| {
+                            let mut targets: Vec<(usize, f32)> = (0..n_bytes)
+                                .filter_map(|j| {
+                                    let c = weight_count[block][head][i * n_bytes + j];
+                                    if c == 0 {
+                                        None
+                                    } else {
+                                        Some((j, weight_sum[block][head][i * n_bytes + j] / c as f32))
+                                    }
+                                })
+                                .collect();
+                            targets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                            targets
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Same training loop as train_token_embedding, plus every diagnostic the
+/// primary/reference run needs (grad_accum, periodic eval, generation) -
+/// duplicated rather than parameterized with a bunch of Option<_> diagnostic
+/// flags, same reasoning as every other duplicated helper in this file.
+/// Log lines are collected rather than printed directly so output stays
+/// deterministic and un-interleaved when this runs concurrently with the
+/// other seeds under thread::scope - each thread has its own stdout calls
+/// otherwise racing for output order with no benefit.
 fn train_with_diagnostics(
     seed: u64,
     train: &[usize],
@@ -808,4 +884,38 @@ fn main() {
         "\n{k_folds}-fold held-out mean accuracy: baseline (embedding only) = {:.3}, graph-augmented = {:.3}",
         mean(&baseline_accs), mean(&gnn_accs)
     );
+
+    // Direct test of the named block-0/head-0-only limitation this
+    // extraction has carried since tiny_lm.rs: does every head show the
+    // same self-attention/arbitrary-sink pattern, or does per-head
+    // specialization (multihead_attention_recall.rs's "one head blind, one
+    // sighted" finding) show up here too? One extra pass over the same
+    // sampled windows gets every block's every head at once - the forward
+    // pass already computes them all internally.
+    let all_heads = attention_graph_all_heads(&model, train, &filtered_bytes, seq_len, attn_windows, 777, n_blocks, n_heads);
+    println!("\nper-head self-attention rate and top sink target (block 0-{}, head 0-{}):", n_blocks - 1, n_heads - 1);
+    for block in 0..n_blocks {
+        for head in 0..n_heads {
+            let graph = &all_heads[block][head];
+            let mut self_count = 0;
+            let mut covered = 0;
+            let mut sink_counts: HashMap<usize, usize> = HashMap::new();
+            for (i, targets) in graph.iter().enumerate() {
+                if let Some(&(top, _)) = targets.first() {
+                    covered += 1;
+                    if top == i {
+                        self_count += 1;
+                    } else {
+                        *sink_counts.entry(top).or_insert(0) += 1;
+                    }
+                }
+            }
+            let self_rate = self_count as f32 / covered as f32;
+            let top_sink = sink_counts.iter().max_by_key(|&(_, &c)| c);
+            let sink_desc = top_sink
+                .map(|(&j, &c)| format!("{:?}({c})", (filtered_bytes[j] as u8) as char))
+                .unwrap_or_else(|| "-".to_string());
+            println!("  block {block} head {head}: self-attention rate = {self_rate:.2}, top sink target = {sink_desc}");
+        }
+    }
 }
