@@ -1,0 +1,8 @@
+# AVX2+FMA measured ~7-16% faster than SSE2 baseline on NdArray::matmul
+# (LLVM auto-vectorizes wider: 8 floats/instruction instead of 4). Not
+# target-cpu=native: this CPU also has AVX-512, which measured 2-3x SLOWER
+# here (known downclocking effect on 512-bit ops) - AVX2 alone avoids it.
+# Requires a CPU with AVX2 (~2013+ on x86_64) - illegal instruction on older
+# hardware.
+[build]
+rustflags = ["-C", "target-feature=+avx2,+fma"]
