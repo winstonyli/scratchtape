@@ -339,36 +339,43 @@ impl NdArray {
         Self { data: out, shape: target.to_vec() }
     }
 
-    pub fn add(&self, other: &Self) -> Self {
+    /// Shared elementwise-with-broadcast implementation for add/sub/mul/div.
+    /// Fast path when shapes already match exactly (the common case - most
+    /// tape ops combine same-shape tensors, broadcasting is the exception
+    /// e.g. a bias vector against a batch): skips broadcast_to entirely,
+    /// which otherwise clones BOTH operands (its own fast path still calls
+    /// .clone()) before the actual output allocation - 3 allocations where
+    /// 1 suffices. Pure performance path: produces identical values either
+    /// way, verified by the existing gradient-check tests passing unchanged.
+    fn elementwise(&self, other: &Self, f: impl Fn(f32, f32) -> f32) -> Self {
+        if self.shape == other.shape {
+            let data = self.data.iter().zip(other.data.iter()).map(|(&x, &y)| f(x, y)).collect();
+            return Self { data, shape: self.shape.clone() };
+        }
         let shape = Self::broadcast_shape(&self.shape, &other.shape);
         let a = self.broadcast_to(&shape);
         let b = other.broadcast_to(&shape);
-        Self { data: a.data.iter().zip(b.data.iter()).map(|(x, y)| x + y).collect(), shape }
+        let data = a.data.iter().zip(b.data.iter()).map(|(&x, &y)| f(x, y)).collect();
+        Self { data, shape }
+    }
+
+    pub fn add(&self, other: &Self) -> Self {
+        self.elementwise(other, |x, y| x + y)
     }
 
     pub fn sub(&self, other: &Self) -> Self {
-        let shape = Self::broadcast_shape(&self.shape, &other.shape);
-        let a = self.broadcast_to(&shape);
-        let b = other.broadcast_to(&shape);
-        Self { data: a.data.iter().zip(b.data.iter()).map(|(x, y)| x - y).collect(), shape }
+        self.elementwise(other, |x, y| x - y)
     }
 
     pub fn mul(&self, other: &Self) -> Self {
-        let shape = Self::broadcast_shape(&self.shape, &other.shape);
-        let a = self.broadcast_to(&shape);
-        let b = other.broadcast_to(&shape);
-        Self { data: a.data.iter().zip(b.data.iter()).map(|(x, y)| x * y).collect(), shape }
+        self.elementwise(other, |x, y| x * y)
     }
 
-    /// Broadcasting, same as add/sub/mul - reuses the same machinery rather
-    /// than being the one sibling op that behaves differently. +/-inf on
-    /// division by zero (IEEE 754 passthrough, no guard): Adam's `+ eps`
-    /// upstream is what prevents an exact zero denominator, not this op.
+    /// +/-inf on division by zero (IEEE 754 passthrough, no guard): Adam's
+    /// `+ eps` upstream is what prevents an exact zero denominator, not
+    /// this op.
     pub fn div(&self, other: &Self) -> Self {
-        let shape = Self::broadcast_shape(&self.shape, &other.shape);
-        let a = self.broadcast_to(&shape);
-        let b = other.broadcast_to(&shape);
-        Self { data: a.data.iter().zip(b.data.iter()).map(|(x, y)| x / y).collect(), shape }
+        self.elementwise(other, |x, y| x / y)
     }
 }
 
