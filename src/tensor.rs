@@ -339,6 +339,24 @@ impl NdArray {
         let mut padded_shape = vec![1usize; pad];
         padded_shape.extend_from_slice(&self.shape);
 
+        // Fast path: broadcasting only happens over the leading (padded)
+        // axes - self's own dims all match target's trailing dims exactly,
+        // so every "row" is an identical copy of self.data (the actual
+        // dominant case in this codebase: a [1,d]-shaped bias broadcasting
+        // against [n,d] activations). Checked via disassembly first: LLVM
+        // already vectorizes the general path below via masked gather loads
+        // (vpmaskmovq), but a gather from scattered addresses is still
+        // costlier than a plain sequential copy - this skips the gather
+        // machinery entirely for the pattern that actually occurs.
+        if (pad..nd).all(|i| padded_shape[i] == target[i]) {
+            let total: usize = target.iter().product();
+            let mut out = Vec::with_capacity(total);
+            while out.len() < total {
+                out.extend_from_slice(&self.data);
+            }
+            return Self { data: out, shape: target.to_vec() };
+        }
+
         let total: usize = target.iter().product();
         let mut out = vec![0.0f32; total];
         let target_strides = strides_for(target);
@@ -365,6 +383,21 @@ impl NdArray {
         let pad = nd - target.len();
         let mut padded_target = vec![1usize; pad];
         padded_target.extend_from_slice(target);
+
+        // Mirror of broadcast_to's fast path: reduction only happens over
+        // the leading (padded) axes, so self.data is just `repeat_count`
+        // contiguous chunks of length target_len to sum elementwise - no
+        // per-element index computation needed.
+        if (pad..nd).all(|i| padded_target[i] == self.shape[i]) {
+            let target_len: usize = target.iter().product();
+            let mut out = vec![0.0f32; target_len];
+            for chunk in self.data.chunks(target_len) {
+                for (o, c) in out.iter_mut().zip(chunk.iter()) {
+                    *o += c;
+                }
+            }
+            return Self { data: out, shape: target.to_vec() };
+        }
 
         let mut out = vec![0.0f32; target.iter().product()];
         let total_self: usize = self.shape.iter().product();
