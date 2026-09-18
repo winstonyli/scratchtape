@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# First non-dev dependencies this project takes. wgpu: cross-platform GPU
+# access (Vulkan/Metal/DX12), no NVIDIA-only lock-in - matmul kernel is
+# hand-written WGSL, not a call into a pre-built library like cuBLAS, to
+# keep the "build the primitive yourself" stance used for matmul/softmax/
+# cross-entropy on the CPU side. pollster: wgpu's adapter/device requests
+# are async fns with no included executor - pollster is a small, minimal
+# blocking executor (not a full runtime like tokio) to drive them.
+wgpu = "23"
+pollster = "0.4"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -14,6 +23,10 @@ harness = false
 
 [[bench]]
 name = "transformer_block"
+harness = false
+
+[[bench]]
+name = "gpu_matmul"
 harness = false
 
 # Release optimizations + debug symbols kept in, so `samply record` gets
