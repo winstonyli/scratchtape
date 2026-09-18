@@ -1,6 +1,7 @@
 use crate::optim::Sgd;
 use crate::tape::{Tape, Var};
 use crate::tensor::NdArray;
+use std::cell::RefCell;
 
 /// xorshift64 PRNG. Hand-rolled, not from a crate - deterministic given a
 /// seed, which matters for reproducing a training run exactly.
@@ -292,6 +293,17 @@ pub struct TransformerBlock {
     ln2: LayerNorm,
     ffn1: Linear,
     ffn2: Linear,
+    /// Causal mask is identical on every call for a fixed seq_len - cached
+    /// rather than rebuilt (fresh allocation + O(seq_len^2) fill loop) on
+    /// every forward pass. RefCell, not a signature change to &mut self:
+    /// forward() stays &self so every existing call site (tiny_lm.rs,
+    /// catastrophic_forgetting.rs, etc.) needs no changes. Recomputed only
+    /// when seq_len actually changes from what's cached; still pays one
+    /// clone per call to hand ownership to the leaf, since Tape::leaf
+    /// takes an owned NdArray and the tape itself is rebuilt fresh every
+    /// step - only the O(seq_len^2) fill loop is eliminated, not the
+    /// per-call allocation entirely.
+    mask_cache: RefCell<Option<(usize, NdArray)>>,
 }
 
 impl TransformerBlock {
@@ -309,12 +321,21 @@ impl TransformerBlock {
             ln2: LayerNorm::new(d_model),
             ffn1: Linear::new(rng, d_model, d_ff),
             ffn2: Linear::new(rng, d_ff, d_model),
+            mask_cache: RefCell::new(None),
         }
     }
 
     pub fn forward(&self, tape: &mut Tape, x: Var) -> TransformerBlockOut {
         let seq_len = tape.value(x).shape[0];
-        let mask = tape.leaf(causal_mask(seq_len));
+        let mask_value = {
+            let mut cache = self.mask_cache.borrow_mut();
+            let needs_recompute = !matches!(&*cache, Some((cached_len, _)) if *cached_len == seq_len);
+            if needs_recompute {
+                *cache = Some((seq_len, causal_mask(seq_len)));
+            }
+            cache.as_ref().unwrap().1.clone()
+        };
+        let mask = tape.leaf(mask_value);
 
         let ln1_out = self.ln1.forward(tape, x);
         let normed1 = ln1_out.y;
@@ -402,7 +423,7 @@ impl TransformerBlock {
         let ln2 = LayerNorm::from_flat(data, offset, d_model);
         let ffn1 = Linear::from_flat(data, offset, d_model, d_ff);
         let ffn2 = Linear::from_flat(data, offset, d_ff, d_model);
-        Self { n_heads, d_k, ln1, q_heads, k_heads, v_heads, out_proj, ln2, ffn1, ffn2 }
+        Self { n_heads, d_k, ln1, q_heads, k_heads, v_heads, out_proj, ln2, ffn1, ffn2, mask_cache: RefCell::new(None) }
     }
 }
 
