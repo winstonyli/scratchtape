@@ -263,13 +263,23 @@ impl NdArray {
         let (k2, n) = (other.shape[0], other.shape[1]);
         assert_eq!(k, k2, "matmul inner dims must match: {:?} vs {:?}", self.shape, other.shape);
         let mut out = vec![0.0f32; m * n];
-        // i-k-j loop order: inner loop is contiguous in both `other` and `out` (row-major),
-        // sequential memory access instead of strided - cache-friendly without needing SIMD/BLAS yet.
-        for i in 0..m {
-            for p in 0..k {
-                let a_ip = self.data[i * k + p];
-                for j in 0..n {
-                    out[i * n + j] += a_ip * other.data[p * n + j];
+        // Cache-blocked on i/p only, j left full-width: blocking j too showed
+        // a large regression at n=256 in one bench run (possibly confounded
+        // by concurrent machine load, not confirmed in isolation) - leaving j
+        // unblocked measured consistent improvement across all sizes with no
+        // such downside, so that's the version kept.
+        const BLOCK: usize = 64;
+        for i0 in (0..m).step_by(BLOCK) {
+            let i_max = (i0 + BLOCK).min(m);
+            for p0 in (0..k).step_by(BLOCK) {
+                let p_max = (p0 + BLOCK).min(k);
+                for i in i0..i_max {
+                    for p in p0..p_max {
+                        let a_ip = self.data[i * k + p];
+                        for j in 0..n {
+                            out[i * n + j] += a_ip * other.data[p * n + j];
+                        }
+                    }
                 }
             }
         }
