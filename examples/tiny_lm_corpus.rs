@@ -42,11 +42,14 @@ fn run_kfold_probe(
     d_model: usize,
     k_folds: usize,
     fold_seed: u64,
+    verbose: bool,
 ) -> (f32, f32, f32) {
     let n_nodes = labels.len();
     let positive_count = labels.iter().filter(|&&l| l == 1).count();
     let majority_baseline = (n_nodes - positive_count).max(positive_count) as f32 / n_nodes as f32;
-    println!("\n{category} probe: {positive_count} positive / {n_nodes} nodes (majority-class baseline = {majority_baseline:.3})");
+    if verbose {
+        println!("\n{category} probe: {positive_count} positive / {n_nodes} nodes (majority-class baseline = {majority_baseline:.3})");
+    }
 
     // Stratified: positive and negative indices shuffled and round-robin'd
     // into folds separately, so every fold gets a proportional share of
@@ -122,14 +125,18 @@ fn run_kfold_probe(
         let train_idx: Vec<usize> = (0..n_nodes).filter(|i| !test_idx.contains(i)).collect();
         let baseline_acc = held_out_accuracy(test_idx, &train_idx, false, 1000 + fold as u64);
         let gnn_acc = held_out_accuracy(test_idx, &train_idx, true, 2000 + fold as u64);
-        println!("  fold {fold}: test_size={}, baseline={baseline_acc:.3}, gnn={gnn_acc:.3}", test_idx.len());
+        if verbose {
+            println!("  fold {fold}: test_size={}, baseline={baseline_acc:.3}, gnn={gnn_acc:.3}", test_idx.len());
+        }
         baseline_accs.push(baseline_acc);
         gnn_accs.push(gnn_acc);
     }
 
     let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
     let (mean_baseline, mean_gnn) = (mean(&baseline_accs), mean(&gnn_accs));
-    println!("{k_folds}-fold held-out mean accuracy: baseline (embedding only) = {mean_baseline:.3}, graph-augmented = {mean_gnn:.3}");
+    if verbose {
+        println!("{k_folds}-fold held-out mean accuracy: baseline (embedding only) = {mean_baseline:.3}, graph-augmented = {mean_gnn:.3}");
+    }
     (mean_baseline, mean_gnn, majority_baseline)
 }
 
@@ -915,7 +922,8 @@ fn main() {
     let mut summary = Vec::new();
     for (name, predicate, fold_seed) in categories {
         let labels: Vec<usize> = filtered_bytes.iter().map(|&b| if predicate(b) { 1 } else { 0 }).collect();
-        let (base, gnn, majority) = run_kfold_probe(name, &labels, &node_features, &neighbor1, &neighbor2, d_model, k_folds, fold_seed);
+        let (base, gnn, majority) =
+            run_kfold_probe(name, &labels, &node_features, &neighbor1, &neighbor2, d_model, k_folds, fold_seed, true);
         summary.push((name, majority, base, gnn));
     }
     println!("\nlinear-probe summary (category: majority-baseline | embedding-only | graph-augmented):");
@@ -954,6 +962,45 @@ fn main() {
                 .map(|(&j, &c)| format!("{:?}({c})", (filtered_bytes[j] as u8) as char))
                 .unwrap_or_else(|| "-".to_string());
             println!("  block {block} head {head}: self-attention rate = {self_rate:.2}, top sink target = {sink_desc}");
+        }
+    }
+
+    // Direct follow-up to the linear-probe summary: block 0/head 0's graph
+    // hurt is-uppercase (-5.6pp vs embedding-only) while helping every
+    // other category. Given how sharply heads specialize (just shown
+    // above), some other head's graph might do the opposite. No
+    // retraining needed - all_heads already has every head's targets;
+    // this just re-derives neighbor1/neighbor2 per head and reruns the
+    // is-uppercase probe's graph-augmented condition against each.
+    let uppercase_labels: Vec<usize> =
+        filtered_bytes.iter().map(|&b| if ((b as u8) as char).is_ascii_uppercase() { 1 } else { 0 }).collect();
+    // Reuses the embedding-only baseline already computed in the summary
+    // loop above (same labels, same fold_seed=43) rather than recomputing
+    // it - the baseline doesn't depend on which head's graph is used at
+    // all, so there's nothing new to learn from rerunning it.
+    let uppercase_baseline = summary.iter().find(|&&(name, ..)| name == "is-uppercase").unwrap().2;
+    println!(
+        "\nis-uppercase graph-augmented accuracy per (block, head) - embedding-only baseline = {uppercase_baseline:.3}:"
+    );
+    for block in 0..n_blocks {
+        for head in 0..n_heads {
+            let graph = &all_heads[block][head];
+            let head_neighbor1: Vec<usize> = (0..n_nodes).map(|i| graph[i].first().map(|&(j, _)| j).unwrap_or(i)).collect();
+            let head_neighbor2: Vec<usize> =
+                (0..n_nodes).map(|i| graph[i].get(1).map(|&(j, _)| j).unwrap_or(head_neighbor1[i])).collect();
+            let (_, gnn_acc, _) = run_kfold_probe(
+                "is-uppercase",
+                &uppercase_labels,
+                &node_features,
+                &head_neighbor1,
+                &head_neighbor2,
+                d_model,
+                k_folds,
+                43,
+                false,
+            );
+            let delta = gnn_acc - uppercase_baseline;
+            println!("  block {block} head {head}: graph-augmented = {gnn_acc:.3} ({delta:+.3})");
         }
     }
 }
