@@ -1,5 +1,5 @@
 use engine::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
-use engine::optim::Sgd;
+use engine::optim::{Adam, AdamState, Sgd};
 use engine::tape::{Tape, Var};
 use std::collections::HashMap;
 use std::thread;
@@ -12,6 +12,17 @@ fn encode_bytes(text: &str) -> Vec<usize> {
 fn decode_bytes(ids: &[usize]) -> String {
     let bytes: Vec<u8> = ids.iter().map(|&i| i as u8).collect();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Fisher-Yates, same rng-driven-index style as kmeans's centroid picks.
+/// Used for the GNN k-fold split below - stratifying vowel/non-vowel
+/// indices separately needs each half shuffled independently before
+/// round-robin assignment into folds.
+fn shuffle(items: &mut [usize], rng: &mut Rng) {
+    for i in (1..items.len()).rev() {
+        let j = (rng.next_f32() * (i + 1) as f32) as usize;
+        items.swap(i, j);
+    }
 }
 
 fn sample_window(rng: &mut Rng, corpus: &[usize], seq_len: usize) -> (Vec<usize>, Vec<usize>) {
@@ -678,5 +689,123 @@ fn main() {
     println!(
         "summary: {unanimous_count} unanimous, {majority_count} majority (2/3), {none_count} all-different, {gap_count} sampling-gap, out of {} bytes",
         filtered_bytes.len()
+    );
+
+    // Third independent extraction from this project's design log, rerun
+    // here on the scaled corpus: GNN message-passing over the attention
+    // graph ([178af66]), is-vowel prediction as an externally-checkable
+    // probe (not model-derived). Originally inconclusive by a stated data
+    // limit, not by finding: only 34 labeled nodes / 7 positive examples
+    // meant both baseline and graph-augmented classifiers hit a 100%
+    // training-accuracy ceiling regardless of graph structure, and a
+    // held-out split was named as "unreliable with only 7 positive examples
+    // total." filtered_bytes has 92 nodes here - enough to actually run a
+    // held-out comparison instead of training-accuracy-only. Reuses
+    // primary_graph's already-computed top-2 targets rather than
+    // recomputing the attention graph a second time.
+    // Falls back to self (i) when a byte has no attention data at all (the
+    // 5 sampling-gap bytes from the cross-seed check above, empty
+    // target list) - a safe identity/no-op edge rather than an out-of-
+    // bounds index, consistent with neighbor2's existing fallback to
+    // neighbor1 when there's no 2nd target.
+    let n_nodes = filtered_bytes.len();
+    let neighbor1: Vec<usize> = (0..n_nodes).map(|i| primary_graph[i].first().map(|&(j, _)| j).unwrap_or(i)).collect();
+    let neighbor2: Vec<usize> =
+        (0..n_nodes).map(|i| primary_graph[i].get(1).map(|&(j, _)| j).unwrap_or(neighbor1[i])).collect();
+
+    let is_vowel = |b: usize| matches!((b as u8) as char, 'a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U');
+    let gnn_labels: Vec<usize> = filtered_bytes.iter().map(|&b| if is_vowel(b) { 1 } else { 0 }).collect();
+    let vowel_count = gnn_labels.iter().filter(|&&l| l == 1).count();
+    println!(
+        "\nGNN is-vowel probe: {vowel_count} vowels out of {n_nodes} nodes (majority-class baseline accuracy: {:.3})",
+        (n_nodes - vowel_count).max(vowel_count) as f32 / n_nodes as f32
+    );
+
+    let node_features = model.token_emb.table.gather_rows(&filtered_bytes);
+
+    // Stratified k-fold: vowel and non-vowel indices shuffled and round-
+    // robin'd into folds separately, so every fold gets a proportional
+    // share of the (still small, ~10-vowel) positive class instead of
+    // risking an all-negative test fold under plain random splitting.
+    let k_folds = 5;
+    let mut fold_rng = Rng::new(42);
+    let mut vowel_idxs: Vec<usize> = (0..n_nodes).filter(|&i| gnn_labels[i] == 1).collect();
+    let mut nonvowel_idxs: Vec<usize> = (0..n_nodes).filter(|&i| gnn_labels[i] == 0).collect();
+    shuffle(&mut vowel_idxs, &mut fold_rng);
+    shuffle(&mut nonvowel_idxs, &mut fold_rng);
+    let mut folds: Vec<Vec<usize>> = vec![Vec::new(); k_folds];
+    for (i, &idx) in vowel_idxs.iter().chain(nonvowel_idxs.iter()).enumerate() {
+        folds[i % k_folds].push(idx);
+    }
+
+    let hidden = 16;
+    let adam = Adam { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 };
+    let train_steps = 400;
+
+    let held_out_accuracy = |test_idx: &[usize], train_idx: &[usize], use_graph: bool, seed: u64| -> f32 {
+        let mut clf_rng = Rng::new(seed);
+        let in_dim = if use_graph { 2 * d_model } else { d_model };
+        let mut l1 = Linear::new(&mut clf_rng, in_dim, hidden);
+        let mut l2 = Linear::new(&mut clf_rng, hidden, 2);
+        let mut s1w = AdamState::zeros_like(&l1.w);
+        let mut s1b = AdamState::zeros_like(&l1.b);
+        let mut s2w = AdamState::zeros_like(&l2.w);
+        let mut s2b = AdamState::zeros_like(&l2.b);
+        let train_labels: Vec<usize> = train_idx.iter().map(|&i| gnn_labels[i]).collect();
+
+        let mut acc = 0.0;
+        for step in 0..train_steps {
+            let mut tape = Tape::new();
+            let x0 = tape.leaf(node_features.clone());
+            let features = if use_graph {
+                let n1 = tape.gather(x0, &neighbor1);
+                let n2 = tape.gather(x0, &neighbor2);
+                let sum_n = tape.add(n1, n2);
+                let avg_neighbor = tape.scale(sum_n, 0.5);
+                tape.concat(&[x0, avg_neighbor])
+            } else {
+                x0
+            };
+            let h1 = l1.forward(&mut tape, features);
+            let h1r = tape.relu(h1.y);
+            let h2 = l2.forward(&mut tape, h1r);
+            let train_logits = tape.gather(h2.y, train_idx);
+            let loss = tape.cross_entropy(train_logits, &train_labels);
+            tape.backward(loss);
+            adam.step(&mut l1.w, tape.grad(h1.w).unwrap(), &mut s1w);
+            adam.step(&mut l1.b, tape.grad(h1.b).unwrap(), &mut s1b);
+            adam.step(&mut l2.w, tape.grad(h2.w).unwrap(), &mut s2w);
+            adam.step(&mut l2.b, tape.grad(h2.b).unwrap(), &mut s2b);
+            if step == train_steps - 1 {
+                let logits = tape.value(h2.y);
+                let correct = test_idx
+                    .iter()
+                    .filter(|&&i| {
+                        let pred = if logits.data[i * 2 + 1] > logits.data[i * 2] { 1 } else { 0 };
+                        pred == gnn_labels[i]
+                    })
+                    .count();
+                acc = correct as f32 / test_idx.len() as f32;
+            }
+        }
+        acc
+    };
+
+    let mut baseline_accs = Vec::new();
+    let mut gnn_accs = Vec::new();
+    for fold in 0..k_folds {
+        let test_idx = &folds[fold];
+        let train_idx: Vec<usize> = (0..n_nodes).filter(|i| !test_idx.contains(i)).collect();
+        let baseline_acc = held_out_accuracy(test_idx, &train_idx, false, 1000 + fold as u64);
+        let gnn_acc = held_out_accuracy(test_idx, &train_idx, true, 2000 + fold as u64);
+        println!("  fold {fold}: test_size={}, baseline={baseline_acc:.3}, gnn={gnn_acc:.3}", test_idx.len());
+        baseline_accs.push(baseline_acc);
+        gnn_accs.push(gnn_acc);
+    }
+
+    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+    println!(
+        "\n{k_folds}-fold held-out mean accuracy: baseline (embedding only) = {:.3}, graph-augmented = {:.3}",
+        mean(&baseline_accs), mean(&gnn_accs)
     );
 }
