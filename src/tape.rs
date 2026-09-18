@@ -21,6 +21,7 @@ enum OpKind {
     Sub(usize, usize),
     Mul(usize, usize),
     MatMul(usize, usize),
+    BatchedMatMul(usize, usize, usize, bool),
     Relu(usize),
     Sum(usize),
     Scale(usize, f32),
@@ -38,6 +39,71 @@ struct Node {
     value: NdArray,
     grad: Option<NdArray>,
     op: OpKind,
+}
+
+/// Extracts one contiguous row-chunk. Row-major layout makes this a plain
+/// sub-range copy, no gather needed - simpler than concat_last_axis/
+/// slice_last_axis, which operate on the non-contiguous last axis instead.
+fn row_chunk(arr: &NdArray, chunk_idx: usize, num_chunks: usize) -> NdArray {
+    let total_rows = arr.shape[0];
+    let cols = arr.shape[1];
+    let rows_per_chunk = total_rows / num_chunks;
+    let start = chunk_idx * rows_per_chunk * cols;
+    let end = start + rows_per_chunk * cols;
+    NdArray::new(arr.data[start..end].to_vec(), vec![rows_per_chunk, cols])
+}
+
+/// Batched matmul forward: loops batch_size independent 2D matmuls over
+/// row-chunks of `a`/`b`, writing each chunk's result into the right slice
+/// of one output buffer - reuses NdArray::matmul/transpose unchanged, no
+/// NdArray rank generalization needed (surveyed and rejected - too much
+/// ripple through Linear/LayerNorm/softmax/cross_entropy for what a single
+/// dedicated op can do instead). transpose_b handles attention's Q@K^T case:
+/// each chunk's B operand is transposed individually, before that chunk's
+/// matmul - never the whole stacked B, which would wrongly mix batches
+/// together (the bug a naive dense-stack-then-block-diagonal-mask approach
+/// has: computes a full (batch*seq)x(batch*seq) matrix and masks out the
+/// cross-batch entries afterward, wasting O(batch) more compute than this
+/// per-chunk loop does).
+fn batched_matmul_forward(a: &NdArray, b: &NdArray, batch_size: usize, transpose_b: bool) -> NdArray {
+    let a_rows_per_chunk = a.shape[0] / batch_size;
+    let out_cols = if transpose_b { b.shape[0] / batch_size } else { b.shape[1] };
+    let mut out = vec![0.0f32; a.shape[0] * out_cols];
+    for i in 0..batch_size {
+        let a_chunk = row_chunk(a, i, batch_size);
+        let b_chunk = row_chunk(b, i, batch_size);
+        let chunk_out = if transpose_b { a_chunk.matmul(&b_chunk.transpose()) } else { a_chunk.matmul(&b_chunk) };
+        let start = i * a_rows_per_chunk * out_cols;
+        out[start..start + a_rows_per_chunk * out_cols].copy_from_slice(&chunk_out.data);
+    }
+    NdArray::new(out, vec![a.shape[0], out_cols])
+}
+
+/// Backward for batched_matmul_forward - same per-chunk derivation as plain
+/// MatMul's backward (C=A@B: dA=dC@Bᵀ, dB=Aᵀ@dC; C=A@Bᵀ: dA=dC@B, dB=dCᵀ@A),
+/// just looped per batch chunk instead of applied once.
+fn batched_matmul_backward(a: &NdArray, b: &NdArray, grad: &NdArray, batch_size: usize, transpose_b: bool) -> (NdArray, NdArray) {
+    let mut grad_a = vec![0.0f32; a.data.len()];
+    let mut grad_b = vec![0.0f32; b.data.len()];
+    let a_cols = a.shape[1];
+    let b_cols = b.shape[1];
+    let a_rows_per_chunk = a.shape[0] / batch_size;
+    let b_rows_per_chunk = b.shape[0] / batch_size;
+    for i in 0..batch_size {
+        let a_chunk = row_chunk(a, i, batch_size);
+        let b_chunk = row_chunk(b, i, batch_size);
+        let grad_chunk = row_chunk(grad, i, batch_size);
+        let (da_chunk, db_chunk) = if transpose_b {
+            (grad_chunk.matmul(&b_chunk), grad_chunk.transpose().matmul(&a_chunk))
+        } else {
+            (grad_chunk.matmul(&b_chunk.transpose()), a_chunk.transpose().matmul(&grad_chunk))
+        };
+        let a_start = i * a_rows_per_chunk * a_cols;
+        grad_a[a_start..a_start + a_rows_per_chunk * a_cols].copy_from_slice(&da_chunk.data);
+        let b_start = i * b_rows_per_chunk * b_cols;
+        grad_b[b_start..b_start + b_rows_per_chunk * b_cols].copy_from_slice(&db_chunk.data);
+    }
+    (NdArray::new(grad_a, a.shape.clone()), NdArray::new(grad_b, b.shape.clone()))
 }
 
 /// Append-only arena. Because an op can only reference Vars that already
@@ -104,6 +170,13 @@ impl Tape {
     pub fn matmul(&mut self, a: Var, b: Var) -> Var {
         let val = self.nodes[a.idx].value.matmul(&self.nodes[b.idx].value);
         self.push(val, OpKind::MatMul(a.idx, b.idx))
+    }
+
+    /// See batched_matmul_forward's own doc comment for what this buys over
+    /// plain matmul and the alternatives it was surveyed against.
+    pub fn batched_matmul(&mut self, a: Var, b: Var, batch_size: usize, transpose_b: bool) -> Var {
+        let val = batched_matmul_forward(&self.nodes[a.idx].value, &self.nodes[b.idx].value, batch_size, transpose_b);
+        self.push(val, OpKind::BatchedMatMul(a.idx, b.idx, batch_size, transpose_b))
     }
 
     pub fn relu(&mut self, a: Var) -> Var {
@@ -302,6 +375,13 @@ impl Tape {
                     self.accumulate(a, grad.matmul(&b_val.transpose()));
                     self.accumulate(b, a_val.transpose().matmul(&grad));
                 }
+                OpKind::BatchedMatMul(a, b, batch_size, transpose_b) => {
+                    let a_val = self.nodes[a].value.clone();
+                    let b_val = self.nodes[b].value.clone();
+                    let (grad_a, grad_b) = batched_matmul_backward(&a_val, &b_val, &grad, batch_size, transpose_b);
+                    self.accumulate(a, grad_a);
+                    self.accumulate(b, grad_b);
+                }
                 OpKind::Relu(a) => {
                     let a_val = &self.nodes[a].value;
                     let mask = NdArray {
@@ -447,6 +527,72 @@ mod tests {
                 "b grad[{i}] mismatch: numerical {numerical} vs analytical {}",
                 b_grad.data[i]
             );
+        }
+    }
+
+    fn batched_matmul_loss(a_data: &[f32], b_data: &[f32], a_shape: Vec<usize>, b_shape: Vec<usize>, batch_size: usize, transpose_b: bool) -> f32 {
+        let mut tape = Tape::new();
+        let av = tape.leaf(NdArray::new(a_data.to_vec(), a_shape));
+        let bv = tape.leaf(NdArray::new(b_data.to_vec(), b_shape));
+        let c = tape.batched_matmul(av, bv, batch_size, transpose_b);
+        let sq = tape.mul(c, c);
+        let loss = tape.sum(sq);
+        tape.value(loss).data[0]
+    }
+
+    /// Gold-standard check for Tape::batched_matmul, both transpose_b
+    /// variants (the plain-C=A@B case used for weights@V, the C=A@Bᵀ case
+    /// used for Q@Kᵀ) - same discipline as every other new backward rule,
+    /// required before this op gets trusted in a real training loop.
+    #[test]
+    fn batched_matmul_backward_matches_finite_difference() {
+        for transpose_b in [false, true] {
+            let batch_size = 2;
+            let (m, k, n) = (2, 3, 2);
+            let a_shape = vec![batch_size * m, k];
+            let b_shape = if transpose_b { vec![batch_size * n, k] } else { vec![batch_size * k, n] };
+            let a0: Vec<f32> = (0..batch_size * m * k).map(|i| 0.1 * (i as f32) - 0.5).collect();
+            let b0: Vec<f32> = (0..b_shape[0] * b_shape[1]).map(|i| 0.05 * (i as f32) - 0.3).collect();
+
+            let mut tape = Tape::new();
+            let av = tape.leaf(NdArray::new(a0.clone(), a_shape.clone()));
+            let bv = tape.leaf(NdArray::new(b0.clone(), b_shape.clone()));
+            let c = tape.batched_matmul(av, bv, batch_size, transpose_b);
+            let sq = tape.mul(c, c);
+            let loss = tape.sum(sq);
+            tape.backward(loss);
+            let a_grad = tape.grad(av).unwrap().clone();
+            let b_grad = tape.grad(bv).unwrap().clone();
+
+            let eps = 1e-3;
+            for i in 0..a0.len() {
+                let mut ap = a0.clone();
+                ap[i] += eps;
+                let mut am = a0.clone();
+                am[i] -= eps;
+                let numerical = (batched_matmul_loss(&ap, &b0, a_shape.clone(), b_shape.clone(), batch_size, transpose_b)
+                    - batched_matmul_loss(&am, &b0, a_shape.clone(), b_shape.clone(), batch_size, transpose_b))
+                    / (2.0 * eps);
+                assert!(
+                    (numerical - a_grad.data[i]).abs() < 1e-2,
+                    "a grad[{i}] transpose_b={transpose_b} mismatch: numerical {numerical} vs analytical {}",
+                    a_grad.data[i]
+                );
+            }
+            for i in 0..b0.len() {
+                let mut bp = b0.clone();
+                bp[i] += eps;
+                let mut bm = b0.clone();
+                bm[i] -= eps;
+                let numerical = (batched_matmul_loss(&a0, &bp, a_shape.clone(), b_shape.clone(), batch_size, transpose_b)
+                    - batched_matmul_loss(&a0, &bm, a_shape.clone(), b_shape.clone(), batch_size, transpose_b))
+                    / (2.0 * eps);
+                assert!(
+                    (numerical - b_grad.data[i]).abs() < 1e-2,
+                    "b grad[{i}] transpose_b={transpose_b} mismatch: numerical {numerical} vs analytical {}",
+                    b_grad.data[i]
+                );
+            }
         }
     }
 

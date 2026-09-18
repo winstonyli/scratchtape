@@ -244,14 +244,25 @@ impl LayerNorm {
 /// has no max-subtraction stability trick): exp(-inf) is an exact, finite
 /// 0.0 under IEEE 754, so -inf never survives past the Exp step - nothing
 /// downstream ever sees an infinity.
-fn causal_mask(seq_len: usize) -> NdArray {
-    let mut data = vec![0.0f32; seq_len * seq_len];
-    for i in 0..seq_len {
-        for j in (i + 1)..seq_len {
-            data[i * seq_len + j] = f32::NEG_INFINITY;
+/// Tiled batch_size times down the rows: each batch chunk gets its own
+/// independent seq_len x seq_len causal pattern. This mask is added
+/// (exact-shape, no broadcast) directly to batched attention scores
+/// (shape [batch_size*seq_len, seq_len], from Tape::batched_matmul), which
+/// only ever contains within-chunk scores in the first place - no
+/// cross-batch masking needed here, unlike a naive dense-stack approach
+/// that would need a block-diagonal mask to hide cross-batch entries it
+/// never should have computed.
+fn causal_mask(seq_len: usize, batch_size: usize) -> NdArray {
+    let mut data = vec![0.0f32; batch_size * seq_len * seq_len];
+    for chunk in 0..batch_size {
+        let base = chunk * seq_len * seq_len;
+        for i in 0..seq_len {
+            for j in (i + 1)..seq_len {
+                data[base + i * seq_len + j] = f32::NEG_INFINITY;
+            }
         }
     }
-    NdArray::new(data, vec![seq_len, seq_len])
+    NdArray::new(data, vec![batch_size * seq_len, seq_len])
 }
 
 pub struct TransformerBlockOut {
@@ -293,17 +304,18 @@ pub struct TransformerBlock {
     ln2: LayerNorm,
     ffn1: Linear,
     ffn2: Linear,
-    /// Causal mask is identical on every call for a fixed seq_len - cached
-    /// rather than rebuilt (fresh allocation + O(seq_len^2) fill loop) on
-    /// every forward pass. RefCell, not a signature change to &mut self:
-    /// forward() stays &self so every existing call site (tiny_lm.rs,
+    /// Causal mask is identical on every call for a fixed (seq_len,
+    /// batch_size) - cached rather than rebuilt (fresh allocation +
+    /// O(seq_len^2) fill loop, now O(batch_size*seq_len^2)) on every forward
+    /// pass. RefCell, not a signature change to &mut self: forward() stays
+    /// &self so every existing call site (tiny_lm.rs,
     /// catastrophic_forgetting.rs, etc.) needs no changes. Recomputed only
-    /// when seq_len actually changes from what's cached; still pays one
-    /// clone per call to hand ownership to the leaf, since Tape::leaf
-    /// takes an owned NdArray and the tape itself is rebuilt fresh every
-    /// step - only the O(seq_len^2) fill loop is eliminated, not the
+    /// when seq_len/batch_size actually change from what's cached; still
+    /// pays one clone per call to hand ownership to the leaf, since
+    /// Tape::leaf takes an owned NdArray and the tape itself is rebuilt
+    /// fresh every step - only the fill loop is eliminated, not the
     /// per-call allocation entirely.
-    mask_cache: RefCell<Option<(usize, NdArray)>>,
+    mask_cache: RefCell<Option<(usize, usize, NdArray)>>,
 }
 
 impl TransformerBlock {
@@ -325,15 +337,35 @@ impl TransformerBlock {
         }
     }
 
+    /// Unbatched convenience wrapper - every existing call site (tiny_lm.rs,
+    /// catastrophic_forgetting.rs, etc.) uses this unchanged; batch_size=1
+    /// makes forward_batched's per-chunk logic degenerate to exactly what
+    /// this function used to compute directly.
     pub fn forward(&self, tape: &mut Tape, x: Var) -> TransformerBlockOut {
-        let seq_len = tape.value(x).shape[0];
+        self.forward_batched(tape, x, 1)
+    }
+
+    /// `x` holds `batch_size` independent sequences stacked along the row
+    /// axis (rows [0,seq_len) = sample 0, [seq_len,2*seq_len) = sample 1,
+    /// etc. - not a genuine batch dimension, since NdArray stays 2D-only).
+    /// Every sublayer except attention is already row-independent (Linear,
+    /// LayerNorm, the residual adds, softmax's own last-axis reduction) and
+    /// needs no change at all under stacking. Attention is the one op that
+    /// mixes rows together (Q@Kᵀ, weights@V), so it alone uses
+    /// Tape::batched_matmul to keep each sample's attention confined to its
+    /// own chunk - see that function's doc comment for why a naive
+    /// dense-stack-then-mask version was rejected (wastes O(batch) more
+    /// compute than this).
+    pub fn forward_batched(&self, tape: &mut Tape, x: Var, batch_size: usize) -> TransformerBlockOut {
+        let seq_len = tape.value(x).shape[0] / batch_size;
         let mask_value = {
             let mut cache = self.mask_cache.borrow_mut();
-            let needs_recompute = !matches!(&*cache, Some((cached_len, _)) if *cached_len == seq_len);
+            let needs_recompute =
+                !matches!(&*cache, Some((cached_len, cached_batch, _)) if *cached_len == seq_len && *cached_batch == batch_size);
             if needs_recompute {
-                *cache = Some((seq_len, causal_mask(seq_len)));
+                *cache = Some((seq_len, batch_size, causal_mask(seq_len, batch_size)));
             }
-            cache.as_ref().unwrap().1.clone()
+            cache.as_ref().unwrap().2.clone()
         };
         let mask = tape.leaf(mask_value);
 
@@ -350,12 +382,11 @@ impl TransformerBlock {
             let k_out = self.k_heads[h].forward(tape, normed1);
             let v_out = self.v_heads[h].forward(tape, normed1);
 
-            let kt = tape.transpose(k_out.y);
-            let scores = tape.matmul(q_out.y, kt);
+            let scores = tape.batched_matmul(q_out.y, k_out.y, batch_size, true);
             let scaled = tape.scale(scores, 1.0 / (self.d_k as f32).sqrt());
             let masked = tape.add(scaled, mask);
             let weights = tape.softmax(masked);
-            head_outputs.push(tape.matmul(weights, v_out.y));
+            head_outputs.push(tape.batched_matmul(weights, v_out.y, batch_size, false));
             head_weights.push(weights);
 
             q_outs.push(q_out);
@@ -518,6 +549,42 @@ mod tests {
             "ffn1.w[0] grad mismatch: numerical {numerical} vs analytical {}",
             ffn1_w_grad.data[0]
         );
+    }
+
+    /// forward_batched must compute EXACTLY what running the unbatched
+    /// forward separately per sample would - batching only changes how
+    /// compute is grouped (Tape::batched_matmul), never what gets computed.
+    /// Checked directly here rather than relying on batched_matmul's own
+    /// gradient-check test alone, which only verifies (forward,backward)
+    /// self-consistency in isolation, not that forward_batched's semantics
+    /// match the unbatched reference at the whole-block level.
+    #[test]
+    fn forward_batched_matches_per_sample_unbatched() {
+        let mut rng = Rng::new(3);
+        let (d_model, n_heads, d_ff, seq_len) = (8, 2, 16, 4);
+        let block = TransformerBlock::new(&mut rng, d_model, n_heads, d_ff);
+        let batch_size = 3;
+
+        let x0: Vec<f32> = (0..seq_len * d_model).map(|i| ((i as f32) * 0.31).sin() * 0.5).collect();
+        let x1: Vec<f32> = (0..seq_len * d_model).map(|i| ((i as f32) * 0.53 + 1.0).sin() * 0.5).collect();
+        let x2: Vec<f32> = (0..seq_len * d_model).map(|i| ((i as f32) * 0.71 + 2.0).sin() * 0.5).collect();
+        let stacked: Vec<f32> = x0.iter().chain(x1.iter()).chain(x2.iter()).cloned().collect();
+
+        let mut batched_tape = Tape::new();
+        let x_batched = batched_tape.leaf(NdArray::new(stacked, vec![batch_size * seq_len, d_model]));
+        let batched_out = block.forward_batched(&mut batched_tape, x_batched, batch_size);
+        let batched_y = batched_tape.value(batched_out.y).clone();
+
+        for (i, x_i) in [x0, x1, x2].iter().enumerate() {
+            let mut tape = Tape::new();
+            let x = tape.leaf(NdArray::new(x_i.clone(), vec![seq_len, d_model]));
+            let out = block.forward(&mut tape, x);
+            let expected = tape.value(out.y);
+            let actual_chunk = &batched_y.data[i * seq_len * d_model..(i + 1) * seq_len * d_model];
+            for (a, e) in actual_chunk.iter().zip(expected.data.iter()) {
+                assert!((a - e).abs() < 1e-4, "batch chunk {i} mismatch: batched {a} vs unbatched {e}");
+            }
+        }
     }
 
     /// Sanity check, not a finite-difference test - Embedding has no new
