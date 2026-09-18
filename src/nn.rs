@@ -357,6 +357,17 @@ impl TransformerBlock {
     /// dense-stack-then-mask version was rejected (wastes O(batch) more
     /// compute than this).
     pub fn forward_batched(&self, tape: &mut Tape, x: Var, batch_size: usize) -> TransformerBlockOut {
+        self.forward_full(tape, x, batch_size, false)
+    }
+
+    /// Same as forward_batched, plus a switch between plain softmax and
+    /// softmax1 (Tape::softmax1, "Attention Is Off By One") for the
+    /// per-head attention weights. A separate most-general method rather
+    /// than a new parameter on forward_batched itself, so every existing
+    /// call site (forward(), forward_batched(...)) keeps working unchanged
+    /// and stays on plain softmax - this is opt-in, not a default change to
+    /// already-recorded experiments elsewhere in the project.
+    pub fn forward_full(&self, tape: &mut Tape, x: Var, batch_size: usize, use_softmax1: bool) -> TransformerBlockOut {
         let seq_len = tape.value(x).shape[0] / batch_size;
         let mask_value = {
             let mut cache = self.mask_cache.borrow_mut();
@@ -385,7 +396,7 @@ impl TransformerBlock {
             let scores = tape.batched_matmul(q_out.y, k_out.y, batch_size, true);
             let scaled = tape.scale(scores, 1.0 / (self.d_k as f32).sqrt());
             let masked = tape.add(scaled, mask);
-            let weights = tape.softmax(masked);
+            let weights = if use_softmax1 { tape.softmax1(masked) } else { tape.softmax(masked) };
             head_outputs.push(tape.batched_matmul(weights, v_out.y, batch_size, false));
             head_weights.push(weights);
 

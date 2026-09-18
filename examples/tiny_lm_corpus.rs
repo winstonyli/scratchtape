@@ -96,6 +96,15 @@ fn forward(
     let pos_out = pos_emb.forward(tape, &positions);
     let mut x = tape.add(tok_out.y, pos_out.y);
 
+    // softmax1 was tried here to test the frequency-sink theory from the
+    // attention-graph rerun (plain softmax forces every row's weights to
+    // sum to exactly 1, so a head with nothing specific to attend to dumps
+    // mass onto a reliable high-frequency byte as a no-op) - reverted:
+    // diverges to NaN regardless of lr (0.3->step 110, 0.1->216, 0.03->507,
+    // 0.01->1443, roughly tripling as lr drops ~3x - the signature of a
+    // compounding/unbounded dynamic, not a step-size mismatch, same failure
+    // class as the parked PC-precision instabilities). Back to plain
+    // softmax, the known-good state.
     let mut block_outs = Vec::with_capacity(blocks.len());
     for block in blocks {
         let out = block.forward(tape, x);
