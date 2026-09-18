@@ -140,6 +140,105 @@ fn run_kfold_probe(
     (mean_baseline, mean_gnn, majority_baseline)
 }
 
+/// The first genuinely symbolic KR&R artifact in this project. Every prior
+/// extraction (k-means clusters, the attention-derived graph, the
+/// embedding-nearest-neighbor graph) is a numeric summary a human still
+/// has to interpret; a decision tree over embedding dimensions produces
+/// literal if-then rules instead - the dimensions themselves stay opaque
+/// (a learned embedding space was never going to have named axes), but the
+/// rule structure itself (which threshold, which branch) is fully
+/// explicit, not a similarity score or a cluster id.
+enum Tree {
+    Leaf(usize),
+    Split { dim: usize, threshold: f32, left: Box<Tree>, right: Box<Tree> },
+}
+
+fn gini(labels: &[usize], idxs: &[usize]) -> f32 {
+    if idxs.is_empty() {
+        return 0.0;
+    }
+    let n = idxs.len() as f32;
+    let p = idxs.iter().filter(|&&i| labels[i] == 1).count() as f32 / n;
+    1.0 - p * p - (1.0 - p) * (1.0 - p)
+}
+
+fn majority_class(labels: &[usize], idxs: &[usize]) -> usize {
+    let pos = idxs.iter().filter(|&&i| labels[i] == 1).count();
+    if pos * 2 >= idxs.len() { 1 } else { 0 }
+}
+
+/// Greedy, axis-aligned, depth-limited: at each node, try every (dimension,
+/// midpoint-between-consecutive-sorted-values) split and keep whichever
+/// minimizes weighted Gini impurity. `min_samples` stops splitting a node
+/// with too few examples to trust a further split (same reasoning behind
+/// this project's care with small-n classifiers elsewhere - the GNN
+/// probe's stratified folds, its ceiling-effect finding on 34 nodes).
+fn fit_tree(features: &[Vec<f32>], labels: &[usize], idxs: &[usize], depth: usize, min_samples: usize) -> Tree {
+    let all_same = idxs.iter().all(|&i| labels[i] == labels[idxs[0]]);
+    if depth == 0 || idxs.len() < min_samples || all_same {
+        return Tree::Leaf(majority_class(labels, idxs));
+    }
+
+    let d_model = features[0].len();
+    let mut best: Option<(usize, f32, f32)> = None; // (dim, threshold, weighted gini)
+    for dim in 0..d_model {
+        let mut values: Vec<f32> = idxs.iter().map(|&i| features[i][dim]).collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        values.dedup();
+        for w in values.windows(2) {
+            let threshold = (w[0] + w[1]) / 2.0;
+            let left: Vec<usize> = idxs.iter().copied().filter(|&i| features[i][dim] <= threshold).collect();
+            let right: Vec<usize> = idxs.iter().copied().filter(|&i| features[i][dim] > threshold).collect();
+            if left.is_empty() || right.is_empty() {
+                continue;
+            }
+            let w_gini =
+                (left.len() as f32 * gini(labels, &left) + right.len() as f32 * gini(labels, &right)) / idxs.len() as f32;
+            if best.is_none_or(|(_, _, best_gini)| w_gini < best_gini) {
+                best = Some((dim, threshold, w_gini));
+            }
+        }
+    }
+
+    match best {
+        None => Tree::Leaf(majority_class(labels, idxs)),
+        Some((dim, threshold, _)) => {
+            let left: Vec<usize> = idxs.iter().copied().filter(|&i| features[i][dim] <= threshold).collect();
+            let right: Vec<usize> = idxs.iter().copied().filter(|&i| features[i][dim] > threshold).collect();
+            Tree::Split {
+                dim,
+                threshold,
+                left: Box::new(fit_tree(features, labels, &left, depth - 1, min_samples)),
+                right: Box::new(fit_tree(features, labels, &right, depth - 1, min_samples)),
+            }
+        }
+    }
+}
+
+fn predict_tree(tree: &Tree, features: &[f32]) -> usize {
+    match tree {
+        Tree::Leaf(class) => *class,
+        Tree::Split { dim, threshold, left, right } => {
+            if features[*dim] <= *threshold { predict_tree(left, features) } else { predict_tree(right, features) }
+        }
+    }
+}
+
+fn print_tree(tree: &Tree, indent: usize, positive_name: &str) {
+    let pad = "  ".repeat(indent);
+    match tree {
+        Tree::Leaf(class) => {
+            println!("{pad}predict: {}", if *class == 1 { positive_name } else { "not" });
+        }
+        Tree::Split { dim, threshold, left, right } => {
+            println!("{pad}if dim[{dim}] <= {threshold:.4}:");
+            print_tree(left, indent + 1, positive_name);
+            println!("{pad}else:");
+            print_tree(right, indent + 1, positive_name);
+        }
+    }
+}
+
 fn sample_window(rng: &mut Rng, corpus: &[usize], seq_len: usize) -> (Vec<usize>, Vec<usize>) {
     let max_start = corpus.len() - seq_len - 1;
     let start = (rng.next_f32() * max_start as f32) as usize;
@@ -1003,6 +1102,53 @@ fn main() {
     for (name, majority, base, gnn) in &summary {
         println!("  {name}: {majority:.3} | {base:.3} | {gnn:.3}");
     }
+
+    // Rule extraction: same held-out k-fold rigor, same embedding-only
+    // feature space as the linear probe's baseline condition, but a
+    // decision tree instead of a small neural classifier - trades whatever
+    // accuracy the neural net's nonlinearity buys for literal, inspectable
+    // rules. depth=3 and min_samples=6 are conservative on purpose: with
+    // ~73 training rows per fold, an unconstrained tree would just
+    // memorize (the exact ceiling-effect risk the GNN probe's own history
+    // already flagged at this data scale).
+    let feature_rows: Vec<Vec<f32>> = (0..n_nodes).map(|i| node_features.data[i * d_model..(i + 1) * d_model].to_vec()).collect();
+    let tree_depth = 3;
+    let tree_min_samples = 6;
+
+    println!("\ndecision-tree summary (category: majority-baseline | embedding-only-neural | decision-tree, held-out):");
+    for (name, predicate, fold_seed) in categories {
+        let labels: Vec<usize> = filtered_bytes.iter().map(|&b| if predicate(b) { 1 } else { 0 }).collect();
+        let mut fold_rng = Rng::new(fold_seed);
+        let mut pos_idxs: Vec<usize> = (0..n_nodes).filter(|&i| labels[i] == 1).collect();
+        let mut neg_idxs: Vec<usize> = (0..n_nodes).filter(|&i| labels[i] == 0).collect();
+        shuffle(&mut pos_idxs, &mut fold_rng);
+        shuffle(&mut neg_idxs, &mut fold_rng);
+        let mut folds: Vec<Vec<usize>> = vec![Vec::new(); k_folds];
+        for (i, &idx) in pos_idxs.iter().chain(neg_idxs.iter()).enumerate() {
+            folds[i % k_folds].push(idx);
+        }
+
+        let mut tree_accs = Vec::new();
+        for fold in 0..k_folds {
+            let test_idx = &folds[fold];
+            let train_idx: Vec<usize> = (0..n_nodes).filter(|i| !test_idx.contains(i)).collect();
+            let tree = fit_tree(&feature_rows, &labels, &train_idx, tree_depth, tree_min_samples);
+            let correct = test_idx.iter().filter(|&&i| predict_tree(&tree, &feature_rows[i]) == labels[i]).count();
+            tree_accs.push(correct as f32 / test_idx.len() as f32);
+        }
+        let mean_tree_acc = tree_accs.iter().sum::<f32>() / tree_accs.len() as f32;
+        let (_, majority, neural_base, _) = summary.iter().find(|&&(n, ..)| n == name).unwrap();
+        println!("  {name}: {majority:.3} | {neural_base:.3} | {mean_tree_acc:.3}");
+    }
+
+    // The actual deliverable: an explicit rule, fit on every node (not a
+    // held-out split - this is the "what did it learn" artifact, the
+    // k-fold numbers above are the separate "does it generalize" claim).
+    let vowel_labels: Vec<usize> = filtered_bytes.iter().map(|&b| if is_vowel(b) { 1 } else { 0 }).collect();
+    let all_idx: Vec<usize> = (0..n_nodes).collect();
+    let full_tree = fit_tree(&feature_rows, &vowel_labels, &all_idx, tree_depth, tree_min_samples);
+    println!("\nis-vowel decision tree, fit on all {n_nodes} nodes (dims are opaque learned axes, not named features):");
+    print_tree(&full_tree, 1, "vowel");
 
     // Direct test of the named block-0/head-0-only limitation this
     // extraction has carried since tiny_lm.rs: does every head show the
