@@ -232,6 +232,31 @@ fn train_token_embedding(
 /// deterministic and un-interleaved when this runs concurrently with the
 /// other seeds under thread::scope - each thread has its own stdout calls
 /// otherwise racing for output order with no benefit.
+/// Connected components of an adjacency matrix via BFS - used twice below
+/// (majority-agreement graph and strict-unanimity graph), the two-consumer
+/// bar this project applies before factoring out a helper.
+fn connected_components(adj: &[Vec<bool>], n: usize) -> Vec<usize> {
+    let mut component = vec![usize::MAX; n];
+    let mut next_component = 0;
+    for start in 0..n {
+        if component[start] != usize::MAX {
+            continue;
+        }
+        let mut stack = vec![start];
+        component[start] = next_component;
+        while let Some(i) = stack.pop() {
+            for j in 0..n {
+                if adj[i][j] && component[j] == usize::MAX {
+                    component[j] = next_component;
+                    stack.push(j);
+                }
+            }
+        }
+        next_component += 1;
+    }
+    component
+}
+
 fn train_with_diagnostics(
     seed: u64,
     train: &[usize],
@@ -431,6 +456,7 @@ fn main() {
     let same_cluster = |r: usize, i: usize, j: usize| all_assignments[r][i] == all_assignments[r][j];
     let mut unanimous = vec![vec![false; n]; n];
     let mut majority_same = vec![vec![false; n]; n];
+    let mut unanimous_same = vec![vec![false; n]; n];
     for i in 0..n {
         for j in 0..n {
             if i == j {
@@ -439,6 +465,7 @@ fn main() {
             let agree_count = (0..n_runs).filter(|&r| same_cluster(r, i, j)).count();
             unanimous[i][j] = agree_count == 0 || agree_count == n_runs;
             majority_same[i][j] = agree_count * 2 > n_runs;
+            unanimous_same[i][j] = agree_count == n_runs;
         }
     }
 
@@ -464,28 +491,32 @@ fn main() {
     // This is the actual answer to "what structure survives across seeds" -
     // the per-byte scores above show confidence, this shows the resulting
     // groups.
-    let mut component = vec![usize::MAX; n];
-    let mut next_component = 0;
-    for start in 0..n {
-        if component[start] != usize::MAX {
-            continue;
-        }
-        let mut stack = vec![start];
-        component[start] = next_component;
-        while let Some(i) = stack.pop() {
-            for j in 0..n {
-                if majority_same[i][j] && component[j] == usize::MAX {
-                    component[j] = next_component;
-                    stack.push(j);
-                }
-            }
-        }
-        next_component += 1;
-    }
+    let component = connected_components(&majority_same, n);
+    let next_component = component.iter().copied().max().map_or(0, |m| m + 1);
     println!("\nconsensus clusters (connected components of >=2/3-seed agreement):");
     for c in 0..next_component {
         let members: Vec<String> = (0..n)
             .filter(|&i| component[i] == c)
+            .map(|i| format!("{:?}", (filtered_bytes[i] as u8) as char))
+            .collect();
+        if !members.is_empty() {
+            println!("  component {c}: {}", members.join(" "));
+        }
+    }
+
+    // Same connected-components analysis, but only wiring an edge when all
+    // 3 seeds agree (not just a 2/3 majority) - the direct test of whether
+    // the giant >=2/3-agreement component above is real shared structure or
+    // a transitivity artifact: a single 2/3-agreeing edge is enough to
+    // bridge two otherwise-unrelated sub-groups into one component, but a
+    // 3/3 requirement can't be bridged by one seed's idiosyncrasy the same
+    // way. No retraining needed - reuses this run's all_assignments as-is.
+    let strict_component = connected_components(&unanimous_same, n);
+    let strict_next = strict_component.iter().copied().max().map_or(0, |m| m + 1);
+    println!("\nstrict consensus clusters (connected components of 3/3-seed agreement):");
+    for c in 0..strict_next {
+        let members: Vec<String> = (0..n)
+            .filter(|&i| strict_component[i] == c)
             .map(|i| format!("{:?}", (filtered_bytes[i] as u8) as char))
             .collect();
         if !members.is_empty() {
