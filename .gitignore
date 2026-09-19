@@ -1,3 +1,5 @@
 /target
 checkpoint.txt
+memory_tier_checkpoint.txt
+memory_tier_replay.txt
 samply_profile.json*
