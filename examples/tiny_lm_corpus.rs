@@ -1061,6 +1061,45 @@ fn main() {
         filtered_bytes.len()
     );
 
+    // Group-membership stability: exact top-1 identity wasn't cross-seed
+    // stable for digits (no digit appeared in the unanimous list above),
+    // despite digits forming the tightest cluster in any one seed. Tests
+    // the weaker, more plausible claim directly: does a category member's
+    // nearest neighbor stay IN THE SAME CATEGORY across seeds, even when
+    // the exact identity doesn't (e.g. a digit's nearest neighbor stays
+    // "some digit" every time, even if which specific digit varies)?
+    // Reuses the 3 already-computed nn graphs, no new computation beyond
+    // the category check itself. Predicates duplicated from the linear-
+    // probe section below rather than reordered/shared, same reasoning as
+    // every other duplicated one-liner in this file.
+    let categories_gm: [(&str, &dyn Fn(usize) -> bool); 4] = [
+        ("is-vowel", &|b: usize| matches!((b as u8) as char, 'a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U')),
+        ("is-uppercase", &|b: usize| ((b as u8) as char).is_ascii_uppercase()),
+        ("is-digit", &|b: usize| ((b as u8) as char).is_ascii_digit()),
+        ("is-punctuation", &|b: usize| ((b as u8) as char).is_ascii_punctuation()),
+    ];
+    println!("\ngroup-membership cross-seed stability (does top-1 neighbor stay in-category across seeds, even if exact identity doesn't):");
+    for (name, predicate) in categories_gm {
+        let members: Vec<usize> = (0..filtered_bytes.len()).filter(|&i| predicate(filtered_bytes[i])).collect();
+        if members.is_empty() {
+            continue;
+        }
+        let (mut unanimous_in, mut unanimous_out, mut split) = (0, 0, 0);
+        for &i in &members {
+            let in_group = |g: &[Vec<(usize, f32)>]| predicate(filtered_bytes[g[i][0].0]);
+            let agree = [in_group(&primary_nn), in_group(&seed2_nn), in_group(&seed3_nn)].iter().filter(|&&x| x).count();
+            match agree {
+                3 => unanimous_in += 1,
+                0 => unanimous_out += 1,
+                _ => split += 1,
+            }
+        }
+        println!(
+            "  {name}: {unanimous_in} always stay in-category, {unanimous_out} always leave, {split} split, out of {} members",
+            members.len()
+        );
+    }
+
     // Fourth extraction, building on the second (attention graph): GNN
     // message-passing over the attention graph ([178af66]), is-vowel
     // prediction as an externally-checkable
