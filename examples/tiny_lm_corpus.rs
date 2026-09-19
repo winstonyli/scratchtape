@@ -1427,4 +1427,39 @@ fn main() {
             println!("  block {block} head {head}: graph-augmented = {gnn_acc:.3} ({delta:+.3})");
         }
     }
+
+    // Direct follow-up to the hierarchy/lattice check: block 0/head 0's
+    // graph erased the neural probe's entire +3.2pp gain for is-uppercase-
+    // vowel (0.978 -> 0.946, back to majority baseline) - the same head
+    // already shown to be the single worst pick for plain is-uppercase.
+    // Does the intersection category get restored by the SAME heads that
+    // helped plain is-uppercase (block 3 head 5, block 3 head 0), or does
+    // the doubly-constrained category need a different head entirely?
+    let uppercase_vowel_labels: Vec<usize> =
+        filtered_bytes.iter().map(|&b| matches!((b as u8) as char, 'A' | 'E' | 'I' | 'O' | 'U')).map(|m| m as usize).collect();
+    let uppercase_vowel_baseline = summary.iter().find(|&&(name, ..)| name == "is-uppercase-vowel").unwrap().2;
+    println!(
+        "\nis-uppercase-vowel graph-augmented accuracy per (block, head) - embedding-only baseline = {uppercase_vowel_baseline:.3}:"
+    );
+    for block in 0..n_blocks {
+        for head in 0..n_heads {
+            let graph = &all_heads[block][head];
+            let head_neighbor1: Vec<usize> = (0..n_nodes).map(|i| graph[i].first().map(|&(j, _)| j).unwrap_or(i)).collect();
+            let head_neighbor2: Vec<usize> =
+                (0..n_nodes).map(|i| graph[i].get(1).map(|&(j, _)| j).unwrap_or(head_neighbor1[i])).collect();
+            let (_, gnn_acc, _) = run_kfold_probe(
+                "is-uppercase-vowel",
+                &uppercase_vowel_labels,
+                &node_features,
+                &head_neighbor1,
+                &head_neighbor2,
+                d_model,
+                k_folds,
+                46,
+                false,
+            );
+            let delta = gnn_acc - uppercase_vowel_baseline;
+            println!("  block {block} head {head}: graph-augmented = {gnn_acc:.3} ({delta:+.3})");
+        }
+    }
 }
