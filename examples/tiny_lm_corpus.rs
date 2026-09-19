@@ -239,6 +239,67 @@ fn print_tree(tree: &Tree, indent: usize, positive_name: &str) {
     }
 }
 
+/// Precision/recall/F1 for a binary classifier's predictions against true
+/// labels - accuracy alone is a weak metric on these categories (most are
+/// under 15% positive, so majority-class accuracy is already high; a
+/// classifier that just predicts "not" every time still scores well on
+/// accuracy but has zero recall).
+fn precision_recall_f1(labels: &[usize], predictions: &[usize]) -> (f32, f32, f32) {
+    let (mut tp, mut fp, mut fn_) = (0, 0, 0);
+    for (&l, &p) in labels.iter().zip(predictions.iter()) {
+        match (l, p) {
+            (1, 1) => tp += 1,
+            (0, 1) => fp += 1,
+            (1, 0) => fn_ += 1,
+            _ => {}
+        }
+    }
+    let precision = if tp + fp == 0 { 0.0 } else { tp as f32 / (tp + fp) as f32 };
+    let recall = if tp + fn_ == 0 { 0.0 } else { tp as f32 / (tp + fn_) as f32 };
+    let f1 = if precision + recall == 0.0 { 0.0 } else { 2.0 * precision * recall / (precision + recall) };
+    (precision, recall, f1)
+}
+
+/// Typed knowledge-graph edge list: for a given relation predicate,
+/// `adj[i]` lists every `j` related to byte-index `i`. Reused across the
+/// three relation types (cluster, attention, embedding-NN) and their
+/// union - the same predicates already used for the cross-extraction
+/// consistency check and rule-chaining, now supporting real multi-hop
+/// traversal instead of only single-hop pairwise checks.
+fn build_adjacency<F: Fn(usize, usize) -> bool>(n: usize, related: F) -> Vec<Vec<usize>> {
+    let mut adj = vec![Vec::new(); n];
+    for i in 0..n {
+        for j in 0..n {
+            if i != j && related(i, j) {
+                adj[i].push(j);
+            }
+        }
+    }
+    adj
+}
+
+/// Breadth-first reachability up to `max_hops`, including `start` itself.
+fn bfs_reachable(start: usize, max_hops: usize, adj: &[Vec<usize>]) -> std::collections::HashSet<usize> {
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(start);
+    let mut frontier = vec![start];
+    for _ in 0..max_hops {
+        let mut next_frontier = Vec::new();
+        for &node in &frontier {
+            for &neighbor in &adj[node] {
+                if visited.insert(neighbor) {
+                    next_frontier.push(neighbor);
+                }
+            }
+        }
+        if next_frontier.is_empty() {
+            break;
+        }
+        frontier = next_frontier;
+    }
+    visited
+}
+
 fn sample_window(rng: &mut Rng, corpus: &[usize], seq_len: usize) -> (Vec<usize>, Vec<usize>) {
     let max_start = corpus.len() - seq_len - 1;
     let start = (rng.next_f32() * max_start as f32) as usize;
@@ -1205,7 +1266,7 @@ fn main() {
     println!("\nrule-chaining inference (majority vote of a byte's related-graph neighbors' TRUE labels, leave-one-out):");
     for (name, predicate) in rc_categories {
         let labels: Vec<usize> = (0..consistency_n).map(|i| if predicate(filtered_bytes[i]) { 1 } else { 0 }).collect();
-        let mut correct = 0;
+        let mut predictions = vec![0usize; consistency_n];
         let mut isolated = 0;
         for i in 0..consistency_n {
             let (mut pos, mut neg) = (0, 0);
@@ -1219,7 +1280,7 @@ fn main() {
                     neg += 1;
                 }
             }
-            let inferred = if pos == 0 && neg == 0 {
+            predictions[i] = if pos == 0 && neg == 0 {
                 isolated += 1;
                 0
             } else if pos > neg {
@@ -1227,12 +1288,11 @@ fn main() {
             } else {
                 0
             };
-            if inferred == labels[i] {
-                correct += 1;
-            }
         }
+        let correct = (0..consistency_n).filter(|&i| predictions[i] == labels[i]).count();
+        let (p, r, f1) = precision_recall_f1(&labels, &predictions);
         println!(
-            "  {name}: {:.3} accuracy ({correct}/{consistency_n}), {isolated} bytes with no related-graph neighbors",
+            "  {name}: accuracy={:.3} ({correct}/{consistency_n}), precision={p:.3}, recall={r:.3}, f1={f1:.3}, {isolated} isolated bytes",
             correct as f32 / consistency_n as f32
         );
     }
@@ -1460,6 +1520,63 @@ fn main() {
             );
             let delta = gnn_acc - uppercase_vowel_baseline;
             println!("  block {block} head {head}: graph-augmented = {gnn_acc:.3} ({delta:+.3})");
+        }
+    }
+
+    // Exhaustive formal verification for the decision tree: rule-chaining
+    // above already evaluates exactly (leave-one-out over all 92 nodes,
+    // not a fold estimate), but the tree's numbers so far were only
+    // 5-fold held-out accuracy (~18 test rows per fold). Leave-one-out
+    // (92 refits) is cheap at this data scale and gives an exact, non-
+    // estimated number instead. Precision/recall/F1 alongside accuracy -
+    // these categories are mostly under 15% positive, so accuracy alone
+    // can't distinguish "learned something" from "always predicts not."
+    println!("\nexhaustive leave-one-out verification (decision tree, exact - 92 refits, not a fold estimate):");
+    for (name, predicate, _fold_seed) in categories {
+        let labels: Vec<usize> = filtered_bytes.iter().map(|&b| if predicate(b) { 1 } else { 0 }).collect();
+        let mut predictions = vec![0usize; n_nodes];
+        for i in 0..n_nodes {
+            let train_idx: Vec<usize> = (0..n_nodes).filter(|&j| j != i).collect();
+            let tree = fit_tree(&feature_rows, &labels, &train_idx, tree_depth, tree_min_samples);
+            predictions[i] = predict_tree(&tree, &feature_rows[i]);
+        }
+        let correct = (0..n_nodes).filter(|&i| predictions[i] == labels[i]).count();
+        let (p, r, f1) = precision_recall_f1(&labels, &predictions);
+        println!(
+            "  {name}: accuracy={:.3} ({correct}/{n_nodes}), precision={p:.3}, recall={r:.3}, f1={f1:.3}",
+            correct as f32 / n_nodes as f32
+        );
+    }
+
+    // First KR&R query capability: real multi-hop traversal instead of
+    // only single-hop pairwise checks (everything above only ever asked
+    // "are i and j related", never "what's reachable from i in N steps").
+    // Formalizes the three relation types (already used for the
+    // consistency check and rule-chaining) into typed adjacency lists.
+    // Demonstrated on bytes already shown to have distinctive relational
+    // behavior this session: '\n' and 'N' (both hit near-1.0 cross-seed
+    // attention stability), 'a' (the recurring block-0 frequency-sink
+    // target), and 'e' (highest raw training-gradient signal of any byte).
+    let cluster_adj = build_adjacency(n_nodes, cluster_same);
+    let attn_adj = build_adjacency(n_nodes, attn_related);
+    let nn_adj = build_adjacency(n_nodes, nn_related);
+    let combined_adj = build_adjacency(n_nodes, related);
+
+    println!("\nknowledge-graph multi-hop query (bytes reachable within N hops, self excluded):");
+    for &target in &[b'a', b'\n', b'N', b'e'] {
+        let Some(idx) = filtered_bytes.iter().position(|&b| b as u8 == target) else {
+            continue;
+        };
+        println!("  from {:?}:", target as char);
+        for (rel_name, adj) in [
+            ("cluster", &cluster_adj),
+            ("attention", &attn_adj),
+            ("embedding-NN", &nn_adj),
+            ("combined (any)", &combined_adj),
+        ] {
+            let one_hop = bfs_reachable(idx, 1, adj).len() - 1;
+            let two_hop = bfs_reachable(idx, 2, adj).len() - 1;
+            println!("    {rel_name}: 1-hop reaches {one_hop}, 2-hop reaches {two_hop} (of {} total)", n_nodes - 1);
         }
     }
 }
