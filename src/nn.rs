@@ -67,6 +67,19 @@ impl Linear {
         }
     }
 
+    /// Leafs a FRESH copy of w/b into the tape on every call - correct and
+    /// the intended usage for the normal one-call-per-training-step
+    /// pattern every current example uses, but NOT safe for weight-tied
+    /// reuse: calling forward() more than once on the same Linear within
+    /// one tape (e.g. weight-tying across an unrolled RNN/SSM loop)
+    /// produces a SEPARATE leaf and gradient slot per call, not one shared
+    /// gradient. apply_grad only reads tape.grad() for the ONE LinearOut
+    /// you pass it, so reusing this pattern silently drops every other
+    /// call's gradient contribution instead of erroring. ssm_recall.rs
+    /// needed exactly this and worked around it by leafing w/b once
+    /// itself and reusing the same Var across all timesteps manually,
+    /// rather than calling forward() per timestep - do the same if you
+    /// need weight-tied reuse elsewhere.
     pub fn forward(&self, tape: &mut Tape, x: Var) -> LinearOut {
         let w = tape.leaf(self.w.clone());
         let b = tape.leaf(self.b.clone());
@@ -134,6 +147,8 @@ impl Embedding {
         Self { table: NdArray::new(data, vec![vocab_size, d_model]) }
     }
 
+    /// Same fresh-leaf-per-call caveat as Linear::forward - see its doc
+    /// comment. Not weight-tie-safe across multiple calls within one tape.
     pub fn forward(&self, tape: &mut Tape, indices: &[usize]) -> EmbeddingOut {
         let table = tape.leaf(self.table.clone());
         let y = tape.gather(table, indices);
@@ -194,6 +209,8 @@ impl LayerNorm {
         }
     }
 
+    /// Same fresh-leaf-per-call caveat as Linear::forward - see its doc
+    /// comment. Not weight-tie-safe across multiple calls within one tape.
     pub fn forward(&self, tape: &mut Tape, x: Var) -> LayerNormOut {
         let d = tape.value(x).shape[1] as f32;
         let gamma = tape.leaf(self.gamma.clone());
@@ -367,6 +384,11 @@ impl TransformerBlock {
     /// call site (forward(), forward_batched(...)) keeps working unchanged
     /// and stays on plain softmax - this is opt-in, not a default change to
     /// already-recorded experiments elsewhere in the project.
+    ///
+    /// Inherits Linear::forward's fresh-leaf-per-call caveat transitively,
+    /// through every Linear/LayerNorm this composes (q/k/v/out_proj heads,
+    /// ln1, ln2, ffn1, ffn2) - calling this more than once on the same
+    /// TransformerBlock within one tape is not weight-tie-safe either.
     pub fn forward_full(&self, tape: &mut Tape, x: Var, batch_size: usize, use_softmax1: bool) -> TransformerBlockOut {
         let seq_len = tape.value(x).shape[0] / batch_size;
         let mask_value = {
