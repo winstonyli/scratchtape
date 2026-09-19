@@ -1186,11 +1186,19 @@ fn main() {
     let is_uppercase_rc = |b: usize| ((b as u8) as char).is_ascii_uppercase();
     let is_digit_rc = |b: usize| ((b as u8) as char).is_ascii_digit();
     let is_punctuation_rc = |b: usize| ((b as u8) as char).is_ascii_punctuation();
-    let rc_categories: [(&str, &dyn Fn(usize) -> bool); 4] = [
+    // Compound intersections, added for the hierarchy/lattice check below:
+    // does "uppercase AND vowel" (A,E,I,O,U) behave as a real,
+    // distinguishable sub-category nested within both is-uppercase and
+    // is-vowel, or does the representation only support flat categories?
+    let is_uppercase_vowel_rc = |b: usize| matches!((b as u8) as char, 'A' | 'E' | 'I' | 'O' | 'U');
+    let is_lowercase_vowel_rc = |b: usize| matches!((b as u8) as char, 'a' | 'e' | 'i' | 'o' | 'u');
+    let rc_categories: [(&str, &dyn Fn(usize) -> bool); 6] = [
         ("is-vowel", &is_vowel_rc),
         ("is-uppercase", &is_uppercase_rc),
         ("is-digit", &is_digit_rc),
         ("is-punctuation", &is_punctuation_rc),
+        ("is-uppercase-vowel", &is_uppercase_vowel_rc),
+        ("is-lowercase-vowel", &is_lowercase_vowel_rc),
     ];
     let related = |i: usize, j: usize| cluster_same(i, j) || attn_related(i, j) || nn_related(i, j);
 
@@ -1262,9 +1270,22 @@ fn main() {
     let is_uppercase = |b: usize| ((b as u8) as char).is_ascii_uppercase();
     let is_digit = |b: usize| ((b as u8) as char).is_ascii_digit();
     let is_punctuation = |b: usize| ((b as u8) as char).is_ascii_punctuation();
+    // Hierarchy/lattice check: does "uppercase AND vowel" (A,E,I,O,U) form
+    // a genuine, distinguishable sub-category nested within both
+    // is-uppercase and is-vowel, or does this representation only support
+    // flat categories? Same k-fold rigor (neural probe + decision tree)
+    // as every flat category above, applied to the intersection.
+    let is_uppercase_vowel = |b: usize| matches!((b as u8) as char, 'A' | 'E' | 'I' | 'O' | 'U');
+    let is_lowercase_vowel = |b: usize| matches!((b as u8) as char, 'a' | 'e' | 'i' | 'o' | 'u');
 
-    let categories: [(&str, &dyn Fn(usize) -> bool, u64); 4] =
-        [("is-vowel", &is_vowel, 42), ("is-uppercase", &is_uppercase, 43), ("is-digit", &is_digit, 44), ("is-punctuation", &is_punctuation, 45)];
+    let categories: [(&str, &dyn Fn(usize) -> bool, u64); 6] = [
+        ("is-vowel", &is_vowel, 42),
+        ("is-uppercase", &is_uppercase, 43),
+        ("is-digit", &is_digit, 44),
+        ("is-punctuation", &is_punctuation, 45),
+        ("is-uppercase-vowel", &is_uppercase_vowel, 46),
+        ("is-lowercase-vowel", &is_lowercase_vowel, 47),
+    ];
 
     let mut summary = Vec::new();
     for (name, predicate, fold_seed) in categories {
