@@ -1100,6 +1100,77 @@ fn main() {
         );
     }
 
+    // First formal-reasoning step in this whole line: every extraction so
+    // far (k-means clustering, the attention graph, the embedding-NN
+    // graph) has only ever been checked against ITSELF (cross-seed
+    // stability). Never checked against each OTHER - three independent
+    // views of the same trained model that might agree, contradict, or
+    // simply not overlap. Pure post-hoc analysis over data already
+    // computed for the primary model (assignments, primary_graph,
+    // primary_nn) - no retraining needed for this step specifically, it
+    // only needs the pipeline to reach this point once per run.
+    let cluster_same = |i: usize, j: usize| assignments[i] == assignments[j];
+    let attn_related = |i: usize, j: usize| {
+        primary_graph[i].iter().take(2).any(|&(k, _)| k == j) || primary_graph[j].iter().take(2).any(|&(k, _)| k == i)
+    };
+    let nn_related = |i: usize, j: usize| {
+        primary_nn[i].iter().any(|&(k, _)| k == j) || primary_nn[j].iter().any(|&(k, _)| k == i)
+    };
+
+    let consistency_n = filtered_bytes.len();
+    let mut total_pairs = 0;
+    let mut agree_all3 = 0;
+    let (mut cluster_vs_attn_agree, mut cluster_vs_nn_agree, mut attn_vs_nn_agree) = (0, 0, 0);
+    let mut attn_nn_agree_cluster_disagrees: Vec<(usize, usize)> = Vec::new();
+    let mut cluster_agrees_attn_nn_disagree: Vec<(usize, usize)> = Vec::new();
+    for i in 0..consistency_n {
+        for j in (i + 1)..consistency_n {
+            total_pairs += 1;
+            let (c, a, e) = (cluster_same(i, j), attn_related(i, j), nn_related(i, j));
+            if c == a && a == e {
+                agree_all3 += 1;
+            }
+            if c == a {
+                cluster_vs_attn_agree += 1;
+            }
+            if c == e {
+                cluster_vs_nn_agree += 1;
+            }
+            if a == e {
+                attn_vs_nn_agree += 1;
+            }
+            if a && e && !c {
+                attn_nn_agree_cluster_disagrees.push((i, j));
+            }
+            if c && !a && !e {
+                cluster_agrees_attn_nn_disagree.push((i, j));
+            }
+        }
+    }
+    println!(
+        "\ncross-extraction formal consistency check (k-means / attention-graph top-2 / embedding-NN top-2), {total_pairs} byte pairs:"
+    );
+    println!("  cluster<->attention pairwise agreement: {:.3}", cluster_vs_attn_agree as f32 / total_pairs as f32);
+    println!("  cluster<->embedding-NN pairwise agreement: {:.3}", cluster_vs_nn_agree as f32 / total_pairs as f32);
+    println!("  attention<->embedding-NN pairwise agreement: {:.3}", attn_vs_nn_agree as f32 / total_pairs as f32);
+    println!("  all 3 methods agree: {:.3} ({agree_all3} of {total_pairs} pairs)", agree_all3 as f32 / total_pairs as f32);
+
+    println!(
+        "\n  attention + embedding-NN both relate a pair, but clustering split them apart ({} pairs, first 15):",
+        attn_nn_agree_cluster_disagrees.len()
+    );
+    for &(i, j) in attn_nn_agree_cluster_disagrees.iter().take(15) {
+        println!("    {:?} <-> {:?}", (filtered_bytes[i] as u8) as char, (filtered_bytes[j] as u8) as char);
+    }
+
+    println!(
+        "\n  clustering grouped a pair together, but neither attention nor embedding-NN corroborate ({} pairs, first 15):",
+        cluster_agrees_attn_nn_disagree.len()
+    );
+    for &(i, j) in cluster_agrees_attn_nn_disagree.iter().take(15) {
+        println!("    {:?} <-> {:?}", (filtered_bytes[i] as u8) as char, (filtered_bytes[j] as u8) as char);
+    }
+
     // Fourth extraction, building on the second (attention graph): GNN
     // message-passing over the attention graph ([178af66]), is-vowel
     // prediction as an externally-checkable
