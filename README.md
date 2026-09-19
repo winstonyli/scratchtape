@@ -1,0 +1,136 @@
+# scratchtape
+
+A machine learning engine built from scratch in Rust: tensors, a
+reverse-mode autodiff tape, neural network layers, optimizers, and a GPU
+backend, with no ML framework underneath any of it. Every primitive
+(matmul, softmax, cross-entropy, gather, attention) is hand-written and
+gradient-checked, not a call into an existing library. Layered on top:
+a byte-level transformer LM, several alternative architectures compared
+against it, and an extended investigation into what symbolic structure
+(if any) a small trained transformer's internals actually contain.
+
+The project's own history is part of its documentation. Every commit
+message narrates what was tried, what was measured, and what the result
+actually was — including the negative ones. `git log` reads like a lab
+notebook; this README is the map, not a replacement for it.
+
+## Quick start
+
+```bash
+cargo test --release              # 18 gradient-check / correctness tests
+cargo build --release --examples  # build everything under examples/
+cargo run --release --example tiny_lm
+```
+
+Most examples are self-contained: encode a small corpus, train a tiny
+transformer, print what happened. A few (`checkpoint_save`/
+`checkpoint_load`, `memory_tier_*`) are pairs of programs that write a
+file and read it back in a genuinely separate process.
+
+## Engine (`src/`)
+
+| module | what it is |
+|---|---|
+| `tensor.rs` | `NdArray` — a minimal n-dimensional array (data + shape), the value type everything else operates on. |
+| `tape.rs` | `Tape` — reverse-mode autodiff. Every op (`add`, `matmul`, `gather`, `softmax`, `softmax1`, `cross_entropy`, `batched_matmul`, ...) is a node with a forward and backward rule, gradient-checked against finite differences. |
+| `nn.rs` | Layers built from tape ops: `Linear`, `LayerNorm`, `Embedding`, `TransformerBlock` (multi-head causal self-attention + FFN), plus `Rng` (hand-rolled xorshift, no external RNG crate). |
+| `optim.rs` | `Sgd` and `Adam`. |
+| `gpu.rs` / `matmul.wgsl` | A wgpu compute-shader matmul kernel — verified correct, but not wired into the autodiff path; see the persistent-GPU-backend note below. |
+
+Design stance, held consistently throughout: build the primitive
+yourself before reaching for a library, verify it against a
+finite-difference gradient check or a direct numerical comparison, and
+promote example-local code into the library only once a second consumer
+actually needs it.
+
+## Examples (`examples/`)
+
+**Fundamentals** — `xor_mlp.rs`, `xor_mlp_adam.rs`, `xor_es.rs` (evolution
+strategies vs backprop on the same task), `linear_regression.rs`,
+`byte_tokenizer.rs`.
+
+**The transformer LM family** — `tiny_lm.rs` is the original: byte-level
+tokenizer, embeddings, causal transformer blocks, trained on a 172-byte
+Shakespeare excerpt. `tiny_lm_scaled.rs` / `tiny_lm_scaled2.rs` scale the
+model up in isolation; `tiny_lm_batched.rs` adds minibatching via
+`BatchedMatMul` (measured net-negative at this scale, kept as
+infrastructure anyway). `tiny_lm_corpus.rs` moves to a real ~238KB
+corpus (Aesop's Fables) with a 90/10 train/held-out split — and is also the
+single largest file in the project (see below).
+
+**Alternatives to attention** — `attention_recall.rs` /
+`multihead_attention_recall.rs` (single- vs multi-head recall, showing
+one head can be blind while another is sighted on an identical query),
+`ssm_recall.rs` (a diagonal linear SSM, measuring its vanishing-gradient
+shape directly rather than citing it), `softmax1_comparison.rs`
+("Attention Is Off By One" — tried against a real frequency-sink finding
+later, diverged regardless of learning rate, reverted; the mechanism
+itself is kept as an opt-in `TransformerBlock::forward_full` flag).
+
+**GNN over an extracted graph** — `gnn_byte_classification.rs`: the
+original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
+graph on the tiny 172-byte corpus. Inconclusive there by a stated data
+limit (only 34 labeled nodes); rerun and resolved at scale inside
+`tiny_lm_corpus.rs` below.
+
+**Predictive coding** — `predictive_coding.rs`: Whittington & Bogacz PC
+as a biologically-motivated alternative to backprop, including a later
+attempt at genuinely learned per-layer precision weighting that produced
+three distinct instabilities and was honestly parked, not forced.
+
+**Continual learning / memory tiers** — `catastrophic_forgetting.rs`
+demonstrates the problem and a bounded-replay-buffer mitigation in one
+process; `checkpoint_save.rs`/`checkpoint_load.rs` prove cross-process
+weight persistence (hand-rolled flat-file format, no serialization
+crate); `memory_tier_save.rs`/`memory_tier_load.rs`/
+`memory_tier_load_no_replay.rs`/`memory_tier_diff.rs` integrate the two
+— persisting the replay buffer alongside the weights so a genuinely
+separate process can resume replay-mitigated training, then diffing the
+resulting weights layer-by-layer against a no-replay control.
+
+**`tiny_lm_corpus.rs`** is the project's largest and most-iterated file
+by far — a byte-level LM plus an extended symbolic/KR&R (knowledge
+representation & reasoning) investigation built on top of it:
+k-means clustering of trained embeddings, an attention-derived
+relational graph, an embedding-geometry nearest-neighbor graph, a GNN
+that message-passes over the attention graph, a from-scratch decision
+tree, a hand-written rule-chaining inference engine, a formal
+consistency check across all three extraction methods, a
+hierarchy/lattice check on compound categories, and a multi-hop
+knowledge-graph query engine — each with cross-seed stability testing,
+each reported honestly including where the methods disagree or fail.
+`git log --oneline -- examples/tiny_lm_corpus.rs` is the actual
+narrative; a few of the sharper findings:
+
+- Attention behaves very differently by depth: early layers lean on a
+  seed-arbitrary frequency sink, deep layers lean on structural
+  landmarks (e.g. `'\n'` as a paragraph boundary).
+- Embedding geometry finds real structure raw clustering misses
+  entirely — a clean punctuation split by grammatical role
+  (`{,;:}` vs `{.?!}`), and a compositional "uppercase AND vowel"
+  direction that no coarser extraction method (clustering, a decision
+  tree, rule-chaining) manages to preserve, even though it demonstrably
+  exists in the raw embeddings.
+- A hand-written logical rule (majority vote over a combined relation
+  graph) beats a from-scratch decision tree in every tested category —
+  but precision/recall reveals several of those "wins" were hollow
+  (zero recall, i.e. the rule never once caught a true positive).
+
+## Open threads
+
+- **Compute-matched model-scale rerun** — a 2x model-size scale-up at a
+  fixed step count measured *worse*, a known compute-optimal-scaling
+  confound (see the commit reverting it); a fair comparison needs
+  proportionally more steps, not just more parameters.
+- **Predictive-coding precision instabilities** — parked as a complete,
+  honest negative result; a real fix likely needs a MAP estimate with a
+  prior, or a smooth ramp-in, not raw MLE.
+- **A persistent, on-device GPU training backend** — the current GPU
+  kernel is correct but pays a full host round-trip per call, which is
+  why it doesn't win at this model's scale. Scoped as its own
+  multi-day project, not a small addition.
+
+## A note on the name
+
+The crate is `scratchtape`: from-scratch, and literally built around a
+`Tape` struct at its center — not a metaphor.
