@@ -1171,6 +1171,64 @@ fn main() {
         println!("    {:?} <-> {:?}", (filtered_bytes[i] as u8) as char, (filtered_bytes[j] as u8) as char);
     }
 
+    // Second formal-reasoning step: rule-chaining inference instead of
+    // just comparing extractions against each other. Combines the three
+    // relation types above into one graph (related(i,j) = same-cluster OR
+    // attention-related OR embedding-NN-related), then infers each byte's
+    // category by majority vote over its RELATED bytes' TRUE labels - a
+    // leave-one-out relational nearest-neighbor rule, not a trained
+    // classifier. No gradient descent, no embeddings read directly - only
+    // the extracted graph structure plus other bytes' known labels,
+    // chained through one inference rule. Tests whether that's enough to
+    // recover category membership, against the same categories the
+    // neural probe and decision tree were already measured on.
+    let is_vowel_rc = |b: usize| matches!((b as u8) as char, 'a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U');
+    let is_uppercase_rc = |b: usize| ((b as u8) as char).is_ascii_uppercase();
+    let is_digit_rc = |b: usize| ((b as u8) as char).is_ascii_digit();
+    let is_punctuation_rc = |b: usize| ((b as u8) as char).is_ascii_punctuation();
+    let rc_categories: [(&str, &dyn Fn(usize) -> bool); 4] = [
+        ("is-vowel", &is_vowel_rc),
+        ("is-uppercase", &is_uppercase_rc),
+        ("is-digit", &is_digit_rc),
+        ("is-punctuation", &is_punctuation_rc),
+    ];
+    let related = |i: usize, j: usize| cluster_same(i, j) || attn_related(i, j) || nn_related(i, j);
+
+    println!("\nrule-chaining inference (majority vote of a byte's related-graph neighbors' TRUE labels, leave-one-out):");
+    for (name, predicate) in rc_categories {
+        let labels: Vec<usize> = (0..consistency_n).map(|i| if predicate(filtered_bytes[i]) { 1 } else { 0 }).collect();
+        let mut correct = 0;
+        let mut isolated = 0;
+        for i in 0..consistency_n {
+            let (mut pos, mut neg) = (0, 0);
+            for j in 0..consistency_n {
+                if i == j || !related(i, j) {
+                    continue;
+                }
+                if labels[j] == 1 {
+                    pos += 1;
+                } else {
+                    neg += 1;
+                }
+            }
+            let inferred = if pos == 0 && neg == 0 {
+                isolated += 1;
+                0
+            } else if pos > neg {
+                1
+            } else {
+                0
+            };
+            if inferred == labels[i] {
+                correct += 1;
+            }
+        }
+        println!(
+            "  {name}: {:.3} accuracy ({correct}/{consistency_n}), {isolated} bytes with no related-graph neighbors",
+            correct as f32 / consistency_n as f32
+        );
+    }
+
     // Fourth extraction, building on the second (attention graph): GNN
     // message-passing over the attention graph ([178af66]), is-vowel
     // prediction as an externally-checkable
