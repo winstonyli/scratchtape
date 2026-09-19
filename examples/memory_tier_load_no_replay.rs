@@ -1,10 +1,12 @@
-// Second half of the memory-tier integration - see memory_tier_save.rs's
-// header comment. This process has no memory of phase 1 at all: it
-// reconstructs the phase-1-trained model from memory_tier_checkpoint.txt
-// and the retained replay snapshot from memory_tier_replay.txt, then runs
-// phase 2 (corpus B) WITH replay - proving persistence and replay compose
-// across a genuine process boundary, not just within one running program
-// the way catastrophic_forgetting.rs demonstrated them separately.
+// No-replay control for memory_tier_load.rs, existing for one reason:
+// memory_tier_diff.rs needs a same-lineage "what if we hadn't replayed"
+// checkpoint to compare per-layer drift against. Identical to
+// memory_tier_load.rs except replay_prob is 0 and the output path differs
+// - duplicated rather than parameterized, same reasoning as every other
+// duplicated file in this project (catastrophic_forgetting.rs's own
+// train() already showed the alternative - an Option<replay> parameter -
+// works fine within one process; across two genuinely separate binaries,
+// a full duplicate keeps each program's behavior readable standalone).
 use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::{Tape, Var};
@@ -20,35 +22,25 @@ fn sample_window(rng: &mut Rng, corpus: &[usize], seq_len: usize) -> (Vec<usize>
     (corpus[start..start + seq_len].to_vec(), corpus[start + 1..start + seq_len + 1].to_vec())
 }
 
-// Corpus A is present here only for EVALUATING retained knowledge, the
-// same convention catastrophic_forgetting.rs already established - the
-// restriction to a tiny snapshot applies to what phase 2 TRAINS on, not
-// to what an honest measurement is allowed to check against.
 const CORPUS_A: &str = "Shall I compare thee to a summer's day?\n\
 Thou art more lovely and more temperate.\n\
 Rough winds do shake the darling buds of May,\n\
 And summer's lease hath all too short a date.";
 
-// Deliberately different register/vocabulary from CORPUS_A, same choice
-// and reasoning as catastrophic_forgetting.rs.
 const CORPUS_B: &str = "Twinkle, twinkle, little star,\n\
 How I wonder what you are!\n\
 Up above the world so high,\n\
 Like a diamond in the sky.";
 
 const CHECKPOINT_PATH: &str = "memory_tier_checkpoint.txt";
-const REPLAY_PATH: &str = "memory_tier_replay.txt";
-const AFTER_REPLAY_CHECKPOINT_PATH: &str = "memory_tier_checkpoint_after_replay.txt";
+const AFTER_NOREPLAY_CHECKPOINT_PATH: &str = "memory_tier_checkpoint_after_noreplay.txt";
 
-// Must match memory_tier_save.rs exactly - genuinely separate process,
-// same reasoning as checkpoint_load.rs.
 const D_MODEL: usize = 32;
 const N_HEADS: usize = 4;
 const D_FF: usize = 64;
 const SEQ_LEN: usize = 16;
 const N_BLOCKS: usize = 2;
 const VOCAB_SIZE: usize = 256;
-const REPLAY_WINDOWS: usize = 8;
 
 struct ForwardOut {
     tok_out: EmbeddingOut,
@@ -146,38 +138,15 @@ fn main() {
     assert_eq!(offset, flat.len(), "checkpoint had leftover/missing floats - architecture mismatch");
     println!("loaded {} floats from {CHECKPOINT_PATH}", flat.len());
 
-    let replay_text = fs::read_to_string(REPLAY_PATH)
-        .unwrap_or_else(|_| panic!("couldn't read {REPLAY_PATH} - run memory_tier_save first"));
-    let replay_flat: Vec<usize> = replay_text.split_whitespace().map(|s| s.parse().expect("bad token id in replay file")).collect();
-    assert_eq!(replay_flat.len(), REPLAY_WINDOWS * 2 * SEQ_LEN, "replay file has the wrong number of tokens - architecture mismatch");
-    let replay_buffer: Vec<(Vec<usize>, Vec<usize>)> = (0..REPLAY_WINDOWS)
-        .map(|i| {
-            let base = i * 2 * SEQ_LEN;
-            (replay_flat[base..base + SEQ_LEN].to_vec(), replay_flat[base + SEQ_LEN..base + 2 * SEQ_LEN].to_vec())
-        })
-        .collect();
-    println!("loaded {REPLAY_WINDOWS} replay windows from {REPLAY_PATH}");
-
-    // Round-trip check, same spirit as checkpoint_load.rs's existing one -
-    // this should match memory_tier_save.rs's printed "loss on corpus A
-    // after phase 1" exactly, confirming the weights survived the
-    // save/load boundary before any phase-2 training touches them.
     let loss_a_on_load = eval_loss(&token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &corpus_a, SEQ_LEN);
     println!("loss on corpus A immediately after loading (no retraining yet): {loss_a_on_load:.6}");
-    println!("  compare exactly against memory_tier_save's \"loss on corpus A after phase 1\" - proves the weight round-trip.");
 
     let opt = Sgd { lr: 0.3 };
     let steps = 2000;
-    let replay_prob = 0.15;
     let mut rng = Rng::new(2);
-    println!("\nphase 2: training on corpus B WITH replay (15% of steps drawn from the loaded snapshot, {steps} steps)");
+    println!("\nphase 2: training on corpus B, NO replay ({steps} steps)");
     for step in 0..steps {
-        let (input, target) = if !replay_buffer.is_empty() && rng.next_f32() < replay_prob {
-            let idx = (rng.next_f32() * replay_buffer.len() as f32) as usize;
-            replay_buffer[idx].clone()
-        } else {
-            sample_window(&mut rng, &corpus_b, SEQ_LEN)
-        };
+        let (input, target) = sample_window(&mut rng, &corpus_b, SEQ_LEN);
         let mut tape = Tape::new();
         let (logits, out) = forward(&mut tape, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &input);
         let loss = tape.cross_entropy(logits, &target);
@@ -188,18 +157,12 @@ fn main() {
         }
     }
 
-    let loss_a_after_b_replay = eval_loss(&token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &corpus_a, SEQ_LEN);
-    let loss_b_after_b_replay = eval_loss(&token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &corpus_b, SEQ_LEN);
-    println!("\nloss on A after cross-process replay-mitigated phase 2: {loss_a_after_b_replay:.4}");
-    println!("loss on B after cross-process replay-mitigated phase 2: {loss_b_after_b_replay:.4}");
-    println!("forgetting on A (cross-process, with replay): {:+.4}", loss_a_after_b_replay - loss_a_on_load);
-    println!(
-        "\ncompare against catastrophic_forgetting.rs's in-process numbers: no-replay forgetting +5.43, in-process-replay forgetting +2.73 (both from a starting loss of 0.43)."
-    );
+    let loss_a_after_b = eval_loss(&token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &corpus_a, SEQ_LEN);
+    let loss_b_after_b = eval_loss(&token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &corpus_b, SEQ_LEN);
+    println!("\nloss on A after cross-process no-replay phase 2: {loss_a_after_b:.4}");
+    println!("loss on B after cross-process no-replay phase 2: {loss_b_after_b:.4}");
+    println!("forgetting on A (cross-process, no replay): {:+.4}", loss_a_after_b - loss_a_on_load);
 
-    // Saved for memory_tier_diff.rs - a second checkpoint, same format as
-    // the phase-1 one, letting a later tool compute per-layer drift
-    // between the two without needing to rerun any training.
     let mut flat_after = token_emb.to_flat();
     flat_after.extend(pos_emb.to_flat());
     for block in &blocks {
@@ -208,6 +171,6 @@ fn main() {
     flat_after.extend(final_ln.to_flat());
     flat_after.extend(output_proj.to_flat());
     let text: String = flat_after.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(" ");
-    fs::write(AFTER_REPLAY_CHECKPOINT_PATH, text).expect("failed to write post-phase-2 checkpoint");
-    println!("saved post-phase-2 (with replay) weights to {AFTER_REPLAY_CHECKPOINT_PATH}");
+    fs::write(AFTER_NOREPLAY_CHECKPOINT_PATH, text).expect("failed to write post-phase-2 checkpoint");
+    println!("saved post-phase-2 (no replay) weights to {AFTER_NOREPLAY_CHECKPOINT_PATH}");
 }
