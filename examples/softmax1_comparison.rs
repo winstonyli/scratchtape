@@ -1,5 +1,5 @@
-use engine::tape::Tape;
-use engine::tensor::NdArray;
+use scratchtape::tape::Tape;
+use scratchtape::tensor::NdArray;
 
 /// Tests Evan Miller's "Attention Is Off By One" claim directly, not just
 /// citing it: does softmax1 actually let attention express "nothing here,"

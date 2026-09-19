@@ -1,7 +1,7 @@
-use engine::nn::{Linear, Rng};
-use engine::optim::{Adam, AdamState};
-use engine::tape::Tape;
-use engine::tensor::NdArray;
+use scratchtape::nn::{Linear, Rng};
+use scratchtape::optim::{Adam, AdamState};
+use scratchtape::tape::Tape;
+use scratchtape::tensor::NdArray;
 
 /// Diagonal linear SSM (S4D-style, not full S4/Mamba - no HiPPO init, no
 /// selectivity): h_t = a*h_{t-1} + b*u_t, elementwise per channel. Copy-task
@@ -141,7 +141,7 @@ fn main() {
         batch: usize,
         d_state: usize,
         denom: f32,
-    ) -> (Tape, Vec<engine::tape::Var>, engine::tape::Var) {
+    ) -> (Tape, Vec<scratchtape::tape::Var>, scratchtape::tape::Var) {
         let mut tape = Tape::new();
         let a_var = tape.leaf(a.clone());
         let b_var = tape.leaf(b_gain.clone());

@@ -1,6 +1,6 @@
-use engine::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
-use engine::optim::{Adam, AdamState};
-use engine::tape::{Tape, Var};
+use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
+use scratchtape::optim::{Adam, AdamState};
+use scratchtape::tape::{Tape, Var};
 use std::collections::HashMap;
 
 fn encode_bytes(text: &str) -> Vec<usize> {
@@ -61,7 +61,7 @@ fn apply_grad(
     blocks: &mut [TransformerBlock],
     final_ln: &mut LayerNorm,
     output_proj: &mut Linear,
-    opt: &engine::optim::Sgd,
+    opt: &scratchtape::optim::Sgd,
 ) {
     token_emb.apply_grad(tape, &out.tok_out, opt);
     pos_emb.apply_grad(tape, &out.pos_out, opt);
@@ -86,7 +86,7 @@ fn main() {
         (0..n_blocks).map(|_| TransformerBlock::new(&mut rng, d_model, n_heads, d_ff)).collect();
     let mut final_ln = LayerNorm::new(d_model);
     let mut output_proj = Linear::new(&mut rng, d_model, vocab_size);
-    let opt = engine::optim::Sgd { lr: 0.3 };
+    let opt = scratchtape::optim::Sgd { lr: 0.3 };
 
     for _ in 0..=4000 {
         let (input, target) = sample_window(&mut rng, &encoded, seq_len);

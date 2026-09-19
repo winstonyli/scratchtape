@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use engine::nn::{Rng, TransformerBlock};
-use engine::tape::Tape;
-use engine::tensor::NdArray;
+use scratchtape::nn::{Rng, TransformerBlock};
+use scratchtape::tape::Tape;
+use scratchtape::tensor::NdArray;
 
 /// Baseline for a realistic COMPOSITE workload, not an isolated primitive
 /// like benches/matmul.rs - one forward+backward pass through a full

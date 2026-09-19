@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use engine::tensor::NdArray;
+use scratchtape::tensor::NdArray;
 
 /// Baseline for the current naive i-k-j triple-loop matmul, to compare
 /// against once a blocked/tiled or SIMD version exists - there's nothing to

@@ -1,4 +1,4 @@
-use engine::nn::Rng;
+use scratchtape::nn::Rng;
 
 /// Byte-level, not character-level: fixed universal vocab of 256 (the byte
 /// value IS the token id, no lookup table or corpus scan needed to build a

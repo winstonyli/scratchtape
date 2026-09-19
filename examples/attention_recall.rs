@@ -1,5 +1,5 @@
-use engine::tape::Tape;
-use engine::tensor::NdArray;
+use scratchtape::tape::Tape;
+use scratchtape::tensor::NdArray;
 
 /// Pure forward-pass associative recall - no training, no gradient descent.
 /// Directly tests the Modern Hopfield Networks claim flagged earlier in

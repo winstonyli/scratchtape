@@ -1,7 +1,7 @@
-use engine::nn::Rng;
-use engine::optim::{Adam, AdamState};
-use engine::tape::Tape;
-use engine::tensor::NdArray;
+use scratchtape::nn::Rng;
+use scratchtape::optim::{Adam, AdamState};
+use scratchtape::tape::Tape;
+use scratchtape::tensor::NdArray;
 
 /// Predictive Coding (Whittington & Bogacz 2017 formulation): bypasses Tape
 /// entirely - not because it needs zero derivatives (that's ES's reason),

@@ -1,6 +1,6 @@
-use engine::nn::Linear;
-use engine::tape::Tape;
-use engine::tensor::NdArray;
+use scratchtape::nn::Linear;
+use scratchtape::tape::Tape;
+use scratchtape::tensor::NdArray;
 
 /// Multi-head attention over the same associative-recall setup as
 /// attention_recall.rs, split into 2 heads of 2 dims each.

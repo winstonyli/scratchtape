@@ -1,7 +1,7 @@
-use engine::nn::{Linear, Rng};
-use engine::optim::Sgd;
-use engine::tape::Tape;
-use engine::tensor::NdArray;
+use scratchtape::nn::{Linear, Rng};
+use scratchtape::optim::Sgd;
+use scratchtape::tape::Tape;
+use scratchtape::tensor::NdArray;
 
 /// XOR: the textbook proof a linear model cannot work here (not linearly
 /// separable) - the whole justification for hidden layers + nonlinearity

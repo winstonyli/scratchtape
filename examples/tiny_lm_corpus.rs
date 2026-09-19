@@ -1,7 +1,7 @@
-use engine::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
-use engine::optim::{Adam, AdamState, Sgd};
-use engine::tape::{Tape, Var};
-use engine::tensor::NdArray;
+use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
+use scratchtape::optim::{Adam, AdamState, Sgd};
+use scratchtape::tape::{Tape, Var};
+use scratchtape::tensor::NdArray;
 use std::collections::HashMap;
 use std::thread;
 use std::time::Instant;

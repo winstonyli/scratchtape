@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use engine::gpu::gpu_matmul;
-use engine::tensor::NdArray;
+use scratchtape::gpu::gpu_matmul;
+use scratchtape::tensor::NdArray;
 
 /// First real GPU-vs-CPU comparison point - CPU side already has
 /// cache-blocking + AVX2/FMA behind it, GPU side is a naive (unblocked,

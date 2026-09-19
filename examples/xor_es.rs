@@ -1,5 +1,5 @@
-use engine::nn::{Linear, Rng};
-use engine::tensor::NdArray;
+use scratchtape::nn::{Linear, Rng};
+use scratchtape::tensor::NdArray;
 
 /// Plain NdArray math, no Tape/Var anywhere - proves ES needs zero autograd
 /// machinery, not just forward-only by convention.

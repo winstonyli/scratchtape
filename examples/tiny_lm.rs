@@ -1,6 +1,6 @@
-use engine::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
-use engine::optim::Sgd;
-use engine::tape::{Tape, Var};
+use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
+use scratchtape::optim::Sgd;
+use scratchtape::tape::{Tape, Var};
 use std::collections::HashMap;
 
 /// Byte-level: fixed 256 vocab, token id = byte value. Duplicated from

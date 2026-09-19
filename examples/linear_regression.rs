@@ -1,7 +1,7 @@
-use engine::nn::Rng;
-use engine::optim::Sgd;
-use engine::tape::Tape;
-use engine::tensor::NdArray;
+use scratchtape::nn::Rng;
+use scratchtape::optim::Sgd;
+use scratchtape::tape::Tape;
+use scratchtape::tensor::NdArray;
 
 /// Ground truth: y = 3x + 2, plus small noise. Simplest possible task that
 /// exercises the whole stack: MatMul, broadcast Add (bias), Sub, Mul, Sum, SGD.

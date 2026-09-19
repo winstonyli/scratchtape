@@ -1,7 +1,7 @@
-use engine::nn::{Linear, Rng};
-use engine::optim::{Adam, AdamState};
-use engine::tape::Tape;
-use engine::tensor::NdArray;
+use scratchtape::nn::{Linear, Rng};
+use scratchtape::optim::{Adam, AdamState};
+use scratchtape::tape::Tape;
+use scratchtape::tensor::NdArray;
 
 /// Same XOR task as xor_mlp.rs, driven by Adam instead of SGD - a direct
 /// comparison point. Drives l.w/l.b directly (bypasses Linear::apply_grad,

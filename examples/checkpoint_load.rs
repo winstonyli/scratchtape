@@ -1,5 +1,5 @@
-use engine::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, TransformerBlock, TransformerBlockOut};
-use engine::tape::{Tape, Var};
+use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, TransformerBlock, TransformerBlockOut};
+use scratchtape::tape::{Tape, Var};
 use std::fs;
 
 fn encode_bytes(text: &str) -> Vec<usize> {
