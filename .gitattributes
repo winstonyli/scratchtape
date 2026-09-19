@@ -1,0 +1,7 @@
+# Training corpus files must never have line endings silently converted -
+# include_str! bakes their exact bytes into the byte-level vocabulary, so a
+# checkout-time CRLF conversion changes the actual training data (a real
+# bug found: a fresh clone introduced '\r' as a new byte, shifting the
+# alphabet from 92 to 93 distinct bytes and invalidating every downstream
+# result computed from it).
+data/*.txt -text
