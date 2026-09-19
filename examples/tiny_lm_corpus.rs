@@ -1196,6 +1196,15 @@ fn main() {
     println!("\nis-vowel decision tree, fit on all {n_nodes} nodes (dims are opaque learned axes, not named features):");
     print_tree(&full_tree, 1, "vowel");
 
+    // Punctuation just emerged as the strongest cross-seed signal in the
+    // whole embedding-geometry line (55% group-membership stability, two
+    // clean unanimous sentence-role clusters {,;:} vs {.?!}) - printing its
+    // rule directly tests the strongest finding against the newest method.
+    let punct_labels: Vec<usize> = filtered_bytes.iter().map(|&b| if is_punctuation(b) { 1 } else { 0 }).collect();
+    let punct_tree = fit_tree(&feature_rows, &punct_labels, &all_idx, tree_depth, tree_min_samples);
+    println!("\nis-punctuation decision tree, fit on all {n_nodes} nodes:");
+    print_tree(&punct_tree, 1, "punctuation");
+
     // Direct test of the named block-0/head-0-only limitation this
     // extraction has carried since tiny_lm.rs: does every head show the
     // same self-attention/arbitrary-sink pattern, or does per-head
