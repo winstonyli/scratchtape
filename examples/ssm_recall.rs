@@ -119,8 +119,7 @@ fn main() {
 
         adam.step(&mut embed_w, tape.grad(w_var).unwrap(), &mut embed_w_state);
         adam.step(&mut embed_b, tape.grad(b_bias_var).unwrap(), &mut embed_b_state);
-        adam.step(&mut readout.w, tape.grad(out.w).unwrap(), &mut readout_w_state);
-        adam.step(&mut readout.b, tape.grad(out.b).unwrap(), &mut readout_b_state);
+        readout.apply_grad_with(&tape, &out, &adam, &mut readout_w_state, &mut readout_b_state);
         adam.step(&mut a, tape.grad(a_var).unwrap(), &mut a_state);
         adam.step(&mut b_gain, tape.grad(b_var).unwrap(), &mut b_state);
 

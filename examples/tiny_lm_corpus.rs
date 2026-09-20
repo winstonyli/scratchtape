@@ -99,10 +99,8 @@ fn run_kfold_probe(
             let train_logits = tape.gather(h2.y, train_idx);
             let loss = tape.cross_entropy(train_logits, &train_labels);
             tape.backward(loss);
-            adam.step(&mut l1.w, tape.grad(h1.w).unwrap(), &mut s1w);
-            adam.step(&mut l1.b, tape.grad(h1.b).unwrap(), &mut s1b);
-            adam.step(&mut l2.w, tape.grad(h2.w).unwrap(), &mut s2w);
-            adam.step(&mut l2.b, tape.grad(h2.b).unwrap(), &mut s2b);
+            l1.apply_grad_with(&tape, &h1, &adam, &mut s1w, &mut s1b);
+            l2.apply_grad_with(&tape, &h2, &adam, &mut s2w, &mut s2b);
             if step == train_steps - 1 {
                 let logits = tape.value(h2.y);
                 let correct = test_idx

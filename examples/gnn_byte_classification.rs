@@ -171,10 +171,8 @@ fn main() {
         let h2 = base2.forward(&mut tape, h1r);
         let loss = tape.cross_entropy(h2.y, &labels);
         tape.backward(loss);
-        adam.step(&mut base1.w, tape.grad(h1.w).unwrap(), &mut b1w);
-        adam.step(&mut base1.b, tape.grad(h1.b).unwrap(), &mut b1b);
-        adam.step(&mut base2.w, tape.grad(h2.w).unwrap(), &mut b2w);
-        adam.step(&mut base2.b, tape.grad(h2.b).unwrap(), &mut b2b);
+        base1.apply_grad_with(&tape, &h1, &adam, &mut b1w, &mut b1b);
+        base2.apply_grad_with(&tape, &h2, &adam, &mut b2w, &mut b2b);
         if step == 399 {
             let logits = tape.value(h2.y);
             let correct = (0..n)
@@ -211,10 +209,8 @@ fn main() {
         let h2 = gnn2.forward(&mut tape, h1r);
         let loss = tape.cross_entropy(h2.y, &labels);
         tape.backward(loss);
-        adam.step(&mut gnn1.w, tape.grad(h1.w).unwrap(), &mut g1w);
-        adam.step(&mut gnn1.b, tape.grad(h1.b).unwrap(), &mut g1b);
-        adam.step(&mut gnn2.w, tape.grad(h2.w).unwrap(), &mut g2w);
-        adam.step(&mut gnn2.b, tape.grad(h2.b).unwrap(), &mut g2b);
+        gnn1.apply_grad_with(&tape, &h1, &adam, &mut g1w, &mut g1b);
+        gnn2.apply_grad_with(&tape, &h2, &adam, &mut g2w, &mut g2b);
         if step == 399 {
             let logits = tape.value(h2.y);
             let correct = (0..n)

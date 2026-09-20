@@ -1,11 +1,11 @@
 use scratchtape::nn::{Linear, Rng};
-use scratchtape::optim::{Adam, AdamState};
+use scratchtape::optim::{Adam, Optimizer};
 use scratchtape::tape::Tape;
 use scratchtape::tensor::NdArray;
 
 /// Same XOR task as xor_mlp.rs, driven by Adam instead of SGD - a direct
-/// comparison point. Drives l.w/l.b directly (bypasses Linear::apply_grad,
-/// which is Sgd-specific) since Linear stays optimizer-agnostic.
+/// comparison point. Uses Linear::apply_grad_with, generic over Optimizer,
+/// rather than hand-rolling adam.step per w/b field.
 fn main() {
     let x_data = NdArray::new(vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], vec![4, 2]);
     let y_data = NdArray::new(vec![0.0, 1.0, 1.0, 0.0], vec![4, 1]);
@@ -15,10 +15,10 @@ fn main() {
     let mut l2 = Linear::new(&mut rng, 4, 1);
 
     let adam = Adam { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 };
-    let mut w1_state = AdamState::zeros_like(&l1.w);
-    let mut b1_state = AdamState::zeros_like(&l1.b);
-    let mut w2_state = AdamState::zeros_like(&l2.w);
-    let mut b2_state = AdamState::zeros_like(&l2.b);
+    let mut w1_state = Adam::new_state(&l1.w.shape);
+    let mut b1_state = Adam::new_state(&l1.b.shape);
+    let mut w2_state = Adam::new_state(&l2.w.shape);
+    let mut b2_state = Adam::new_state(&l2.b.shape);
 
     let n = 4.0f32;
 
@@ -38,10 +38,8 @@ fn main() {
 
         tape.backward(loss);
 
-        adam.step(&mut l1.w, tape.grad(out1.w).unwrap(), &mut w1_state);
-        adam.step(&mut l1.b, tape.grad(out1.b).unwrap(), &mut b1_state);
-        adam.step(&mut l2.w, tape.grad(out2.w).unwrap(), &mut w2_state);
-        adam.step(&mut l2.b, tape.grad(out2.b).unwrap(), &mut b2_state);
+        l1.apply_grad_with(&tape, &out1, &adam, &mut w1_state, &mut b1_state);
+        l2.apply_grad_with(&tape, &out2, &adam, &mut w2_state, &mut b2_state);
 
         if epoch % 50 == 0 {
             println!("epoch {epoch:>4}: loss = {:.6}", tape.value(loss).data[0]);

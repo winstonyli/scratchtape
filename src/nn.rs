@@ -1,4 +1,4 @@
-use crate::optim::Sgd;
+use crate::optim::{Optimizer, Sgd};
 use crate::tape::{Tape, Var};
 use crate::tensor::NdArray;
 use std::cell::RefCell;
@@ -32,8 +32,10 @@ impl Rng {
 /// Output of a Linear layer's forward pass. Carries the leaf `Var`s
 /// (not just the result `y`) because the training loop needs them to read
 /// gradients back off the tape and step the optimizer - no hidden state,
-/// same explicit style as the tape itself. w/b are pub - Adam's training
-/// loop needs them directly (bypasses apply_grad, which is Sgd-specific).
+/// same explicit style as the tape itself. w/b are pub - useful directly
+/// for raw NdArray parameters outside any Linear (e.g. predictive_coding.rs,
+/// ssm_recall.rs's weight-tied embed), though apply_grad_with now covers
+/// the common Linear-plus-any-Optimizer case without needing them exposed.
 pub struct LinearOut {
     pub y: Var,
     pub w: Var,
@@ -91,6 +93,19 @@ impl Linear {
     pub fn apply_grad(&mut self, tape: &Tape, out: &LinearOut, opt: &Sgd) {
         opt.step(&mut self.w, tape.grad(out.w).unwrap());
         opt.step(&mut self.b, tape.grad(out.b).unwrap());
+    }
+
+    /// Generic over Optimizer, so Adam (or anything else implementing it)
+    /// can update this layer without the caller hand-rolling a per-
+    /// parameter step loop the way every current Adam consumer does today.
+    /// State stays caller-owned (create once via O::new_state, thread it
+    /// every step) - same explicit, no-hidden-state placement AdamState
+    /// already uses, this just removes the duplicated step-invocation code
+    /// around it. apply_grad (Sgd-specific, no state to thread) is
+    /// unchanged and still the simplest path for the common case.
+    pub fn apply_grad_with<O: Optimizer>(&mut self, tape: &Tape, out: &LinearOut, opt: &O, w_state: &mut O::State, b_state: &mut O::State) {
+        opt.step(&mut self.w, tape.grad(out.w).unwrap(), w_state);
+        opt.step(&mut self.b, tape.grad(out.b).unwrap(), b_state);
     }
 
     /// Flattens to raw floats for checkpointing - no headers or shape
@@ -641,5 +656,37 @@ mod tests {
         let table_grad = tape.grad(out.table).unwrap();
         // Row 2 was looked up twice - its gradient should reflect both uses.
         assert!(table_grad.data[2 * 3] > table_grad.data[0 * 3]);
+    }
+
+    /// apply_grad_with::<Sgd> must compute EXACTLY what apply_grad already
+    /// does - same discipline as forward_batched's degenerate-case test.
+    /// Sgd::State = () means this path costs nothing extra over the
+    /// existing Sgd-specific apply_grad; the two must never diverge.
+    #[test]
+    fn apply_grad_with_sgd_matches_apply_grad() {
+        let mut rng = Rng::new(4);
+        let mut layer_a = Linear::new(&mut rng, 3, 2);
+        let mut layer_b = layer_a.clone();
+        let opt = Sgd { lr: 0.1 };
+
+        let x_data = vec![0.5, -0.3, 0.8];
+        let mut tape_a = Tape::new();
+        let x_a = tape_a.leaf(NdArray::new(x_data.clone(), vec![1, 3]));
+        let out_a = layer_a.forward(&mut tape_a, x_a);
+        let loss_a = tape_a.sum(out_a.y);
+        tape_a.backward(loss_a);
+        layer_a.apply_grad(&tape_a, &out_a, &opt);
+
+        let mut tape_b = Tape::new();
+        let x_b = tape_b.leaf(NdArray::new(x_data, vec![1, 3]));
+        let out_b = layer_b.forward(&mut tape_b, x_b);
+        let loss_b = tape_b.sum(out_b.y);
+        tape_b.backward(loss_b);
+        let mut w_state = <Sgd as Optimizer>::new_state(&layer_b.w.shape);
+        let mut b_state = <Sgd as Optimizer>::new_state(&layer_b.b.shape);
+        layer_b.apply_grad_with(&tape_b, &out_b, &opt, &mut w_state, &mut b_state);
+
+        assert_eq!(layer_a.w.data, layer_b.w.data);
+        assert_eq!(layer_a.b.data, layer_b.b.data);
     }
 }
