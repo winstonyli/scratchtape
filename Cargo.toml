@@ -170,6 +170,10 @@ path = "examples/memory_tiers/memory_tier_multigen_diverse_budget256.rs"
 name = "memory_tier_multigen_diverse_consolidate"
 path = "examples/memory_tiers/memory_tier_multigen_diverse_consolidate.rs"
 
+[[example]]
+name = "memory_tier_multigen_diverse_consolidate_fisher"
+path = "examples/memory_tiers/memory_tier_multigen_diverse_consolidate_fisher.rs"
+
 # differentiable reasoning / neural theorem proving
 [[example]]
 name = "differentiable_forward_chaining"
