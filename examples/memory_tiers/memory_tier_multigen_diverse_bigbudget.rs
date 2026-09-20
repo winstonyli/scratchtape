@@ -1,17 +1,12 @@
-// Scaled-up rerun of memory_tier_multigen.rs's 4-phase continual-learning
-// experiment - same design, same questions, but at real scale instead of
-// toy scale. Every memory-tier demo so far (catastrophic_forgetting.rs
-// through memory_tier_multigen.rs) used 4-line nursery-rhyme corpora at
-// d_model=32; this uses tiny_lm_corpus.rs's proven real-corpus scale
-// (d_model=128, Aesop's Fables) instead, split into 4 sequential phases
-// by contiguous byte range rather than 4 separate short texts. Tests
-// whether the toy-scale findings (threshold-not-dial replay effect, even
-// actively-replayed corpora still forgetting hard, new-task learning
-// getting harder as generations accumulate) hold up, or were artifacts of
-// running everything on texts small enough to fit in a handful of
-// gradient steps - the same "is this real or a toy-scale artifact"
-// instinct already applied to the KR&R line's compute-matched rerun,
-// aimed at the memory-tier line instead.
+// Follow-up to memory_tier_multigen_diverse_no_replay.rs's finding that
+// budget=8 replay made no measurable difference against genuinely
+// different real corpora - traced to 8 fixed windows covering a
+// negligible fraction of a ~59KB corpus (~930 possible seq_len=64 windows
+// per corpus), unlike the toy demos where budget=8 covered a real share
+// of a 4-line corpus. This reruns the same diverse-corpus setup with
+// budget=128 (16x), replay_prob unchanged at 0.15, to test whether a
+// bigger budget is what replay actually needed at this scale, or whether
+// the mechanism itself doesn't transfer regardless of size.
 use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::{Tape, Var};
@@ -81,9 +76,6 @@ fn apply_grad(
     output_proj.apply_grad(tape, &out.proj_out, opt);
 }
 
-/// Full deterministic sweep, same as memory_tier_multigen.rs's - at
-/// ~59KB per phase and seq_len=64 this is ~930 windows per call, forward-
-/// only, cheap relative to training.
 fn eval_loss(
     token_emb: &Embedding,
     pos_emb: &Embedding,
@@ -139,9 +131,9 @@ fn train(
     }
 }
 
-/// Same half-life curation policy as memory_tier_multigen.rs - see its
-/// doc comment. Unchanged on purpose: this experiment varies scale, not
-/// the policy being tested.
+/// Same half-life curation policy as memory_tier_multigen_diverse.rs - see
+/// its doc comment. Unchanged on purpose: this experiment varies budget
+/// size, not the policy being tested.
 fn curate(
     mut buffer: Vec<(&'static str, Vec<usize>, Vec<usize>)>,
     just_finished_label: &'static str,
@@ -172,41 +164,28 @@ fn composition(buffer: &[(&'static str, Vec<usize>, Vec<usize>)]) -> String {
 }
 
 fn main() {
-    // Same corpus tiny_lm_corpus.rs uses, split into 4 contiguous quarters
-    // by byte range - not by fable boundary, which would need parsing
-    // structure this file has no reason to add. Each quarter still spans
-    // many distinct fables (Aesop's Fables has hundreds), so this isn't a
-    // single repeated theme the way it might sound - it's simply "the
-    // first/second/third/fourth stretch of a long stream of real prose."
-    let full_text = include_str!("../data/aesops_fables.txt");
-    let full_encoded = encode_bytes(full_text);
-    let quarter = full_encoded.len() / 4;
-    let encoded: Vec<Vec<usize>> = (0..4)
-        .map(|i| {
-            let end = if i == 3 { full_encoded.len() } else { (i + 1) * quarter };
-            full_encoded[i * quarter..end].to_vec()
-        })
-        .collect();
-    let labels = ["A", "B", "C", "D"];
-    println!(
-        "corpus: {} bytes total, split into 4 phases of {} bytes each (last phase gets the remainder)",
-        full_encoded.len(),
-        quarter
-    );
+    // Identical corpus construction to memory_tier_multigen_diverse.rs -
+    // see its doc comment for sourcing.
+    let aesop_full = encode_bytes(include_str!("../../data/aesops_fables.txt"));
+    let encoded: Vec<Vec<usize>> = vec![
+        aesop_full[..59470].to_vec(),
+        encode_bytes(include_str!("../../data/sherlock_holmes.txt")),
+        encode_bytes(include_str!("../../data/origin_of_species.txt")),
+        encode_bytes(include_str!("../../data/leaves_of_grass.txt")),
+    ];
+    let labels = ["A(fables)", "B(holmes)", "C(origin)", "D(whitman)"];
+    for (label, corpus) in labels.iter().zip(encoded.iter()) {
+        println!("corpus {label}: {} bytes", corpus.len());
+    }
 
-    // Same architecture tiny_lm_corpus.rs's whole KR&R investigation was
-    // built on - the "real scale" this experiment is testing against,
-    // not the toy d_model=32 every earlier memory-tier demo used.
+    // Same architecture and step budget as memory_tier_multigen_diverse.rs.
+    // Only budget differs (128 instead of 8) - the one variable this file
+    // tests.
     let (d_model, n_heads, d_ff, seq_len, n_blocks) = (128, 8, 256, 64, 4);
     let vocab_size = 256;
-    // 4000 steps/phase, matching tiny_lm.rs's own first proven convergence
-    // budget - 4 phases x 4000 = 16000 total steps, the same total step
-    // count tiny_lm_corpus.rs's single-corpus runs used, so this spends
-    // the same total training compute just distributed across 4
-    // sequential phases instead of one continuous run.
     let steps_per_phase = 4000;
     let replay_prob = 0.15;
-    let budget = 8;
+    let budget = 128;
 
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);
@@ -224,7 +203,7 @@ fn main() {
     for phase in 0..4 {
         let name = labels[phase];
         println!(
-            "phase {phase} ({name}): training {steps_per_phase} steps, replay buffer = [{}] ({:.1}s elapsed)",
+            "\nphase {phase} ({name}): training {steps_per_phase} steps, replay buffer = [{}] ({:.1}s elapsed)",
             composition(&buffer),
             start_time.elapsed().as_secs_f32()
         );

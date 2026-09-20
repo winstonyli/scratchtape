@@ -800,7 +800,7 @@ fn main() {
     // boilerplate header/footer and the trailing alphabetical index
     // stripped, fetched verbatim rather than reproduced from memory (same
     // accuracy-risk reasoning as every other corpus choice in this project).
-    let full_text = include_str!("../data/aesops_fables.txt");
+    let full_text = include_str!("../../data/aesops_fables.txt");
     let full_encoded = encode_bytes(full_text);
 
     // 90/10 train/held-out split - held-out text is never sampled during

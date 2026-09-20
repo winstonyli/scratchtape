@@ -1,12 +1,8 @@
-// Follow-up to memory_tier_multigen_diverse_no_replay.rs's finding that
-// budget=8 replay made no measurable difference against genuinely
-// different real corpora - traced to 8 fixed windows covering a
-// negligible fraction of a ~59KB corpus (~930 possible seq_len=64 windows
-// per corpus), unlike the toy demos where budget=8 covered a real share
-// of a 4-line corpus. This reruns the same diverse-corpus setup with
-// budget=128 (16x), replay_prob unchanged at 0.15, to test whether a
-// bigger budget is what replay actually needed at this scale, or whether
-// the mechanism itself doesn't transfer regardless of size.
+// Next point on the budget sweep memory_tier_multigen_diverse_bigbudget.rs
+// started: that file found budget=128 (16x the original 8) gave a real,
+// consistent ~0.15-0.28 loss reduction over budget=8/no-replay. This
+// doubles to budget=256 (~28% coverage of a ~930-window corpus) to see
+// whether returns are still climbing or already flattening out.
 use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::{Tape, Var};
@@ -166,12 +162,12 @@ fn composition(buffer: &[(&'static str, Vec<usize>, Vec<usize>)]) -> String {
 fn main() {
     // Identical corpus construction to memory_tier_multigen_diverse.rs -
     // see its doc comment for sourcing.
-    let aesop_full = encode_bytes(include_str!("../data/aesops_fables.txt"));
+    let aesop_full = encode_bytes(include_str!("../../data/aesops_fables.txt"));
     let encoded: Vec<Vec<usize>> = vec![
         aesop_full[..59470].to_vec(),
-        encode_bytes(include_str!("../data/sherlock_holmes.txt")),
-        encode_bytes(include_str!("../data/origin_of_species.txt")),
-        encode_bytes(include_str!("../data/leaves_of_grass.txt")),
+        encode_bytes(include_str!("../../data/sherlock_holmes.txt")),
+        encode_bytes(include_str!("../../data/origin_of_species.txt")),
+        encode_bytes(include_str!("../../data/leaves_of_grass.txt")),
     ];
     let labels = ["A(fables)", "B(holmes)", "C(origin)", "D(whitman)"];
     for (label, corpus) in labels.iter().zip(encoded.iter()) {
@@ -179,13 +175,13 @@ fn main() {
     }
 
     // Same architecture and step budget as memory_tier_multigen_diverse.rs.
-    // Only budget differs (128 instead of 8) - the one variable this file
-    // tests.
+    // Only budget differs (256 instead of 128) - the one variable this
+    // file tests.
     let (d_model, n_heads, d_ff, seq_len, n_blocks) = (128, 8, 256, 64, 4);
     let vocab_size = 256;
     let steps_per_phase = 4000;
     let replay_prob = 0.15;
-    let budget = 128;
+    let budget = 256;
 
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);

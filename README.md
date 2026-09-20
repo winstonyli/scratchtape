@@ -27,6 +27,14 @@ transformer, print what happened. A few (`checkpoint_save`/
 `checkpoint_load`, `memory_tier_*`) are pairs of programs that write a
 file and read it back in a genuinely separate process.
 
+`examples/` is grouped into subdirectories by investigation line
+(`fundamentals/`, `tiny_lm/`, `alternative_mechanisms/`,
+`memory_tiers/`, `differentiable_reasoning/` — matching this section's
+own headings below), each wired up via an explicit `[[example]]` entry
+in `Cargo.toml` (Cargo only auto-discovers examples at the top level).
+Names are unchanged from the original flat layout, so every
+`cargo run --example <name>` below still works exactly as written.
+
 ## Engine (`src/`)
 
 | module | what it is |

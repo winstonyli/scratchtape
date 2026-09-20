@@ -34,3 +34,151 @@ harness = false
 [profile.profiling]
 inherits = "release"
 debug = true
+
+# Cargo only auto-discovers examples/*.rs at the top level (or
+# examples/*/main.rs) - grouping them into thematic subdirectories
+# (examples/memory_tiers/, examples/differentiable_reasoning/, etc., see
+# README's Examples section) needs an explicit [[example]] entry per
+# file. `name` is unchanged from the flat layout, so every existing
+# `cargo run --example <name>` invocation still works identically.
+
+# fundamentals
+[[example]]
+name = "xor_mlp"
+path = "examples/fundamentals/xor_mlp.rs"
+
+[[example]]
+name = "xor_mlp_adam"
+path = "examples/fundamentals/xor_mlp_adam.rs"
+
+[[example]]
+name = "xor_es"
+path = "examples/fundamentals/xor_es.rs"
+
+[[example]]
+name = "linear_regression"
+path = "examples/fundamentals/linear_regression.rs"
+
+[[example]]
+name = "byte_tokenizer"
+path = "examples/fundamentals/byte_tokenizer.rs"
+
+# tiny_lm family (+ the GNN probe that's resolved at scale inside tiny_lm_corpus)
+[[example]]
+name = "tiny_lm"
+path = "examples/tiny_lm/tiny_lm.rs"
+
+[[example]]
+name = "tiny_lm_scaled"
+path = "examples/tiny_lm/tiny_lm_scaled.rs"
+
+[[example]]
+name = "tiny_lm_scaled2"
+path = "examples/tiny_lm/tiny_lm_scaled2.rs"
+
+[[example]]
+name = "tiny_lm_batched"
+path = "examples/tiny_lm/tiny_lm_batched.rs"
+
+[[example]]
+name = "tiny_lm_corpus"
+path = "examples/tiny_lm/tiny_lm_corpus.rs"
+
+[[example]]
+name = "gnn_byte_classification"
+path = "examples/tiny_lm/gnn_byte_classification.rs"
+
+# alternative computational/training mechanisms
+[[example]]
+name = "attention_recall"
+path = "examples/alternative_mechanisms/attention_recall.rs"
+
+[[example]]
+name = "multihead_attention_recall"
+path = "examples/alternative_mechanisms/multihead_attention_recall.rs"
+
+[[example]]
+name = "ssm_recall"
+path = "examples/alternative_mechanisms/ssm_recall.rs"
+
+[[example]]
+name = "softmax1_comparison"
+path = "examples/alternative_mechanisms/softmax1_comparison.rs"
+
+[[example]]
+name = "predictive_coding"
+path = "examples/alternative_mechanisms/predictive_coding.rs"
+
+# continual learning / memory tiers
+[[example]]
+name = "catastrophic_forgetting"
+path = "examples/memory_tiers/catastrophic_forgetting.rs"
+
+[[example]]
+name = "checkpoint_save"
+path = "examples/memory_tiers/checkpoint_save.rs"
+
+[[example]]
+name = "checkpoint_load"
+path = "examples/memory_tiers/checkpoint_load.rs"
+
+[[example]]
+name = "memory_tier_save"
+path = "examples/memory_tiers/memory_tier_save.rs"
+
+[[example]]
+name = "memory_tier_load"
+path = "examples/memory_tiers/memory_tier_load.rs"
+
+[[example]]
+name = "memory_tier_load_no_replay"
+path = "examples/memory_tiers/memory_tier_load_no_replay.rs"
+
+[[example]]
+name = "memory_tier_diff"
+path = "examples/memory_tiers/memory_tier_diff.rs"
+
+[[example]]
+name = "memory_tier_sweep"
+path = "examples/memory_tiers/memory_tier_sweep.rs"
+
+[[example]]
+name = "memory_tier_multigen"
+path = "examples/memory_tiers/memory_tier_multigen.rs"
+
+[[example]]
+name = "memory_tier_multigen_scaled"
+path = "examples/memory_tiers/memory_tier_multigen_scaled.rs"
+
+[[example]]
+name = "memory_tier_multigen_diverse"
+path = "examples/memory_tiers/memory_tier_multigen_diverse.rs"
+
+[[example]]
+name = "memory_tier_multigen_diverse_no_replay"
+path = "examples/memory_tiers/memory_tier_multigen_diverse_no_replay.rs"
+
+[[example]]
+name = "memory_tier_multigen_diverse_bigbudget"
+path = "examples/memory_tiers/memory_tier_multigen_diverse_bigbudget.rs"
+
+[[example]]
+name = "memory_tier_multigen_diverse_budget256"
+path = "examples/memory_tiers/memory_tier_multigen_diverse_budget256.rs"
+
+[[example]]
+name = "memory_tier_multigen_diverse_consolidate"
+path = "examples/memory_tiers/memory_tier_multigen_diverse_consolidate.rs"
+
+# differentiable reasoning / neural theorem proving
+[[example]]
+name = "differentiable_forward_chaining"
+path = "examples/differentiable_reasoning/differentiable_forward_chaining.rs"
+
+[[example]]
+name = "differentiable_backward_chaining"
+path = "examples/differentiable_reasoning/differentiable_backward_chaining.rs"
+
+[[example]]
+name = "differentiable_backward_chaining_dense"
+path = "examples/differentiable_reasoning/differentiable_backward_chaining_dense.rs"

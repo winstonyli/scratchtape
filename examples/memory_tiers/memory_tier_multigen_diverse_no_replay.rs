@@ -1,12 +1,14 @@
-// Rerun of memory_tier_multigen_scaled.rs's 4-phase continual-learning
-// experiment, but with the confound it surfaced removed: that run quartered
-// ONE book (Aesop's Fables) and found essentially no forgetting, traced to
-// all 4 "phases" sharing the same vocabulary/register/byte statistics - not
-// a real different-task sequence. This run swaps the 4 quarters for 4
-// genuinely different real public-domain texts (fable, detective fiction,
-// scientific argument, free verse), each trimmed to roughly the same byte
-// budget as one of the old quarters (~58-60KB), so scale and step count
-// are unchanged and vocabulary divergence is the only thing that changed.
+// Control for memory_tier_multigen_diverse.rs: identical setup (same 4
+// genuinely different real corpora, same architecture, same step budget,
+// same seeds) with budget=0 so the replay buffer stays permanently empty
+// and every step trains on the current phase only. Isolates the question
+// that run's commit left open - was its forgetting mild (~0.1-0.4 loss
+// drift) because replay was doing real mitigating work, or because
+// byte-level loss on real prose partly saturates on universal structure
+// (whitespace, punctuation, function words) regardless of replay? If this
+// run forgets much harder than the replay version, replay was doing real
+// work; if it forgets about the same amount, the mildness was saturation,
+// not mitigation.
 use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::{Tape, Var};
@@ -131,9 +133,12 @@ fn train(
     }
 }
 
-/// Same half-life curation policy as memory_tier_multigen_scaled.rs - see
-/// its doc comment. Unchanged on purpose: this experiment varies corpus
-/// divergence, not the policy being tested.
+/// Same half-life curation policy as memory_tier_multigen_diverse.rs - see
+/// its doc comment. With budget=0 this is a no-op every call (evict=0,
+/// while-loop never fires since len()=0 is never < 0), so buffer stays
+/// permanently empty. Kept as a real call rather than special-cased away,
+/// so this file's control differs from the replay version by exactly one
+/// constant.
 fn curate(
     mut buffer: Vec<(&'static str, Vec<usize>, Vec<usize>)>,
     just_finished_label: &'static str,
@@ -164,31 +169,29 @@ fn composition(buffer: &[(&'static str, Vec<usize>, Vec<usize>)]) -> String {
 }
 
 fn main() {
-    // 4 genuinely different real texts, not quarters of one book - fable,
-    // detective fiction, scientific argument, free verse. Phase A is
-    // truncated to the same ~59.5KB the other three were independently
-    // trimmed to (Project Gutenberg source, boilerplate stripped, cut at a
-    // paragraph boundary), so no phase gets a size advantage.
-    let aesop_full = encode_bytes(include_str!("../data/aesops_fables.txt"));
+    // Identical corpus construction to memory_tier_multigen_diverse.rs -
+    // see its doc comment for sourcing.
+    let aesop_full = encode_bytes(include_str!("../../data/aesops_fables.txt"));
     let encoded: Vec<Vec<usize>> = vec![
         aesop_full[..59470].to_vec(),
-        encode_bytes(include_str!("../data/sherlock_holmes.txt")),
-        encode_bytes(include_str!("../data/origin_of_species.txt")),
-        encode_bytes(include_str!("../data/leaves_of_grass.txt")),
+        encode_bytes(include_str!("../../data/sherlock_holmes.txt")),
+        encode_bytes(include_str!("../../data/origin_of_species.txt")),
+        encode_bytes(include_str!("../../data/leaves_of_grass.txt")),
     ];
     let labels = ["A(fables)", "B(holmes)", "C(origin)", "D(whitman)"];
     for (label, corpus) in labels.iter().zip(encoded.iter()) {
         println!("corpus {label}: {} bytes", corpus.len());
     }
 
-    // Same architecture and step budget as memory_tier_multigen_scaled.rs -
-    // scale and total compute held fixed, corpus divergence is the only
-    // variable being changed by this file.
+    // Same architecture and step budget as memory_tier_multigen_diverse.rs.
+    // Only budget differs (0 instead of 8) - replay_prob is irrelevant at
+    // budget=0 (replay.is_empty() is always true) but left in place so the
+    // train() call signature matches exactly.
     let (d_model, n_heads, d_ff, seq_len, n_blocks) = (128, 8, 256, 64, 4);
     let vocab_size = 256;
     let steps_per_phase = 4000;
     let replay_prob = 0.15;
-    let budget = 8;
+    let budget = 0;
 
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);

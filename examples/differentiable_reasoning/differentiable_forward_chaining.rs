@@ -210,7 +210,7 @@ fn fit_and_predict(
 }
 
 fn main() {
-    let corpus = encode_bytes(include_str!("../data/aesops_fables.txt"));
+    let corpus = encode_bytes(include_str!("../../data/aesops_fables.txt"));
 
     let mut node_of = [-1i32; 256];
     let mut values: Vec<usize> = Vec::new();

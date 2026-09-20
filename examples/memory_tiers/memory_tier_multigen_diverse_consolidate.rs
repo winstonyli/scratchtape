@@ -179,12 +179,12 @@ fn blend(new: &[f32], old: &[f32], alpha: f32) -> Vec<f32> {
 fn main() {
     // Identical corpus construction to memory_tier_multigen_diverse.rs -
     // see its doc comment for sourcing.
-    let aesop_full = encode_bytes(include_str!("../data/aesops_fables.txt"));
+    let aesop_full = encode_bytes(include_str!("../../data/aesops_fables.txt"));
     let encoded: Vec<Vec<usize>> = vec![
         aesop_full[..59470].to_vec(),
-        encode_bytes(include_str!("../data/sherlock_holmes.txt")),
-        encode_bytes(include_str!("../data/origin_of_species.txt")),
-        encode_bytes(include_str!("../data/leaves_of_grass.txt")),
+        encode_bytes(include_str!("../../data/sherlock_holmes.txt")),
+        encode_bytes(include_str!("../../data/origin_of_species.txt")),
+        encode_bytes(include_str!("../../data/leaves_of_grass.txt")),
     ];
     let labels = ["A(fables)", "B(holmes)", "C(origin)", "D(whitman)"];
     for (label, corpus) in labels.iter().zip(encoded.iter()) {
