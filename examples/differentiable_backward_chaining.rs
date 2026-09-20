@@ -35,7 +35,30 @@
 // model composed two 1-hop facts it was never shown together into a
 // 2-hop conclusion, purely through soft unification. No new tape
 // primitive needed for this: the max here is over plain f32s outside
-// the tape, not backpropagated through - see the closing note on why.
+// the tape, not backpropagated through.
+//
+// Phase 3 (added as a follow-up - does backprop through the OR-module's
+// max actually matter?): first checked whether continuing phase 1's
+// single-relation training a few more steps would trivially close phase
+// 2's gap on its own - at this toy scale it does (step 60 has 0.833
+// grandparent recall, step 62 already hits 1.000), so there's no
+// meaningful "does end-to-end help beyond more of the same" question to
+// ask on this KB. The actually decisive test is different: can the model
+// learn `parent` from ONLY 2-hop grandparent supervision, never shown a
+// single `parent` fact directly? That needs a genuinely differentiable
+// OR-module - gradient has to flow back through `max` to shape the base
+// relation embeddings at all. Added `Tape::max_last_axis` (src/tape.rs)
+// for this, gradient-checked like every other op here (routes the whole
+// incoming gradient to whichever candidate actually won the max, zero
+// elsewhere - standard max-pool backward). Fresh embeddings, trained
+// end-to-end via the same OR/AND-module formula batched over the tape
+// (n score columns concatenated, then max_last_axis - Tape::concat and
+// Tape::max_last_axis are both first-class differentiable ops, so
+// gradient reaches every candidate's embeddings, not just the winner's,
+// across the whole training run). Checked afterward: does the model's
+// RECOVERED parent_score, which it was never directly supervised on,
+// actually match the 10 true parent facts - or did it find some other,
+// non-veridical way to satisfy the observed 2-hop constraints?
 use scratchtape::nn::{Embedding, Rng};
 use scratchtape::optim::{Adam, AdamState};
 use scratchtape::tape::Tape;
@@ -68,6 +91,71 @@ fn sigmoid_scalar(x: f32) -> f32 {
 fn parent_score(subj_table: &NdArray, obj_table: &NdArray, bias: f32, a: usize, b: usize, d: usize) -> f32 {
     let dot: f32 = (0..d).map(|k| subj_table.data[a * d + k] * obj_table.data[b * d + k]).sum();
     sigmoid_scalar(dot + bias)
+}
+
+fn sigmoid(tape: &mut Tape, x: scratchtape::tape::Var) -> scratchtape::tape::Var {
+    let neg_x = tape.scale(x, -1.0);
+    let exp_neg_x = tape.exp(neg_x);
+    let one = tape.leaf(NdArray::new(vec![1.0; tape.value(exp_neg_x).data.len()], tape.value(exp_neg_x).shape.clone()));
+    let denom = tape.add(one, exp_neg_x);
+    tape.div(one, denom)
+}
+
+/// score(a,b) = sigmoid(dot(subj_emb[a], obj_emb[b]) + bias), batched over
+/// a whole id list at once - `forward_shared` (not `forward`) on
+/// pre-leafed `subj_table`/`obj_table`, since phase 3 calls this many
+/// times per step against the SAME embeddings (once per OR-module
+/// candidate). Plain `forward` would leaf a fresh copy each call - the
+/// exact weight-tying footgun Linear/Embedding's own doc comments warn
+/// about, since only the LAST leaf's gradient would then be visible.
+fn pair_score(
+    tape: &mut Tape,
+    subj_emb: &Embedding,
+    subj_table: scratchtape::tape::Var,
+    obj_emb: &Embedding,
+    obj_table: scratchtape::tape::Var,
+    bias_var: scratchtape::tape::Var,
+    a_ids: &[usize],
+    b_ids: &[usize],
+) -> scratchtape::tape::Var {
+    let a_out = subj_emb.forward_shared(tape, a_ids, subj_table);
+    let b_out = obj_emb.forward_shared(tape, b_ids, obj_table);
+    let prod = tape.mul(a_out.y, b_out.y);
+    let dot = tape.sum_last_axis(prod);
+    let logit = tape.add(dot, bias_var);
+    sigmoid(tape, logit)
+}
+
+/// The differentiable OR/AND modules, batched over a whole query set at
+/// once: for each of the n entities as a candidate Y, computes
+/// parent_score(x,y)*parent_score(y,z) (AND-module - product of both
+/// atoms) as one column, concatenates all n candidates' columns
+/// (Tape::concat, along the last axis - exactly what it's for), then
+/// max_last_axis picks the best candidate PER QUERY ROW (OR-module -
+/// existential search over Y) - differentiably, so gradient reaches
+/// every candidate's embeddings during training, not just whichever one
+/// happens to win on a given step.
+fn batched_grandparent_score(
+    tape: &mut Tape,
+    subj_emb: &Embedding,
+    subj_table: scratchtape::tape::Var,
+    obj_emb: &Embedding,
+    obj_table: scratchtape::tape::Var,
+    bias_var: scratchtape::tape::Var,
+    xs: &[usize],
+    zs: &[usize],
+    n: usize,
+) -> scratchtape::tape::Var {
+    let q = xs.len();
+    let mut columns = Vec::with_capacity(n);
+    for y in 0..n {
+        let y_ids = vec![y; q];
+        let s1 = pair_score(tape, subj_emb, subj_table, obj_emb, obj_table, bias_var, xs, &y_ids);
+        let s2 = pair_score(tape, subj_emb, subj_table, obj_emb, obj_table, bias_var, &y_ids, zs);
+        columns.push(tape.mul(s1, s2));
+    }
+    let all_scores = tape.concat(&columns);
+    tape.max_last_axis(all_scores)
 }
 
 fn main() {
@@ -232,6 +320,108 @@ fn main() {
                 }
                 println!("  grandparent({}, {}) via {} - score={best:.3}", names[x], names[z], names[best_y]);
             }
+        }
+    }
+
+    // Phase 3: learn `parent` from ONLY 2-hop grandparent supervision -
+    // fresh embeddings, never shown a single `parent` fact directly. This
+    // is the test that actually needs gradient to flow through the OR-
+    // module's max, unlike phases 1-2.
+    println!("\nphase 3: learning `parent` from ONLY grandparent supervision (fresh embeddings, no direct parent facts shown)");
+    let mut gp_xs = Vec::new();
+    let mut gp_zs = Vec::new();
+    let mut gp_labels = Vec::new();
+    for x in 0..n {
+        for z in 0..n {
+            if x == z {
+                continue;
+            }
+            gp_xs.push(x);
+            gp_zs.push(z);
+            gp_labels.push(if is_true_grandparent(x, z) { 1.0 } else { 0.0 });
+        }
+    }
+    let q = gp_xs.len();
+
+    let mut rng3 = Rng::new(1);
+    let mut subj_emb3 = Embedding::new(&mut rng3, n, d);
+    let mut obj_emb3 = Embedding::new(&mut rng3, n, d);
+    let mut bias3 = NdArray::new(vec![0.0], vec![1, 1]);
+    let adam3 = Adam { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 };
+    let mut subj_state3 = AdamState::zeros_like(&subj_emb3.table);
+    let mut obj_state3 = AdamState::zeros_like(&obj_emb3.table);
+    let mut bias_state3 = AdamState::zeros_like(&bias3);
+
+    let steps3 = 2000;
+    for step in 0..steps3 {
+        let mut tape = Tape::new();
+        let subj_table_var = tape.leaf(subj_emb3.table.clone());
+        let obj_table_var = tape.leaf(obj_emb3.table.clone());
+        let bias_var = tape.leaf(bias3.clone());
+
+        let proof = batched_grandparent_score(&mut tape, &subj_emb3, subj_table_var, &obj_emb3, obj_table_var, bias_var, &gp_xs, &gp_zs, n);
+
+        let one = tape.leaf(NdArray::new(vec![1.0; q], vec![q, 1]));
+        let y = tape.leaf(NdArray::new(gp_labels.clone(), vec![q, 1]));
+        let eps = tape.leaf(NdArray::new(vec![1e-6; q], vec![q, 1]));
+        let proof_eps = tape.add(proof, eps);
+        let one_minus_proof = tape.sub(one, proof);
+        let one_minus_proof_eps = tape.add(one_minus_proof, eps);
+        let one_minus_y = tape.sub(one, y);
+        let log_p = tape.log(proof_eps);
+        let log_one_minus_p = tape.log(one_minus_proof_eps);
+        let term1 = tape.mul(y, log_p);
+        let term2 = tape.mul(one_minus_y, log_one_minus_p);
+        let sum_terms = tape.add(term1, term2);
+        let neg_mean = tape.scale(sum_terms, -1.0 / q as f32);
+        let loss = tape.sum(neg_mean);
+
+        tape.backward(loss);
+        adam3.step(&mut subj_emb3.table, tape.grad(subj_table_var).unwrap(), &mut subj_state3);
+        adam3.step(&mut obj_emb3.table, tape.grad(obj_table_var).unwrap(), &mut obj_state3);
+        adam3.step(&mut bias3, tape.grad(bias_var).unwrap(), &mut bias_state3);
+
+        if step % 200 == 0 {
+            println!("  phase 3 step {step:>4}: loss = {:.4}", tape.value(loss).data[0]);
+        }
+    }
+
+    // Check 1: did phase 3 solve the objective it was actually trained on?
+    let mut gp_predictions = vec![0usize; q];
+    for i in 0..q {
+        let mut best = 0.0f32;
+        for y in 0..n {
+            if y == gp_xs[i] || y == gp_zs[i] {
+                continue;
+            }
+            let s = parent_score(&subj_emb3.table, &obj_emb3.table, bias3.data[0], gp_xs[i], y, d)
+                * parent_score(&subj_emb3.table, &obj_emb3.table, bias3.data[0], y, gp_zs[i], d);
+            if s > best {
+                best = s;
+            }
+        }
+        gp_predictions[i] = if best > 0.5 { 1 } else { 0 };
+    }
+    let gp_labels_usize: Vec<usize> = gp_labels.iter().map(|&l| l as usize).collect();
+    let (gp_p, gp_r, gp_f1) = precision_recall_f1(&gp_labels_usize, &gp_predictions);
+    println!("phase 3 check 1 - the trained objective (grandparent prediction): precision={gp_p:.3} recall={gp_r:.3} f1={gp_f1:.3}");
+
+    // Check 2 (the actually interesting one): does the RECOVERED
+    // parent_score match the 10 true parent facts it never saw directly?
+    let mut recovered_predictions = vec![0usize; n_pairs];
+    for i in 0..n_pairs {
+        let s = parent_score(&subj_emb3.table, &obj_emb3.table, bias3.data[0], subj_ids[i], obj_ids[i], d);
+        recovered_predictions[i] = if s > 0.5 { 1 } else { 0 };
+    }
+    let (rp, rr, rf1) = precision_recall_f1(&fact_labels_usize, &recovered_predictions);
+    println!(
+        "phase 3 check 2 - did it recover the TRUE `parent` facts as a byproduct: precision={rp:.3} recall={rr:.3} f1={rf1:.3}"
+    );
+    println!("  (facts it inferred as `parent` that were never directly supervised:)");
+    for i in 0..n_pairs {
+        if recovered_predictions[i] == 1 {
+            let matches_truth = if fact_labels_usize[i] == 1 { "true parent fact" } else { "NOT a true parent fact" };
+            println!("    parent({}, {}) - {matches_truth}", names[subj_ids[i]], names[obj_ids[i]]);
         }
     }
 }

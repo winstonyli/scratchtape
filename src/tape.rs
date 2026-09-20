@@ -28,6 +28,7 @@ enum OpKind {
     Transpose(usize),
     Exp(usize),
     SumLastAxis(usize),
+    MaxLastAxis(usize),
     Div(usize, usize),
     Concat(Vec<usize>),
     Gather(usize, Vec<usize>),
@@ -211,6 +212,22 @@ impl Tape {
     pub fn sum_last_axis(&mut self, a: Var) -> Var {
         let val = self.nodes[a.idx].value.sum_last_axis();
         self.push(val, OpKind::SumLastAxis(a.idx))
+    }
+
+    /// Differentiable max along the last axis - distinct from
+    /// NdArray::max_last_axis, which stays non-differentiable/detached-leaf
+    /// use (softmax's stability trick, where the gradient through the max
+    /// is provably zero by shift-invariance - see that method's doc
+    /// comment). Needed for a genuine OR-module (existential search over
+    /// candidate substitutions, differentiable_backward_chaining.rs):
+    /// there the gradient through which candidate wins must NOT be zero -
+    /// that's the whole point of learning through the search. 2D input
+    /// only ([rows, cols] -> [rows, 1]), same scope every other reduction
+    /// in this codebase is actually used at (matmul, sum_last_axis, etc.
+    /// are never called past rank 2 in practice either).
+    pub fn max_last_axis(&mut self, a: Var) -> Var {
+        let val = self.nodes[a.idx].value.max_last_axis();
+        self.push(val, OpKind::MaxLastAxis(a.idx))
     }
 
     /// Differentiable division - distinct from NdArray::div, which stays
@@ -414,6 +431,30 @@ impl Tape {
                     // reduced axis via the existing broadcast machinery.
                     let a_shape = self.nodes[a].value.shape.clone();
                     self.accumulate(a, grad.broadcast_to(&a_shape));
+                }
+                OpKind::MaxLastAxis(a) => {
+                    // Standard max-pool backward: the whole incoming
+                    // gradient routes to whichever column actually WAS the
+                    // max in that row, zero everywhere else - only the
+                    // winner influenced the output, so only the winner
+                    // gets credit/blame. Ties route to the first occurrence
+                    // (matches this project's other tie-break-by-first-
+                    // match conventions, and real float ties are
+                    // vanishingly rare on learned data anyway). Assumes
+                    // 2D input, same scope max_last_axis's own doc comment
+                    // states.
+                    let a_val = self.nodes[a].value.clone();
+                    let max_val = self.nodes[i].value.clone();
+                    let rows = a_val.shape[0];
+                    let cols = a_val.shape[1];
+                    let mut grad_a = vec![0.0f32; a_val.data.len()];
+                    for row in 0..rows {
+                        let target = max_val.data[row];
+                        let row_start = row * cols;
+                        let winner = (0..cols).find(|&k| a_val.data[row_start + k] == target).unwrap_or(0);
+                        grad_a[row_start + winner] = grad.data[row];
+                    }
+                    self.accumulate(a, NdArray::new(grad_a, a_val.shape.clone()));
                 }
                 OpKind::Div(a, b) => {
                     let a_val = self.nodes[a].value.clone();
@@ -915,6 +956,49 @@ mod tests {
                 (numerical - logits_grad.data[i]).abs() < 1e-2,
                 "logits grad[{i}] mismatch: numerical {numerical} vs analytical {}",
                 logits_grad.data[i]
+            );
+        }
+    }
+
+    fn max_last_axis_loss(x_data: &[f32]) -> f32 {
+        let mut tape = Tape::new();
+        let x = tape.leaf(NdArray::new(x_data.to_vec(), vec![2, 3]));
+        let m = tape.max_last_axis(x);
+        let sq = tape.mul(m, m);
+        let loss = tape.sum(sq);
+        tape.value(loss).data[0]
+    }
+
+    /// Gold-standard check for the new differentiable MaxLastAxis - same
+    /// discipline as every other backward rule here, required before it
+    /// gets trusted in a real training loop (differentiable_backward_chaining.rs's
+    /// planned end-to-end fine-tuning phase). Row 0's max is at index 2
+    /// (1.2), row 1's max is at index 0 (2.0) - both non-edge positions,
+    /// so this also confirms non-argmax entries correctly get exactly zero
+    /// gradient, not just that the argmax entry gets a nonzero one.
+    #[test]
+    fn max_last_axis_backward_matches_finite_difference() {
+        let x0 = vec![0.5, -0.3, 1.2, 2.0, 0.1, -1.5];
+
+        let mut tape = Tape::new();
+        let x = tape.leaf(NdArray::new(x0.clone(), vec![2, 3]));
+        let m = tape.max_last_axis(x);
+        let sq = tape.mul(m, m);
+        let loss = tape.sum(sq);
+        tape.backward(loss);
+        let x_grad = tape.grad(x).unwrap().clone();
+
+        let eps = 1e-3;
+        for i in 0..x0.len() {
+            let mut xp = x0.clone();
+            xp[i] += eps;
+            let mut xm = x0.clone();
+            xm[i] -= eps;
+            let numerical = (max_last_axis_loss(&xp) - max_last_axis_loss(&xm)) / (2.0 * eps);
+            assert!(
+                (numerical - x_grad.data[i]).abs() < 1e-2,
+                "x grad[{i}] mismatch: numerical {numerical} vs analytical {}",
+                x_grad.data[i]
             );
         }
     }
