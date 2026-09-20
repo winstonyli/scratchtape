@@ -390,14 +390,21 @@ pub struct TransformerBlockOut {
     /// used by apply_grad (no separate parameters of its own), only by
     /// callers wanting to inspect what the block actually attended to.
     pub head_weights: Vec<Var>,
-    ln1_out: LayerNormOut,
-    q_outs: Vec<LinearOut>,
-    k_outs: Vec<LinearOut>,
-    v_outs: Vec<LinearOut>,
-    out_proj_out: LinearOut,
-    ln2_out: LayerNormOut,
-    ffn1_out: LinearOut,
-    ffn2_out: LinearOut,
+    /// Every sublayer's own *Out below is `pub` (not just `y`/`head_weights`
+    /// above) so a caller can read `tape.grad(...)` on any individual
+    /// sublayer's parameters directly - needed for per-sublayer diagnostics
+    /// like Fisher-information estimation (memory_tier_multigen_diverse_consolidate_fisher.rs),
+    /// which previously had to treat an entire block as one opaque unit
+    /// with no way to tell which of its 8 sublayers the loss actually
+    /// depended on.
+    pub ln1_out: LayerNormOut,
+    pub q_outs: Vec<LinearOut>,
+    pub k_outs: Vec<LinearOut>,
+    pub v_outs: Vec<LinearOut>,
+    pub out_proj_out: LinearOut,
+    pub ln2_out: LayerNormOut,
+    pub ffn1_out: LinearOut,
+    pub ffn2_out: LinearOut,
 }
 
 /// Pre-norm transformer block: x + Attn(LN(x)), then x + FFN(LN(x)).

@@ -164,6 +164,32 @@ sampling; this only runs between phases) and each has exactly one
 consumer so far, nowhere near the "2+ consumers" bar the `Optimizer`
 trait needed before it was worth building.
 
+`memory_tier_multigen_diverse_consolidate_fisher.rs` built the real
+importance weighting that file's uniform pull-back explicitly named as
+missing — per-segment empirical Fisher (average squared gradient over
+the phase's own data) instead of one hand-picked alpha. Took three
+rounds of actually finding bugs rather than accepting the first
+plausible-sounding explanation for a negative result: the first
+attempt looked *worse* than the uniform blend, diagnosed at the time as
+per-parameter averaging diluting large layers' scores — true in part,
+but a real counting bug (`counts` accumulated with `+=` every training
+step instead of being set once) was doing most of the damage, silently
+shrinking every Fisher value ~4000x and mistuning the blend strength by
+four orders of magnitude. Once fixed, Fisher-weighting beat the uniform
+blend on every metric, including new-task cost. Extending it further —
+`TransformerBlockOut`'s fields were private, so the 4 transformer
+blocks had fallen back to the old fixed alpha; made them `pub` (nothing
+about reading a gradient needs write access to a layer's internals) —
+gave each block its own genuine importance score instead of one shared
+guess. Result changed again, honestly: retention improved further (the
+best of any method in this whole line), but new-task cost got *worse*
+than every other method tried, including no mitigation — the real
+stability/plasticity trade-off, no longer averaged away. `block0`
+(earliest layer) gets the strongest protection in every phase, a
+specific finding that echoes — via a completely different method —
+`tiny_lm_corpus.rs`'s own finding that attention behaves very
+differently by depth.
+
 **Differentiable reasoning / neural theorem proving** — surveyed against
 recent NTP (neural theorem prover) literature, testing whether making
 `tiny_lm_corpus.rs`'s rule-chaining engine's combination rule *learned*

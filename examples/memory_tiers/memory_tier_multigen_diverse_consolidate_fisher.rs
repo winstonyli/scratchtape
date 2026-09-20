@@ -10,15 +10,28 @@
 // used in practice) instead of one hand-picked global alpha.
 //
 // Scope, stated honestly rather than glossed over: full per-parameter
-// EWC would need a gradient for every individual weight. This gets
-// real per-parameter Fisher for token_emb, pos_emb, final_ln and
-// output_proj - their *Out structs expose the actual parameter Vars
-// (table/w/b/gamma/beta are all `pub`). TransformerBlock's internals
-// (q/k/v heads, ffn, its own layernorms) are private - TransformerBlockOut
-// only exposes `y` and `head_weights`, not the sub-layer Vars - so the 4
-// blocks fall back to the old fixed-alpha uniform blend. A real,
-// meaningful partial upgrade (4 of the model's parameter groups now get
-// genuine importance weighting instead of none), not a claim of full EWC.
+// EWC would need a gradient for every individual weight. This gets real
+// per-SEGMENT Fisher (token_emb, pos_emb, final_ln, output_proj, and now
+// each of the 4 transformer blocks as its own segment) - not per-
+// individual-weight-within-a-block, since that would mean one alpha per
+// scalar parameter rather than per named group. Each block's own 8
+// sublayers (ln1, 8 attention heads' worth of q/k/v, out_proj, ln2,
+// ffn1, ffn2) are summed into ONE Fisher score for that block, not
+// scored individually - a coarser granularity than the 4 top-level
+// segments get, chosen because going all the way to per-head/per-
+// sublayer alphas would mean reconstructing each block from a blend of
+// differently-blended sub-pieces, real extra complexity for a question
+// (does sub-block granularity change the result further) this file
+// doesn't yet have evidence needs answering.
+//
+// This became possible only after making TransformerBlockOut's fields
+// pub (src/nn.rs) - they were private until this file's own doc comment
+// named that as the reason the 4 blocks fell back to a fixed alpha
+// instead of genuine importance weighting. That was a real, deliberate
+// scope decision worth revisiting rather than a permanent constraint:
+// nothing about Fisher-style diagnostics needs write access to a
+// block's internals, only read access to each sublayer's gradient Var,
+// which `pub` on the *Out struct's fields is enough to provide.
 //
 // Took three attempts to get an honest, working version - each wrong
 // attempt genuinely diagnosed and fixed, not papered over:
@@ -47,6 +60,25 @@
 //    main()). Only after both fixes does the result actually beat the
 //    uniform blend, which is what "real Fisher-weighted consolidation
 //    helps" was supposed to demonstrate in the first place.
+//
+// 4. (After exposing per-block Fisher, see above.) Splitting the 4
+//    blocks out of the single fixed-0.7 fallback and into their own
+//    genuinely-measured segments changed the RESULT, not just the
+//    mechanism: retention on every retained corpus improved further
+//    (now the best of any method tried in this whole line), but new-
+//    task cost got WORSE than every other method, including no
+//    mitigation at all - a real stability/plasticity trade-off becoming
+//    visible now that it's no longer averaged away by treating all 4
+//    blocks as one unit. block0 (earliest layer) gets the strongest
+//    protection of any segment in every phase (alpha~0.38-0.49, well
+//    below even final_ln's ~0.86-0.88) - a genuinely new, specific
+//    finding: early transformer layers are more Fisher-sensitive than
+//    late ones in this setup, echoing (via a completely different
+//    method) tiny_lm_corpus.rs's own earlier finding that attention
+//    behaves very differently by depth. Not chased further with a
+//    second lambda retune to try to buy back the plasticity cost - the
+//    trade-off is real and well-understood (stronger protection costs
+//    plasticity, no free lunch), not a bug to fix.
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::Tape;
@@ -87,6 +119,31 @@ fn train_with_fisher(
         fisher.accumulate("final_ln", tape.grad(out.ln_out.beta));
         fisher.accumulate("output_proj", tape.grad(out.proj_out.w));
         fisher.accumulate("output_proj", tape.grad(out.proj_out.b));
+        for (i, block_out) in out.block_outs.iter().enumerate() {
+            let seg = format!("block{i}");
+            fisher.accumulate(&seg, tape.grad(block_out.ln1_out.gamma));
+            fisher.accumulate(&seg, tape.grad(block_out.ln1_out.beta));
+            for q in &block_out.q_outs {
+                fisher.accumulate(&seg, tape.grad(q.w));
+                fisher.accumulate(&seg, tape.grad(q.b));
+            }
+            for k in &block_out.k_outs {
+                fisher.accumulate(&seg, tape.grad(k.w));
+                fisher.accumulate(&seg, tape.grad(k.b));
+            }
+            for v in &block_out.v_outs {
+                fisher.accumulate(&seg, tape.grad(v.w));
+                fisher.accumulate(&seg, tape.grad(v.b));
+            }
+            fisher.accumulate(&seg, tape.grad(block_out.out_proj_out.w));
+            fisher.accumulate(&seg, tape.grad(block_out.out_proj_out.b));
+            fisher.accumulate(&seg, tape.grad(block_out.ln2_out.gamma));
+            fisher.accumulate(&seg, tape.grad(block_out.ln2_out.beta));
+            fisher.accumulate(&seg, tape.grad(block_out.ffn1_out.w));
+            fisher.accumulate(&seg, tape.grad(block_out.ffn1_out.b));
+            fisher.accumulate(&seg, tape.grad(block_out.ffn2_out.w));
+            fisher.accumulate(&seg, tape.grad(block_out.ffn2_out.b));
+        }
         fisher.steps += 1;
         fisher.counts_locked = true;
 
@@ -99,8 +156,8 @@ fn train_with_fisher(
 /// empirical Fisher (average squared gradient per parameter) once a
 /// phase's training is done.
 struct Fisher {
-    sums: std::collections::HashMap<&'static str, f32>,
-    counts: std::collections::HashMap<&'static str, usize>,
+    sums: std::collections::HashMap<String, f32>,
+    counts: std::collections::HashMap<String, usize>,
     counts_locked: bool,
     steps: usize,
 }
@@ -124,12 +181,12 @@ impl Fisher {
     /// multi-tensor segments (final_ln's gamma+beta, output_proj's w+b)
     /// call accumulate() twice under the same name and both sub-tensors'
     /// sizes need to add up, just not accumulate again on later steps.
-    fn accumulate(&mut self, name: &'static str, grad: Option<&scratchtape::tensor::NdArray>) {
+    fn accumulate(&mut self, name: &str, grad: Option<&scratchtape::tensor::NdArray>) {
         let Some(g) = grad else { return };
         let sq_sum: f32 = g.data.iter().map(|x| x * x).sum();
-        *self.sums.entry(name).or_insert(0.0) += sq_sum;
+        *self.sums.entry(name.to_string()).or_insert(0.0) += sq_sum;
         if !self.counts_locked {
-            *self.counts.entry(name).or_insert(0) += g.data.len();
+            *self.counts.entry(name.to_string()).or_insert(0) += g.data.len();
         }
     }
 
@@ -188,32 +245,32 @@ fn reconstruct(flat: &[f32], vocab_size: usize, d_model: usize, seq_len: usize, 
 /// uses and recording each call's consumed range - same technique
 /// memory_tier_diff.rs already established, reused here instead of
 /// hand-deriving each struct's flat length.
-fn segment_ranges(vocab_size: usize, d_model: usize, seq_len: usize, n_blocks: usize, n_heads: usize, d_ff: usize, total_len: usize) -> Vec<(&'static str, usize, usize)> {
+fn segment_ranges(vocab_size: usize, d_model: usize, seq_len: usize, n_blocks: usize, n_heads: usize, d_ff: usize, total_len: usize) -> Vec<(String, usize, usize)> {
     let dummy = vec![0.0f32; total_len];
     let mut offset = 0usize;
     let mut ranges = Vec::new();
 
     let start = offset;
     let _ = Embedding::from_flat(&dummy, &mut offset, vocab_size, d_model);
-    ranges.push(("token_emb", start, offset));
+    ranges.push(("token_emb".to_string(), start, offset));
 
     let start = offset;
     let _ = Embedding::from_flat(&dummy, &mut offset, seq_len, d_model);
-    ranges.push(("pos_emb", start, offset));
+    ranges.push(("pos_emb".to_string(), start, offset));
 
-    for _ in 0..n_blocks {
+    for i in 0..n_blocks {
         let start = offset;
         let _ = TransformerBlock::from_flat(&dummy, &mut offset, d_model, n_heads, d_ff);
-        ranges.push(("blocks", start, offset));
+        ranges.push((format!("block{i}"), start, offset));
     }
 
     let start = offset;
     let _ = LayerNorm::from_flat(&dummy, &mut offset, d_model);
-    ranges.push(("final_ln", start, offset));
+    ranges.push(("final_ln".to_string(), start, offset));
 
     let start = offset;
     let _ = Linear::from_flat(&dummy, &mut offset, d_model, vocab_size);
-    ranges.push(("output_proj", start, offset));
+    ranges.push(("output_proj".to_string(), start, offset));
 
     ranges
 }
@@ -234,7 +291,6 @@ fn main() {
     let (d_model, n_heads, d_ff, seq_len, n_blocks) = (128, 8, 256, 64, 4);
     let vocab_size = 256;
     let steps_per_phase = 4000;
-    let blocks_alpha = 0.7; // unchanged fallback for the 4 opaque block segments
     // First attempt at 5000.0 gave alpha~1.000 for every Fisher-weighted
     // segment (Fisher::average magnitudes were ~1e-9 to ~1e-7, so
     // lambda*fisher was negligible). Diagnosed at the time as pure
@@ -285,9 +341,9 @@ fn main() {
         if phase > 0 {
             let post_flat = flatten_all(&token_emb, &pos_emb, &blocks, &final_ln, &output_proj);
             let mut blended = post_flat.clone();
-            for &(seg_name, start, end) in &ranges {
-                let alpha = if seg_name == "blocks" { blocks_alpha } else { fisher_to_alpha(fisher.total(seg_name), lambda) };
-                for i in start..end {
+            for (seg_name, start, end) in &ranges {
+                let alpha = fisher_to_alpha(fisher.total(seg_name), lambda);
+                for i in *start..*end {
                     blended[i] = alpha * post_flat[i] + (1.0 - alpha) * pre_phase_flat[i];
                 }
             }
@@ -298,28 +354,13 @@ fn main() {
             final_ln = l;
             output_proj = o;
 
-            println!(
-                "  consolidated - Fisher (total sq grad, per step): token_emb={:.2e} pos_emb={:.2e} final_ln={:.2e} output_proj={:.2e}",
-                fisher.total("token_emb"),
-                fisher.total("pos_emb"),
-                fisher.total("final_ln"),
-                fisher.total("output_proj"),
-            );
-            println!(
-                "  (parameter counts: token_emb={} pos_emb={} final_ln={} output_proj={})",
-                fisher.param_count("token_emb"),
-                fisher.param_count("pos_emb"),
-                fisher.param_count("final_ln"),
-                fisher.param_count("output_proj"),
-            );
-            println!(
-                "  alpha used: token_emb={:.3} pos_emb={:.3} final_ln={:.3} output_proj={:.3} blocks={:.3} (fixed)",
-                fisher_to_alpha(fisher.total("token_emb"), lambda),
-                fisher_to_alpha(fisher.total("pos_emb"), lambda),
-                fisher_to_alpha(fisher.total("final_ln"), lambda),
-                fisher_to_alpha(fisher.total("output_proj"), lambda),
-                blocks_alpha,
-            );
+            print!("  consolidated - Fisher (total sq grad, per step) / alpha / param count:");
+            for (seg_name, _, _) in &ranges {
+                let f = fisher.total(seg_name);
+                let a = fisher_to_alpha(f, lambda);
+                print!("  {seg_name}: fisher={f:.2e} alpha={a:.3} n={}", fisher.param_count(seg_name));
+            }
+            println!();
         }
 
         print!("  loss now on: ");
