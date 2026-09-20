@@ -74,9 +74,13 @@ limit (only 34 labeled nodes); rerun and resolved at scale inside
 `tiny_lm_corpus.rs` below.
 
 **Predictive coding** — `predictive_coding.rs`: Whittington & Bogacz PC
-as a biologically-motivated alternative to backprop, including a later
-attempt at genuinely learned per-layer precision weighting that produced
-three distinct instabilities and was honestly parked, not forced.
+as a biologically-motivated alternative to backprop, including genuinely
+learned per-layer precision weighting. Took three attempts to stabilize
+(raw MLE precision collapses toward zero on large early error, or
+explodes toward infinity once error gets small, or NaNs on the
+discontinuous jump between them) - fixed with a MAP estimate under a
+Gamma prior (self-bounding, no clamp wall to hit) plus a smooth linear
+ramp across the warm-up boundary (removes the jump itself).
 
 **Continual learning / memory tiers** — `catastrophic_forgetting.rs`
 demonstrates the problem and a bounded-replay-buffer mitigation in one
@@ -116,19 +120,31 @@ narrative; a few of the sharper findings:
   but precision/recall reveals several of those "wins" were hollow
   (zero recall, i.e. the rule never once caught a true positive).
 
+Two more findings worth surfacing: a 2x model-size scale-up at a fixed
+step count measured *worse* on both held-out loss and structural
+fragmentation than the smaller model - a compute-optimal-scaling
+confound, confirmed by rerunning it with proportionally more steps too,
+which closed almost the entire gap (and revealed capacity doesn't
+clearly help either, once fairly trained - it just catches up to
+parity, at ~20x the wall-clock cost). And a real design gap found by
+checking which architecture parts are genuinely swappable: every
+layer's `apply_grad` was hardcoded to `Sgd` even though Adam had grown
+5 real consumers, past this project's own stated bar for promoting an
+abstraction - fixed with an `Optimizer` trait unifying both behind
+`Linear::apply_grad_with`.
+
 ## Open threads
 
-- **Compute-matched model-scale rerun** — a 2x model-size scale-up at a
-  fixed step count measured *worse*, a known compute-optimal-scaling
-  confound (see the commit reverting it); a fair comparison needs
-  proportionally more steps, not just more parameters.
-- **Predictive-coding precision instabilities** — parked as a complete,
-  honest negative result; a real fix likely needs a MAP estimate with a
-  prior, or a smooth ramp-in, not raw MLE.
 - **A persistent, on-device GPU training backend** — the current GPU
   kernel is correct but pays a full host round-trip per call, which is
   why it doesn't win at this model's scale. Scoped as its own
   multi-day project, not a small addition.
+- **Weight-tied layer reuse within one tape** — `Linear`/`Embedding`/
+  `LayerNorm::forward()` leaf a fresh copy per call, so reusing one
+  layer across multiple `forward()` calls in a single tape (RNN/SSM-
+  style weight tying) silently drops gradient contributions unless
+  worked around manually (`ssm_recall.rs` already does). Documented as
+  a footgun at the source; not fixed there yet.
 
 ## A note on the name
 
