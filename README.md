@@ -17,7 +17,7 @@ notebook; this README is the map, not a replacement for it.
 ## Quick start
 
 ```bash
-cargo test --release              # 18 gradient-check / correctness tests
+cargo test --release              # 19 gradient-check / correctness tests
 cargo build --release --examples  # build everything under examples/
 cargo run --release --example tiny_lm
 ```
