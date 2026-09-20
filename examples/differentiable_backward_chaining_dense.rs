@@ -1,0 +1,262 @@
+// Direct follow-up to differentiable_backward_chaining.rs's phases 3-4:
+// both found that a model trained on ONLY grandparent(x,z) existence
+// labels (never shown a `parent` fact directly) fails to recover the
+// true `parent` relation - it finds a different, non-veridical bridge
+// structure that still satisfies almost every existence constraint.
+// Neither hard max_or nor softmax-weighted beam_or fixed it, pointing at
+// an information-theoretic cause (existence-only supervision
+// underdetermines WHICH y works, not just an optimization pathology).
+//
+// This tests that diagnosis directly: does the SAME failure persist on
+// a KB with much denser, more asymmetric constraints, or was the
+// original 12-entity family tree's clean 2-branch symmetry (every
+// branch the same shape) specifically what made a wrong bridge
+// structure so easy to substitute? If identifiability improves with
+// more overlapping constraints per free parameter, that confirms this
+// really is a data-density question, not a fixed property of
+// differentiable backward chaining in general.
+//
+// New KB: 26 entities across 3 generations, deliberately irregular
+// branching (fan-out 1-3 at every level, no two branches the same
+// shape) so there's no clean structural symmetry to hide behind. 22
+// parent edges, 13 true grandparent pairs out of 650 ordered pairs
+// (~2.0% positive, sparser than the original KB's ~4.5%).
+use scratchtape::nn::{Embedding, Rng};
+use scratchtape::optim::{Adam, AdamState};
+use scratchtape::tape::{Tape, Var};
+use scratchtape::tensor::NdArray;
+
+fn precision_recall_f1(labels: &[usize], predictions: &[usize]) -> (f32, f32, f32) {
+    let mut tp = 0;
+    let mut fp = 0;
+    let mut fn_ = 0;
+    for i in 0..labels.len() {
+        match (predictions[i], labels[i]) {
+            (1, 1) => tp += 1,
+            (1, 0) => fp += 1,
+            (0, 1) => fn_ += 1,
+            _ => {}
+        }
+    }
+    let precision = if tp + fp == 0 { 0.0 } else { tp as f32 / (tp + fp) as f32 };
+    let recall = if tp + fn_ == 0 { 0.0 } else { tp as f32 / (tp + fn_) as f32 };
+    let f1 = if precision + recall == 0.0 { 0.0 } else { 2.0 * precision * recall / (precision + recall) };
+    (precision, recall, f1)
+}
+
+fn sigmoid_scalar(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+fn parent_score(subj_table: &NdArray, obj_table: &NdArray, bias: f32, a: usize, b: usize, d: usize) -> f32 {
+    let dot: f32 = (0..d).map(|k| subj_table.data[a * d + k] * obj_table.data[b * d + k]).sum();
+    sigmoid_scalar(dot + bias)
+}
+
+fn sigmoid(tape: &mut Tape, x: Var) -> Var {
+    let neg_x = tape.scale(x, -1.0);
+    let exp_neg_x = tape.exp(neg_x);
+    let one = tape.leaf(NdArray::new(vec![1.0; tape.value(exp_neg_x).data.len()], tape.value(exp_neg_x).shape.clone()));
+    let denom = tape.add(one, exp_neg_x);
+    tape.div(one, denom)
+}
+
+fn pair_score(tape: &mut Tape, subj_emb: &Embedding, subj_table: Var, obj_emb: &Embedding, obj_table: Var, bias_var: Var, a_ids: &[usize], b_ids: &[usize]) -> Var {
+    let a_out = subj_emb.forward_shared(tape, a_ids, subj_table);
+    let b_out = obj_emb.forward_shared(tape, b_ids, obj_table);
+    let prod = tape.mul(a_out.y, b_out.y);
+    let dot = tape.sum_last_axis(prod);
+    let logit = tape.add(dot, bias_var);
+    sigmoid(tape, logit)
+}
+
+fn candidate_scores(tape: &mut Tape, subj_emb: &Embedding, subj_table: Var, obj_emb: &Embedding, obj_table: Var, bias_var: Var, xs: &[usize], zs: &[usize], n: usize) -> Var {
+    let q = xs.len();
+    let mut columns = Vec::with_capacity(n);
+    for y in 0..n {
+        let y_ids = vec![y; q];
+        let s1 = pair_score(tape, subj_emb, subj_table, obj_emb, obj_table, bias_var, xs, &y_ids);
+        let s2 = pair_score(tape, subj_emb, subj_table, obj_emb, obj_table, bias_var, &y_ids, zs);
+        columns.push(tape.mul(s1, s2));
+    }
+    tape.concat(&columns)
+}
+
+fn max_or(tape: &mut Tape, scores: Var) -> Var {
+    tape.max_last_axis(scores)
+}
+
+fn beam_or(tape: &mut Tape, scores: Var, temperature: f32) -> Var {
+    let scaled = tape.scale(scores, 1.0 / temperature);
+    let weights = tape.softmax(scaled);
+    let weighted = tape.mul(scores, weights);
+    tape.sum_last_axis(weighted)
+}
+
+/// Trains fresh embeddings on ONLY grandparent existence labels (`or_fn`
+/// picks max_or or beam_or), then reports both the trained objective's
+/// own accuracy and whether the RECOVERED parent_score matches the true
+/// edges it never saw directly - same two-check structure as
+/// differentiable_backward_chaining.rs's phases 3/4.
+fn train_from_indirect_supervision(
+    label: &str,
+    n: usize,
+    d: usize,
+    is_parent_fact: &dyn Fn(usize, usize) -> bool,
+    is_true_grandparent: &dyn Fn(usize, usize) -> bool,
+    or_fn: impl Fn(&mut Tape, Var) -> Var,
+    names: &[&str],
+) {
+    let mut gp_xs = Vec::new();
+    let mut gp_zs = Vec::new();
+    let mut gp_labels = Vec::new();
+    for x in 0..n {
+        for z in 0..n {
+            if x == z {
+                continue;
+            }
+            gp_xs.push(x);
+            gp_zs.push(z);
+            gp_labels.push(if is_true_grandparent(x, z) { 1.0 } else { 0.0 });
+        }
+    }
+    let q = gp_xs.len();
+
+    let mut rng = Rng::new(1);
+    let mut subj_emb = Embedding::new(&mut rng, n, d);
+    let mut obj_emb = Embedding::new(&mut rng, n, d);
+    let mut bias = NdArray::new(vec![0.0], vec![1, 1]);
+    let adam = Adam { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 };
+    let mut subj_state = AdamState::zeros_like(&subj_emb.table);
+    let mut obj_state = AdamState::zeros_like(&obj_emb.table);
+    let mut bias_state = AdamState::zeros_like(&bias);
+
+    let steps = 3000;
+    let mut last_loss = 0.0f32;
+    for step in 0..steps {
+        let mut tape = Tape::new();
+        let subj_table_var = tape.leaf(subj_emb.table.clone());
+        let obj_table_var = tape.leaf(obj_emb.table.clone());
+        let bias_var = tape.leaf(bias.clone());
+
+        let scores = candidate_scores(&mut tape, &subj_emb, subj_table_var, &obj_emb, obj_table_var, bias_var, &gp_xs, &gp_zs, n);
+        let proof = or_fn(&mut tape, scores);
+
+        let one = tape.leaf(NdArray::new(vec![1.0; q], vec![q, 1]));
+        let y = tape.leaf(NdArray::new(gp_labels.clone(), vec![q, 1]));
+        let eps = tape.leaf(NdArray::new(vec![1e-6; q], vec![q, 1]));
+        let proof_eps = tape.add(proof, eps);
+        let one_minus_proof = tape.sub(one, proof);
+        let one_minus_proof_eps = tape.add(one_minus_proof, eps);
+        let one_minus_y = tape.sub(one, y);
+        let log_p = tape.log(proof_eps);
+        let log_one_minus_p = tape.log(one_minus_proof_eps);
+        let term1 = tape.mul(y, log_p);
+        let term2 = tape.mul(one_minus_y, log_one_minus_p);
+        let sum_terms = tape.add(term1, term2);
+        let neg_mean = tape.scale(sum_terms, -1.0 / q as f32);
+        let loss = tape.sum(neg_mean);
+
+        tape.backward(loss);
+        adam.step(&mut subj_emb.table, tape.grad(subj_table_var).unwrap(), &mut subj_state);
+        adam.step(&mut obj_emb.table, tape.grad(obj_table_var).unwrap(), &mut obj_state);
+        adam.step(&mut bias, tape.grad(bias_var).unwrap(), &mut bias_state);
+        last_loss = tape.value(loss).data[0];
+
+        if step % 500 == 0 {
+            println!("  [{label}] step {step:>4}: loss = {last_loss:.4}");
+        }
+    }
+    println!("  [{label}] final loss = {last_loss:.4}");
+
+    let mut gp_predictions = vec![0usize; q];
+    for i in 0..q {
+        let mut best = 0.0f32;
+        for y in 0..n {
+            if y == gp_xs[i] || y == gp_zs[i] {
+                continue;
+            }
+            let s = parent_score(&subj_emb.table, &obj_emb.table, bias.data[0], gp_xs[i], y, d) * parent_score(&subj_emb.table, &obj_emb.table, bias.data[0], y, gp_zs[i], d);
+            if s > best {
+                best = s;
+            }
+        }
+        gp_predictions[i] = if best > 0.5 { 1 } else { 0 };
+    }
+    let gp_labels_usize: Vec<usize> = gp_labels.iter().map(|&l| l as usize).collect();
+    let (gp_p, gp_r, gp_f1) = precision_recall_f1(&gp_labels_usize, &gp_predictions);
+    println!("  [{label}] check 1 - trained objective (grandparent prediction): precision={gp_p:.3} recall={gp_r:.3} f1={gp_f1:.3}");
+
+    let mut fact_labels = Vec::new();
+    let mut recovered_predictions = Vec::new();
+    let mut wrong_facts = Vec::new();
+    for a in 0..n {
+        for b in 0..n {
+            if a == b {
+                continue;
+            }
+            let truth = is_parent_fact(a, b);
+            fact_labels.push(if truth { 1 } else { 0 });
+            let s = parent_score(&subj_emb.table, &obj_emb.table, bias.data[0], a, b, d);
+            let pred = if s > 0.5 { 1 } else { 0 };
+            recovered_predictions.push(pred);
+            if pred == 1 && !truth {
+                wrong_facts.push((a, b));
+            }
+        }
+    }
+    let (rp, rr, rf1) = precision_recall_f1(&fact_labels, &recovered_predictions);
+    println!("  [{label}] check 2 - recovered TRUE `parent` facts as a byproduct: precision={rp:.3} recall={rr:.3} f1={rf1:.3}");
+    if !wrong_facts.is_empty() {
+        print!("  [{label}] hallucinated (not real parent edges): ");
+        for &(a, b) in wrong_facts.iter().take(8) {
+            print!("{}->{} ", names[a], names[b]);
+        }
+        if wrong_facts.len() > 8 {
+            print!("... ({} more)", wrong_facts.len() - 8);
+        }
+        println!();
+    }
+}
+
+fn main() {
+    let names = [
+        "alice", "bob", "carol", "dave", //
+        "eve", "frank", "grace", "heidi", "ivan", "judy", "karl", "liam", "mia", //
+        "nina", "oscar", "paul", "quinn", "rose", "sam", "tara", "uma", "vince", "wendy", "xander", "yara", "zack",
+    ];
+    let n = names.len();
+    let idx = |name: &str| names.iter().position(|&x| x == name).unwrap();
+
+    // 3 generations, deliberately irregular fan-out (1-3 children,
+    // varying at every branch) so there's no clean structural symmetry
+    // for a wrong bridge hypothesis to hide behind.
+    let parent_edges: Vec<(usize, usize)> = [
+        ("alice", "eve"), ("alice", "frank"), ("alice", "grace"),
+        ("bob", "heidi"), ("bob", "ivan"),
+        ("carol", "judy"),
+        ("dave", "karl"), ("dave", "liam"), ("dave", "mia"),
+        ("eve", "nina"), ("eve", "oscar"),
+        ("frank", "paul"),
+        ("grace", "quinn"),
+        ("heidi", "rose"), ("heidi", "sam"),
+        ("ivan", "tara"),
+        ("judy", "uma"), ("judy", "vince"),
+        ("karl", "wendy"),
+        ("liam", "xander"),
+        ("mia", "yara"), ("mia", "zack"),
+    ]
+    .iter()
+    .map(|&(p, c)| (idx(p), idx(c)))
+    .collect();
+    let is_parent_fact = |a: usize, b: usize| parent_edges.contains(&(a, b));
+    let is_true_grandparent = |x: usize, z: usize| (0..n).any(|y| is_parent_fact(x, y) && is_parent_fact(y, z));
+
+    let true_gp_count = (0..n).flat_map(|x| (0..n).map(move |z| (x, z))).filter(|&(x, z)| x != z && is_true_grandparent(x, z)).count();
+    println!("kinship KB: {n} entities, {} parent facts, {true_gp_count} true grandparent pairs out of {}", parent_edges.len(), n * (n - 1));
+
+    let d = 6;
+    println!("\ntraining from ONLY grandparent existence labels, never shown a `parent` fact directly (d={d}):");
+    train_from_indirect_supervision("max_or", n, d, &is_parent_fact, &is_true_grandparent, max_or, &names);
+    train_from_indirect_supervision("beam_or T=0.5", n, d, &is_parent_fact, &is_true_grandparent, |t, s| beam_or(t, s, 0.5), &names);
+}
