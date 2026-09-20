@@ -17,7 +17,7 @@ notebook; this README is the map, not a replacement for it.
 ## Quick start
 
 ```bash
-cargo test --release              # 19 gradient-check / correctness tests
+cargo test --release              # 20 gradient-check / correctness tests
 cargo build --release --examples  # build everything under examples/
 cargo run --release --example tiny_lm
 ```
@@ -32,7 +32,7 @@ file and read it back in a genuinely separate process.
 | module | what it is |
 |---|---|
 | `tensor.rs` | `NdArray` — a minimal n-dimensional array (data + shape), the value type everything else operates on. |
-| `tape.rs` | `Tape` — reverse-mode autodiff. Every op (`add`, `matmul`, `gather`, `softmax`, `softmax1`, `cross_entropy`, `batched_matmul`, ...) is a node with a forward and backward rule, gradient-checked against finite differences. |
+| `tape.rs` | `Tape` — reverse-mode autodiff. Every op (`add`, `matmul`, `gather`, `softmax`, `softmax1`, `cross_entropy`, `batched_matmul`, `max_last_axis`, ...) is a node with a forward and backward rule, gradient-checked against finite differences. `max_last_axis` is differentiable on purpose, unlike `NdArray::max_last_axis` (kept non-differentiable, used only for softmax's shift-invariant stability trick) — added for a real OR-module in the differentiable-reasoning line below, where gradient through *which candidate wins* is the whole point. |
 | `nn.rs` | Layers built from tape ops: `Linear`, `LayerNorm`, `Embedding`, `TransformerBlock` (multi-head causal self-attention + FFN), plus `Rng` (hand-rolled xorshift, no external RNG crate). |
 | `optim.rs` | `Sgd` and `Adam`. |
 | `gpu.rs` / `matmul.wgsl` | A wgpu compute-shader matmul kernel — verified correct, but not wired into the autodiff path; see the persistent-GPU-backend note below. |
@@ -148,6 +148,61 @@ the two don't share a call shape (replay hooks into training's
 sampling; this only runs between phases) and each has exactly one
 consumer so far, nowhere near the "2+ consumers" bar the `Optimizer`
 trait needed before it was worth building.
+
+**Differentiable reasoning / neural theorem proving** — surveyed against
+recent NTP (neural theorem prover) literature, testing whether making
+`tiny_lm_corpus.rs`'s rule-chaining engine's combination rule *learned*
+instead of hand-written fixes its "hollow recall" finding below (a
+majority-vote rule that beat a decision tree on accuracy but never once
+caught a true positive on several categories).
+
+`differentiable_forward_chaining.rs` rebuilds that rule on a self-
+contained relation graph (raw byte co-occurrence, not attention/
+embeddings/clustering) and learns the combination weights instead of an
+untrained OR. Fixes real recall on `is-uppercase` and weakly on
+`is-digit`, but stays at exactly zero on every vowel category — not
+noise: English alternates consonants and vowels, so a vowel's textual
+neighbors are mostly consonants, and no weighting scheme can learn
+signal that isn't there. Separates two causes of hollow recall that
+looked identical under the hard rule: an untrained combination
+(fixable by learning) vs. evidence with no real predictive signal for
+the target (not fixable by any weighting — garbage in, garbage out).
+
+`differentiable_backward_chaining.rs` goes further — a real NTP-style
+prover (OR-module = existential search over a candidate entity,
+AND-module = product of two atoms' scores) on a toy 12-entity kinship
+KB: one relation (`parent`), one rule
+(`grandparent(X,Z) :- parent(X,Y), parent(Y,Z)`). Phases 1-2: embeddings
+trained on `parent` facts alone achieve perfect, stable-across-4-seeds
+zero-shot compositional generalization to `grandparent` — genuine 2-hop
+reasoning from 1-hop training, with the correct bridge entity printed
+for every true pair. Phase 3 asks the harder question: can `parent` be
+learned from *only* 2-hop supervision, never shown directly? That
+needed a real differentiable OR-module, so `Tape::max_last_axis` was
+added (gradient-checked like every other op here). Result: the trained
+objective converges fine, but the recovered `parent` relation is a
+complete miss (0% precision/recall on every inferred fact) — the model
+finds a different, self-consistent-but-wrong bridge structure, matching
+the literature's own documented local-minima failure mode for greedy
+max-pooling. Phase 4 tried the literature's own named fix (a
+softmax-weighted "beam" over candidates instead of hard max) — it
+didn't fix it, and hallucinated *more* spurious relations, not fewer,
+distinguishing an optimization pathology (what beam supervision
+actually fixes) from an information-theoretic one (what this task
+actually has — existence-only labels never specify *which* y works).
+
+`differentiable_backward_chaining_dense.rs` tested whether that
+identifiability gap was specific to the toy KB's clean symmetry (26
+entities, deliberately irregular branching, no two branches shaped the
+same) — it wasn't: still 0% recovery, and greedy max-pooling now failed
+to even solve the trained objective at the larger scale, an
+optimization artifact isolated by retuning the learning rate (which
+fixed the trained objective cleanly while recovery stayed at exactly
+0%). A temperature sweep on the softmax-weighted variant found one real
+but noisy exception — a small nonzero recovery signal at specific
+temperatures (best f1=0.137), not a smooth function of temperature —
+consistent with genuinely limited recoverable information rather than
+a tunable knob.
 
 **`tiny_lm_corpus.rs`** is the project's largest and most-iterated file
 by far — a byte-level LM plus an extended symbolic/KR&R (knowledge
