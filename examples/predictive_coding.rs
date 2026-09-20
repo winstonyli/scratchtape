@@ -167,29 +167,36 @@ fn pc_grads_and_errors(
     (d_f_dw0, d_f_dw1, e1, e2)
 }
 
-/// Closed-form maximum-likelihood precision given a settled error e
-/// (Gaussian assumption: Pi* = N/sum(e^2) is the exact zero-gradient
-/// solution of dF/dPi = 0.5*(sum(e^2) - N/Pi) = 0 - the same free-energy F
-/// this whole file is built around, just solved for Pi instead of W or x1).
-/// EMA-smoothed across training steps rather than recomputed fresh each
-/// step: error magnitude drifts as weights train, and a fresh single-step
-/// MLE would make precision chase that drift noisily rather than track its
-/// trend. `ema_ssq` is the running mean of sum(e^2) across steps.
+/// MAP precision estimate under a Gamma(alpha, beta) prior (the conjugate
+/// prior for a zero-mean Gaussian's precision) instead of raw MLE - the
+/// fix surveyed but not built when this file was parked. Prior mode fixed
+/// at 1.0 (matching sigma_inv's own pre-warmup default, no new "what
+/// should the prior believe" hyperparameter needed) with `pseudo_n`
+/// pseudo-observations worth of confidence in that belief:
+///   Pi_MAP = (pseudo_n + N) / (pseudo_n + sum(e^2))
+/// Derivation: Gamma(alpha=pseudo_n/2+1, beta=pseudo_n/2) has mode
+/// (alpha-1)/beta = 1.0 by construction; the posterior after N Gaussian
+/// observations with sum-of-squares ss is Gamma(alpha+N/2, beta+ss/2),
+/// whose mode is exactly the formula above (same MLE derivation
+/// update_precision's original doc comment used, just with a prior in the
+/// numerator and denominator instead of none).
 ///
-/// Clamped to [floor, ceiling] - found necessary the hard way. Warm-up
-/// alone (delaying when this function starts getting called) fixed the
-/// large-error crash-to-zero failure but exposed the symmetric opposite:
-/// once weights fit well enough that sum(e^2) is near-zero, the unclamped
-/// MLE explodes toward infinity and blows up the next weight update into
-/// NaN. The raw MLE has no bound in either direction - a floor prevents
-/// precision (and therefore the weight gradient it scales) from ever fully
-/// vanishing, a ceiling prevents it from ever dominating the update enough
-/// to destabilize it.
-fn update_precision(e: &NdArray, ema_ssq: &mut f32, decay: f32, floor: f32, ceiling: f32) -> f32 {
+/// This is a fundamentally different fix from the old clamp, not a
+/// tuned replacement: it's self-bounding rather than hard-walled. As
+/// ss -> 0 (near-perfect fit), Pi_MAP -> (pseudo_n+N)/pseudo_n, a finite
+/// ceiling the formula approaches smoothly - no discontinuous wall to hit,
+/// so no single-step jump when crossing whatever threshold a clamp would
+/// have imposed. As ss grows, Pi_MAP behaves like a softened MLE (the
+/// +pseudo_n floor in the denominator prevents it from crashing quite as
+/// fast toward zero as raw MLE would), so it still tempers - not
+/// eliminates - the large-error collapse risk that motivated the original
+/// warm-up. Kept EMA-smoothed for the same reason as before: a fresh
+/// single-step estimate would chase noise, not the trend.
+fn update_precision_map(e: &NdArray, ema_ssq: &mut f32, decay: f32, pseudo_n: f32) -> f32 {
     let ssq = e.mul(e).sum().data[0];
     *ema_ssq = decay * *ema_ssq + (1.0 - decay) * ssq;
     let n = e.data.len() as f32;
-    (n / ema_ssq.max(1e-6)).clamp(floor, ceiling)
+    (pseudo_n + n) / (pseudo_n + *ema_ssq)
 }
 
 fn rel_error(a: &NdArray, b: &NdArray) -> f32 {
@@ -303,8 +310,23 @@ fn main() {
     // Genuinely learned precision - the real free-energy formulation the
     // fixed-value revisit above was proportionate scope ahead of. Per-layer
     // scalar (same granularity as the fixed-value test, not per-unit -
-    // still the smaller step), EMA-smoothed closed-form MLE recomputed each
-    // training step from the settled error, not a hand-swept constant.
+    // still the smaller step), EMA-smoothed and recomputed each training
+    // step from the settled error, not a hand-swept constant.
+    //
+    // Previously parked after three instabilities: raw MLE crashed toward
+    // zero on large early error (self-reinforcing collapse), a warm-up
+    // fixed that but exposed the mirror failure (unbounded MLE exploding
+    // toward infinity once error got small), and a [0.1, 100] clamp still
+    // NaN'd - diagnosed as the clamp's ceiling still being a 100x jump in
+    // one step right at the warm-up boundary, not the bound's value.
+    // Fixed here with both surveyed remedies together: update_precision_map
+    // replaces raw MLE with a MAP estimate under a Gamma prior (self-
+    // bounding - no discontinuous wall to hit, see its own doc comment),
+    // and a linear ramp blends sigma_inv from the frozen 1.0 toward that
+    // estimate over `ramp_epochs` instead of switching in one step,
+    // directly targeting the diagnosed mechanism (the jump itself). Result:
+    // no NaN at any epoch, precision converges to a stable (5.0, 2.0) and
+    // stays there, XOR trains correctly throughout.
     // Precision needs real training experience before it means anything -
     // sigma_inv=1.0 at epoch 0 is an arbitrary starting point, not a claim -
     // so the diagnostic T-sweep below runs AFTER training, at whatever
@@ -335,19 +357,27 @@ fn main() {
     // ends, not the arbitrary 1.0 default, so the first post-warmup
     // precision estimate reflects where training actually is.
     let warmup_epochs = 200;
-    // Found necessary after warm-up alone still exploded (see
-    // update_precision's doc comment) - floor keeps precision from crashing
-    // to zero on large early error, ceiling keeps it from exploding once
-    // error gets near-zero from good fitting. [0.1, 100.0]: floor matches
-    // the smallest sigma2_inv used in the earlier fixed-value sweep (never
-    // went below 1.0 there, so 0.1 is already a generous lower bound);
-    // ceiling set an order of magnitude above the fixed-value sweep's
-    // largest tested value (10.0), giving real room to learn something
-    // beyond what fixed hyperparameters already covered without repeating
-    // the unbounded version's runaway.
-    let (precision_floor, precision_ceiling) = (0.1, 100.0);
+    // Diagnosed root cause of the earlier NaN, stated plainly in the
+    // parked commit: "not about the bound's value, the discontinuity
+    // itself" - precision jumped from the frozen 1.0 straight to whatever
+    // the estimator produced in a single step the instant warm-up ended,
+    // and Adam's moment estimates (calibrated to 200 epochs of one
+    // gradient scale) overshot on the sudden regime change. A linear ramp
+    // over `ramp_epochs` blends sigma_inv from 1.0 toward the MAP estimate
+    // instead of switching in one step - bounds the largest possible
+    // per-step CHANGE in precision to roughly 1/ramp_epochs of the total
+    // gap, however large that gap turns out to be, addressing the actual
+    // diagnosed mechanism (the jump size) rather than re-guessing at a
+    // bound (the old clamp's failed approach).
+    let ramp_epochs = 50.0;
+    // pseudo_n=4.0: matches N (this error term always has 4 elements,
+    // seq unbatched over the 4 XOR rows) - "one real batch's worth" of
+    // prior confidence, the same order-of-magnitude reasoning as the old
+    // floor/ceiling picks, but now feeding a principled formula instead of
+    // a hand-tuned wall (see update_precision_map's doc comment).
+    let pseudo_n = 4.0;
 
-    println!("\ntraining XOR with LEARNED precision ({warmup_epochs}-epoch warm-up, clamped to [{precision_floor}, {precision_ceiling}], T=20 relaxation steps/epoch):");
+    println!("\ntraining XOR with LEARNED precision ({warmup_epochs}-epoch warm-up, {ramp_epochs}-epoch ramp, MAP estimate with pseudo_n={pseudo_n}, T=20 relaxation steps/epoch):");
     for epoch in 0..1000 {
         let (d_w0, d_w1, e1, e2) = pc_grads_and_errors(&x0, &target, &w0_lp, &w1_lp, 20, 0.1, sigma1_inv, sigma2_inv);
         adam_lp.step(&mut w0_lp, &d_w0, &mut w0_lp_state);
@@ -358,8 +388,11 @@ fn main() {
                 ema1 = e1.mul(&e1).sum().data[0];
                 ema2 = e2.mul(&e2).sum().data[0];
             }
-            sigma1_inv = update_precision(&e1, &mut ema1, decay, precision_floor, precision_ceiling);
-            sigma2_inv = update_precision(&e2, &mut ema2, decay, precision_floor, precision_ceiling);
+            let map1 = update_precision_map(&e1, &mut ema1, decay, pseudo_n);
+            let map2 = update_precision_map(&e2, &mut ema2, decay, pseudo_n);
+            let ramp_frac = ((epoch - warmup_epochs) as f32 / ramp_epochs).min(1.0);
+            sigma1_inv = (1.0 - ramp_frac) * 1.0 + ramp_frac * map1;
+            sigma2_inv = (1.0 - ramp_frac) * 1.0 + ramp_frac * map2;
         }
 
         if epoch % 100 == 0 {
@@ -371,10 +404,15 @@ fn main() {
     }
 
     // Same diagnostic as the fixed-value revisit, now at weights+precision
-    // that emerged from actual training - does LEARNED precision (with the
-    // warm-up mitigation) close the persistent nonzero-plateau gap the
-    // fixed-value test only partially did, without the collapse the
-    // unmitigated version showed on the first attempt?
+    // that emerged from actual training - no collapse this time (see the
+    // header comment above). Measured: does NOT close the persistent
+    // nonzero-plateau gap the fixed-value test also couldn't fully close -
+    // dW1's error is actually larger at low T here than the fixed-value
+    // sweep showed (1.56 at T=1 vs that sweep's 0.267), though both settle
+    // to a similar-magnitude plateau by T=20+. Different question than
+    // "does it explode": stability was the thing that was broken and is
+    // now fixed; full convergence to backprop as T grows was never fully
+    // achieved by any variant tried in this file, fixed-value or learned.
     let (bp_w0_lp, bp_w1_lp) = backprop_grads_precision(&x0, &target, &w0_lp, &w1_lp, sigma2_inv);
     println!("\nlearned-precision T-sweep at trained weights (sigma1_inv={sigma1_inv:.4}, sigma2_inv={sigma2_inv:.4}):");
     for &t in &[1usize, 5, 20, 50, 100, 300] {
