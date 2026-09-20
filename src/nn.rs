@@ -1,7 +1,7 @@
 use crate::optim::{Optimizer, Sgd};
 use crate::tape::{Tape, Var};
 use crate::tensor::NdArray;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 /// xorshift64 PRNG. Hand-rolled, not from a crate - deterministic given a
 /// seed, which matters for reproducing a training run exactly.
@@ -46,6 +46,14 @@ pub struct LinearOut {
 pub struct Linear {
     pub w: NdArray, // [in_dim, out_dim]
     pub b: NdArray, // [out_dim]
+    // Tracks the most recent leaf pair forward() produced, so apply_grad
+    // can catch the weight-tying footgun instead of silently computing a
+    // partial gradient - see forward's and apply_grad's doc comments.
+    // Interior mutability (not &mut self on forward) for the same reason
+    // TransformerBlock's mask_cache already uses it: forward() computing a
+    // value is conceptually a read, not a mutation, everywhere else in
+    // this file.
+    last_leaf: Cell<Option<(Var, Var)>>,
 }
 
 impl Linear {
@@ -66,7 +74,18 @@ impl Linear {
         Self {
             w: NdArray::new(w_data, vec![in_dim, out_dim]),
             b: NdArray::new(b_data, vec![out_dim]),
+            last_leaf: Cell::new(None),
         }
+    }
+
+    /// Builds a Linear directly from already-computed w/b - for callers
+    /// constructing weights by some means other than `new`'s random init
+    /// (e.g. a hand-built identity/slicing matrix, or an ES-perturbed
+    /// copy of an existing layer's weights). Exists because `last_leaf`
+    /// being private blocks the struct-literal syntax these callers used
+    /// before it was added, not because this needs to be a common path.
+    pub fn from_parts(w: NdArray, b: NdArray) -> Self {
+        Self { w, b, last_leaf: Cell::new(None) }
     }
 
     /// Leafs a FRESH copy of w/b into the tape on every call - correct and
@@ -75,22 +94,57 @@ impl Linear {
     /// reuse: calling forward() more than once on the same Linear within
     /// one tape (e.g. weight-tying across an unrolled RNN/SSM loop)
     /// produces a SEPARATE leaf and gradient slot per call, not one shared
-    /// gradient. apply_grad only reads tape.grad() for the ONE LinearOut
-    /// you pass it, so reusing this pattern silently drops every other
-    /// call's gradient contribution instead of erroring. ssm_recall.rs
-    /// needed exactly this and worked around it by leafing w/b once
-    /// itself and reusing the same Var across all timesteps manually,
-    /// rather than calling forward() per timestep - do the same if you
-    /// need weight-tied reuse elsewhere.
+    /// gradient. apply_grad now catches this (panics instead of silently
+    /// dropping the earlier call's gradient) - for weight-tied reuse, leaf
+    /// once yourself and call forward_shared with the same Var every time,
+    /// the same pattern ssm_recall.rs already used manually before this
+    /// method existed.
     pub fn forward(&self, tape: &mut Tape, x: Var) -> LinearOut {
         let w = tape.leaf(self.w.clone());
         let b = tape.leaf(self.b.clone());
+        self.last_leaf.set(Some((w, b)));
+        self.forward_shared(tape, x, w, b)
+    }
+
+    /// The general form forward() delegates to, for callers that leaf w/b
+    /// themselves and want to reuse the same Var across multiple calls
+    /// (weight-tying) instead of getting a fresh leaf each time. Doesn't
+    /// touch last_leaf - the staleness check is specifically about
+    /// protecting forward()'s own fresh-leaf-per-call default from
+    /// accidental misuse; a caller using this method has already opted
+    /// into managing the Vars themselves.
+    pub fn forward_shared(&self, tape: &mut Tape, x: Var, w: Var, b: Var) -> LinearOut {
         let mm = tape.matmul(x, w);
         let y = tape.add(mm, b);
         LinearOut { y, w, b }
     }
 
+    /// Panics if `out` isn't the most recent LinearOut forward() produced -
+    /// i.e. forward() was called again on this same Linear (within the
+    /// tape's lifetime or a later one) since `out` was created, meaning
+    /// out.w/out.b's gradient reflects only part of what should have
+    /// updated this layer. Silently proceeding would compute a partial,
+    /// wrong weight update instead of erroring - the actual danger this
+    /// whole footgun poses. Only checks LinearOuts from forward() (which
+    /// records into last_leaf); forward_shared's callers manage their own
+    /// Vars and are exempt by design.
+    /// Shared by apply_grad and apply_grad_with - both need the same
+    /// staleness check before touching the tape, only the actual step
+    /// call differs (Sgd-specific vs generic Optimizer).
+    fn check_not_stale(&self, out: &LinearOut) {
+        assert_eq!(
+            self.last_leaf.get(),
+            Some((out.w, out.b)),
+            "Linear::apply_grad called with a stale LinearOut - forward() was called again on \
+             this Linear since this LinearOut was created, so its gradient reflects only that \
+             later call, not this one. This is the weight-tying footgun forward()'s doc comment \
+             describes: for weight-tied reuse across multiple calls, leaf w/b once yourself and \
+             call forward_shared with the same Var each time instead of forward()."
+        );
+    }
+
     pub fn apply_grad(&mut self, tape: &Tape, out: &LinearOut, opt: &Sgd) {
+        self.check_not_stale(out);
         opt.step(&mut self.w, tape.grad(out.w).unwrap());
         opt.step(&mut self.b, tape.grad(out.b).unwrap());
     }
@@ -104,6 +158,7 @@ impl Linear {
     /// around it. apply_grad (Sgd-specific, no state to thread) is
     /// unchanged and still the simplest path for the common case.
     pub fn apply_grad_with<O: Optimizer>(&mut self, tape: &Tape, out: &LinearOut, opt: &O, w_state: &mut O::State, b_state: &mut O::State) {
+        self.check_not_stale(out);
         opt.step(&mut self.w, tape.grad(out.w).unwrap(), w_state);
         opt.step(&mut self.b, tape.grad(out.b).unwrap(), b_state);
     }
@@ -127,7 +182,7 @@ impl Linear {
         *offset += w_len;
         let b = NdArray::new(data[*offset..*offset + out_dim].to_vec(), vec![out_dim]);
         *offset += out_dim;
-        Self { w, b }
+        Self { w, b, last_leaf: Cell::new(None) }
     }
 }
 
@@ -147,6 +202,7 @@ pub struct EmbeddingOut {
 #[derive(Clone)]
 pub struct Embedding {
     pub table: NdArray, // [vocab_size, d_model]
+    last_leaf: Cell<Option<Var>>, // see Linear's identical field for why
 }
 
 impl Embedding {
@@ -159,18 +215,32 @@ impl Embedding {
     pub fn new(rng: &mut Rng, vocab_size: usize, d_model: usize) -> Self {
         let scale = 0.02;
         let data = (0..vocab_size * d_model).map(|_| (rng.next_f32() * 2.0 - 1.0) * scale).collect();
-        Self { table: NdArray::new(data, vec![vocab_size, d_model]) }
+        Self { table: NdArray::new(data, vec![vocab_size, d_model]), last_leaf: Cell::new(None) }
     }
 
     /// Same fresh-leaf-per-call caveat as Linear::forward - see its doc
-    /// comment. Not weight-tie-safe across multiple calls within one tape.
+    /// comment. Not weight-tie-safe across multiple calls within one tape;
+    /// apply_grad catches misuse the same way Linear's does. Use
+    /// forward_shared with a Var you leaf yourself for tied reuse.
     pub fn forward(&self, tape: &mut Tape, indices: &[usize]) -> EmbeddingOut {
         let table = tape.leaf(self.table.clone());
+        self.last_leaf.set(Some(table));
+        self.forward_shared(tape, indices, table)
+    }
+
+    /// The general form forward() delegates to - see Linear::forward_shared.
+    pub fn forward_shared(&self, tape: &mut Tape, indices: &[usize], table: Var) -> EmbeddingOut {
         let y = tape.gather(table, indices);
         EmbeddingOut { y, table }
     }
 
     pub fn apply_grad(&mut self, tape: &Tape, out: &EmbeddingOut, opt: &Sgd) {
+        assert_eq!(
+            self.last_leaf.get(),
+            Some(out.table),
+            "Embedding::apply_grad called with a stale EmbeddingOut - see Linear::apply_grad's \
+             panic message for the full explanation; use forward_shared for tied reuse."
+        );
         opt.step(&mut self.table, tape.grad(out.table).unwrap());
     }
 
@@ -182,7 +252,7 @@ impl Embedding {
         let len = vocab_size * d_model;
         let table = NdArray::new(data[*offset..*offset + len].to_vec(), vec![vocab_size, d_model]);
         *offset += len;
-        Self { table }
+        Self { table, last_leaf: Cell::new(None) }
     }
 }
 
@@ -208,6 +278,7 @@ pub struct LayerNorm {
     pub gamma: NdArray, // [1, d_model]
     pub beta: NdArray,  // [1, d_model]
     eps: f32,
+    last_leaf: Cell<Option<(Var, Var)>>, // see Linear's identical field for why
 }
 
 impl LayerNorm {
@@ -221,16 +292,24 @@ impl LayerNorm {
             gamma: NdArray::new(vec![1.0; d_model], vec![1, d_model]),
             beta: NdArray::new(vec![0.0; d_model], vec![1, d_model]),
             eps: 1e-5,
+            last_leaf: Cell::new(None),
         }
     }
 
     /// Same fresh-leaf-per-call caveat as Linear::forward - see its doc
-    /// comment. Not weight-tie-safe across multiple calls within one tape.
+    /// comment. Not weight-tie-safe across multiple calls within one tape;
+    /// apply_grad catches misuse the same way Linear's does. Use
+    /// forward_shared with Vars you leaf yourself for tied reuse.
     pub fn forward(&self, tape: &mut Tape, x: Var) -> LayerNormOut {
-        let d = tape.value(x).shape[1] as f32;
         let gamma = tape.leaf(self.gamma.clone());
         let beta = tape.leaf(self.beta.clone());
+        self.last_leaf.set(Some((gamma, beta)));
+        self.forward_shared(tape, x, gamma, beta)
+    }
 
+    /// The general form forward() delegates to - see Linear::forward_shared.
+    pub fn forward_shared(&self, tape: &mut Tape, x: Var, gamma: Var, beta: Var) -> LayerNormOut {
+        let d = tape.value(x).shape[1] as f32;
         let sum = tape.sum_last_axis(x);
         let mean = tape.scale(sum, 1.0 / d);
         let centered = tape.sub(x, mean);
@@ -249,6 +328,12 @@ impl LayerNorm {
     }
 
     pub fn apply_grad(&mut self, tape: &Tape, out: &LayerNormOut, opt: &Sgd) {
+        assert_eq!(
+            self.last_leaf.get(),
+            Some((out.gamma, out.beta)),
+            "LayerNorm::apply_grad called with a stale LayerNormOut - see Linear::apply_grad's \
+             panic message for the full explanation; use forward_shared for tied reuse."
+        );
         opt.step(&mut self.gamma, tape.grad(out.gamma).unwrap());
         opt.step(&mut self.beta, tape.grad(out.beta).unwrap());
     }
@@ -266,7 +351,7 @@ impl LayerNorm {
         *offset += d_model;
         let beta = NdArray::new(data[*offset..*offset + d_model].to_vec(), vec![1, d_model]);
         *offset += d_model;
-        Self { gamma, beta, eps: 1e-5 }
+        Self { gamma, beta, eps: 1e-5, last_leaf: Cell::new(None) }
     }
 }
 

@@ -86,7 +86,7 @@ fn main() {
     let init_embed_b = embed_b.clone();
     let init_a = a.clone();
     let init_b_gain = b_gain.clone();
-    let init_readout = Linear { w: readout.w.clone(), b: readout.b.clone() };
+    let init_readout = Linear::from_parts(readout.w.clone(), readout.b.clone());
 
     let epochs = 400;
     let denom = 1.0 / (batch * d_content) as f32;

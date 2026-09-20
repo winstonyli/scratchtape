@@ -50,12 +50,12 @@ fn main() {
             let eps_w2 = randn_like(&mut rng, &l2.w.shape);
             let eps_b2 = randn_like(&mut rng, &l2.b.shape);
 
-            let plus = Linear { w: l1.w.add(&eps_w1.scale(sigma)), b: l1.b.add(&eps_b1.scale(sigma)) };
-            let plus2 = Linear { w: l2.w.add(&eps_w2.scale(sigma)), b: l2.b.add(&eps_b2.scale(sigma)) };
+            let plus = Linear::from_parts(l1.w.add(&eps_w1.scale(sigma)), l1.b.add(&eps_b1.scale(sigma)));
+            let plus2 = Linear::from_parts(l2.w.add(&eps_w2.scale(sigma)), l2.b.add(&eps_b2.scale(sigma)));
             let f_pos = mse_loss(&forward(&plus, &plus2, &x_data), &y_data);
 
-            let minus = Linear { w: l1.w.sub(&eps_w1.scale(sigma)), b: l1.b.sub(&eps_b1.scale(sigma)) };
-            let minus2 = Linear { w: l2.w.sub(&eps_w2.scale(sigma)), b: l2.b.sub(&eps_b2.scale(sigma)) };
+            let minus = Linear::from_parts(l1.w.sub(&eps_w1.scale(sigma)), l1.b.sub(&eps_b1.scale(sigma)));
+            let minus2 = Linear::from_parts(l2.w.sub(&eps_w2.scale(sigma)), l2.b.sub(&eps_b2.scale(sigma)));
             let f_neg = mse_loss(&forward(&minus, &minus2, &x_data), &y_data);
 
             forward_evals += 2;

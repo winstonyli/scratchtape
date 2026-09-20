@@ -61,7 +61,7 @@ fn main() {
         for i in 0..d_k {
             w[(start + i) * d_k + i] = 1.0;
         }
-        Linear { w: NdArray::new(w, vec![d_model, d_k]), b: NdArray::zeros(vec![d_k]) }
+        Linear::from_parts(NdArray::new(w, vec![d_model, d_k]), NdArray::zeros(vec![d_k]))
     };
 
     let mut head_outputs = Vec::with_capacity(n_heads);
