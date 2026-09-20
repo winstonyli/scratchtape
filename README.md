@@ -98,6 +98,14 @@ weight term — was checked by direct calculation and is identical for
 both variants, ruling it out rather than confirming it; the real
 mechanism is a multi-layer effect (softmax1's variable row-sum
 interacting with the residual stream) not fully decomposed here.
+`softmax1_qknorm_fix.rs` tested the natural fix anyway — L2-normalizing
+Q/K before the dot product, bounding every score regardless of
+underlying weight-norm growth — using a self-contained reimplementation
+of the block (`TransformerBlock`'s own fields are private, unlike its
+`Out` struct) rather than another library change. It works completely:
+a full 2000-step run with zero divergence, Q/K weight norm and gradient
+both staying flat the whole time, against the same setup's step-775 NaN
+without it.
 
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention

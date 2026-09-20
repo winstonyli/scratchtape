@@ -110,6 +110,10 @@ name = "softmax1_divergence_diagnosis"
 path = "examples/alternative_mechanisms/softmax1_divergence_diagnosis.rs"
 
 [[example]]
+name = "softmax1_qknorm_fix"
+path = "examples/alternative_mechanisms/softmax1_qknorm_fix.rs"
+
+[[example]]
 name = "predictive_coding"
 path = "examples/alternative_mechanisms/predictive_coding.rs"
 

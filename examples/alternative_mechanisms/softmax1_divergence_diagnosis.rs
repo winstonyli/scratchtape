@@ -50,11 +50,12 @@
 // and plain softmax by direct calculation - the real differentiator
 // has to be softmax1's variable (not fixed-at-1) row-sum interacting
 // with the residual stream across multiple layers, a multi-layer
-// effect not further decomposed here. The natural next step, not built
-// in this file: does a known real fix for this class of problem
-// (QK-norm - L2-normalizing Q/K before the dot product, used in
-// several real transformer architectures specifically to prevent
-// unbounded logit growth) actually stabilize training here.
+// effect not further decomposed here. Follow-up (softmax1_qknorm_fix.rs):
+// does a known real fix for this class of problem (QK-norm - L2-
+// normalizing Q/K before the dot product) actually stabilize training
+// here - yes, completely. Full 2000-step run with zero divergence,
+// Q/K weight norm and gradient both staying flat/bounded the whole
+// time, versus this file's own step-775 NaN under identical settings.
 //
 // Reuses the already-tested, already-in-the-library TransformerBlock::forward_full
 // hook (added in d54c8f2 specifically for this, never exercised beyond
