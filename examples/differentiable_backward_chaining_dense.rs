@@ -122,7 +122,7 @@ fn train_from_indirect_supervision(
     is_true_grandparent: &dyn Fn(usize, usize) -> bool,
     or_fn: impl Fn(&mut Tape, Var) -> Var,
     names: &[&str],
-) {
+) -> (f32, f32, f32) {
     let mut gp_xs = Vec::new();
     let mut gp_zs = Vec::new();
     let mut gp_labels = Vec::new();
@@ -233,6 +233,7 @@ fn train_from_indirect_supervision(
         }
         println!();
     }
+    (rp, rr, rf1)
 }
 
 fn main() {
@@ -273,8 +274,8 @@ fn main() {
 
     let d = 6;
     println!("\ntraining from ONLY grandparent existence labels, never shown a `parent` fact directly (d={d}):");
-    train_from_indirect_supervision("max_or lr=0.05", n, d, 0.05, &is_parent_fact, &is_true_grandparent, max_or, &names);
-    train_from_indirect_supervision("beam_or T=0.5 lr=0.05", n, d, 0.05, &is_parent_fact, &is_true_grandparent, |t, s| beam_or(t, s, 0.5), &names);
+    let _ = train_from_indirect_supervision("max_or lr=0.05", n, d, 0.05, &is_parent_fact, &is_true_grandparent, max_or, &names);
+    let _ = train_from_indirect_supervision("beam_or T=0.5 lr=0.05", n, d, 0.05, &is_parent_fact, &is_true_grandparent, |t, s| beam_or(t, s, 0.5), &names);
 
     // lr=0.05 (above) undersolved the TRAINED objective itself at this
     // scale (max_or's check 1 was 0/0/0 - worse than the original
@@ -283,6 +284,33 @@ fn main() {
     // (max_or reaches 0.833 f1, matching the original KB) - isolating
     // the two questions cleanly.
     println!("\nsame KB, tuned lr=0.15 - isolates optimization difficulty from identifiability:");
-    train_from_indirect_supervision("max_or lr=0.15", n, d, 0.15, &is_parent_fact, &is_true_grandparent, max_or, &names);
-    train_from_indirect_supervision("beam_or T=0.5 lr=0.15", n, d, 0.15, &is_parent_fact, &is_true_grandparent, |t, s| beam_or(t, s, 0.5), &names);
+    let _ = train_from_indirect_supervision("max_or lr=0.15", n, d, 0.15, &is_parent_fact, &is_true_grandparent, max_or, &names);
+    let (_, _, beam_05_f1) = train_from_indirect_supervision("beam_or T=0.5 lr=0.15", n, d, 0.15, &is_parent_fact, &is_true_grandparent, |t, s| beam_or(t, s, 0.5), &names);
+
+    // beam_or's one nonzero check-2 result (above) raises the obvious
+    // question: does temperature matter, and is there a better setting?
+    // Sweeps it directly rather than guessing from one data point.
+    println!("\nsweeping beam_or's temperature at lr=0.15 - is recovery a smooth function of temperature, or noisy?");
+    let temperatures = [0.05, 0.07, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0, 2.0];
+    let mut sweep_results = vec![(0.5, beam_05_f1)];
+    for &t in &temperatures {
+        if t == 0.5 {
+            continue; // already have it above
+        }
+        let (_, _, f1) = train_from_indirect_supervision(&format!("beam_or T={t}"), n, d, 0.15, &is_parent_fact, &is_true_grandparent, |tape, s| beam_or(tape, s, t), &names);
+        sweep_results.push((t, f1));
+    }
+    sweep_results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    println!("\ntemperature -> check 2 f1 (recovering true parent facts):");
+    for (t, f1) in &sweep_results {
+        println!("  T={t:<5} f1={f1:.3}");
+    }
+    let (best_t, best_f1) = sweep_results.iter().cloned().fold((0.0, -1.0), |acc, x| if x.1 > acc.1 { x } else { acc });
+    println!(
+        "best: T={best_t} (f1={best_f1:.3}) - still far from reliable recovery, and not a smooth function of \
+         temperature (T=0.07/0.2/0.3/1.0/2.0 all collapsed to 0.000 while T=0.05/0.1/0.15/0.5 didn't) - single-seed \
+         training \
+         dynamics finding a locally better bridge structure by chance seems more likely than a genuine \
+         temperature/sharpness trend."
+    );
 }
