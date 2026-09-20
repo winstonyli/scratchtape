@@ -127,6 +127,28 @@ replay mitigation — 8 fixed windows replayed 15% of the time is a
 negligible fraction of a ~59KB corpus, unlike the toy case where it
 covered a real share of the whole task.
 
+That pointed at budget as the fix, not a fundamental mismatch, so
+`memory_tier_multigen_diverse_bigbudget.rs` reran the same setup at
+budget=128 (16x) and found a real, consistent ~0.15-0.28 loss
+reduction across every retained corpus — the mechanism does transfer
+to real scale, it just needed real coverage.
+`memory_tier_multigen_diverse_budget256.rs` doubled budget again to
+256 and found meaningfully smaller further gains (~0.03-0.065) —
+diminishing returns, not a threshold or a continued linear win.
+
+`memory_tier_multigen_diverse_consolidate.rs` then tried a completely
+different mechanism on the same setup: no replay buffer at all, just
+blending each phase's trained weights 70/30 back toward a snapshot
+taken before that phase started (an EWC-lite stand-in — no
+per-parameter importance weighting, just a uniform pull-back). It ties
+budget=128 replay on one corpus, beats it on another, and matches it on
+new-task cost — competitive retention from a mechanism with no stored
+history or curation policy at all. No trait unifies this with replay:
+the two don't share a call shape (replay hooks into training's
+sampling; this only runs between phases) and each has exactly one
+consumer so far, nowhere near the "2+ consumers" bar the `Optimizer`
+trait needed before it was worth building.
+
 **`tiny_lm_corpus.rs`** is the project's largest and most-iterated file
 by far — a byte-level LM plus an extended symbolic/KR&R (knowledge
 representation & reasoning) investigation built on top of it:
