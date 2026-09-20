@@ -21,6 +21,21 @@
 // shape) so there's no clean structural symmetry to hide behind. 22
 // parent edges, 13 true grandparent pairs out of 650 ordered pairs
 // (~2.0% positive, sparser than the original KB's ~4.5%).
+//
+// First result (lr=0.05, this file's original run): both check 1
+// (trained objective) AND check 2 (recovery) failed for max_or - the
+// direct objective wasn't even solved, muddying whether check 2's
+// 0.000 reflected identifiability or just bad optimization at the
+// larger scale. Follow-up (lr=0.15): fixes check 1 cleanly (max_or
+// reaches 0.833 f1, matching the original 12-entity KB), isolating the
+// two questions. With optimization no longer the bottleneck, max_or's
+// check 2 is STILL exactly 0.000 - confirms the failure is
+// identifiability, not an artifact of under-tuned optimization.
+// beam_or at lr=0.15 differs in one respect worth keeping precise: it
+// gets a small but genuinely NONZERO check 2 (some true facts
+// recovered, not none) - softer aggregation leaks a little real signal
+// about the base relation once optimization stops being the
+// bottleneck, though nowhere near reliable recovery.
 use scratchtape::nn::{Embedding, Rng};
 use scratchtape::optim::{Adam, AdamState};
 use scratchtape::tape::{Tape, Var};
@@ -102,6 +117,7 @@ fn train_from_indirect_supervision(
     label: &str,
     n: usize,
     d: usize,
+    lr: f32,
     is_parent_fact: &dyn Fn(usize, usize) -> bool,
     is_true_grandparent: &dyn Fn(usize, usize) -> bool,
     or_fn: impl Fn(&mut Tape, Var) -> Var,
@@ -126,7 +142,7 @@ fn train_from_indirect_supervision(
     let mut subj_emb = Embedding::new(&mut rng, n, d);
     let mut obj_emb = Embedding::new(&mut rng, n, d);
     let mut bias = NdArray::new(vec![0.0], vec![1, 1]);
-    let adam = Adam { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 };
+    let adam = Adam { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8 };
     let mut subj_state = AdamState::zeros_like(&subj_emb.table);
     let mut obj_state = AdamState::zeros_like(&obj_emb.table);
     let mut bias_state = AdamState::zeros_like(&bias);
@@ -257,6 +273,16 @@ fn main() {
 
     let d = 6;
     println!("\ntraining from ONLY grandparent existence labels, never shown a `parent` fact directly (d={d}):");
-    train_from_indirect_supervision("max_or", n, d, &is_parent_fact, &is_true_grandparent, max_or, &names);
-    train_from_indirect_supervision("beam_or T=0.5", n, d, &is_parent_fact, &is_true_grandparent, |t, s| beam_or(t, s, 0.5), &names);
+    train_from_indirect_supervision("max_or lr=0.05", n, d, 0.05, &is_parent_fact, &is_true_grandparent, max_or, &names);
+    train_from_indirect_supervision("beam_or T=0.5 lr=0.05", n, d, 0.05, &is_parent_fact, &is_true_grandparent, |t, s| beam_or(t, s, 0.5), &names);
+
+    // lr=0.05 (above) undersolved the TRAINED objective itself at this
+    // scale (max_or's check 1 was 0/0/0 - worse than the original
+    // 12-entity KB's 0.833), muddying whether check 2's failure reflects
+    // identifiability or just bad optimization. lr=0.15 fixes check 1
+    // (max_or reaches 0.833 f1, matching the original KB) - isolating
+    // the two questions cleanly.
+    println!("\nsame KB, tuned lr=0.15 - isolates optimization difficulty from identifiability:");
+    train_from_indirect_supervision("max_or lr=0.15", n, d, 0.15, &is_parent_fact, &is_true_grandparent, max_or, &names);
+    train_from_indirect_supervision("beam_or T=0.5 lr=0.15", n, d, 0.15, &is_parent_fact, &is_true_grandparent, |t, s| beam_or(t, s, 0.5), &names);
 }
