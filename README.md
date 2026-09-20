@@ -22,8 +22,8 @@ cargo build --release --examples  # build everything under examples/
 cargo run --release --example tiny_lm
 ```
 
-Most examples are self-contained: encode a small corpus, train a tiny
-transformer, print what happened. A few (`checkpoint_save`/
+Most examples follow the same shape: encode a small corpus, train a
+tiny transformer, print what happened. A few (`checkpoint_save`/
 `checkpoint_load`, `memory_tier_*`) are pairs of programs that write a
 file and read it back in a genuinely separate process.
 
@@ -34,6 +34,13 @@ own headings below), each wired up via an explicit `[[example]]` entry
 in `Cargo.toml` (Cargo only auto-discovers examples at the top level).
 Names are unchanged from the original flat layout, so every
 `cargo run --example <name>` below still works exactly as written.
+`examples/common/` holds the handful of helpers that crossed this
+project's own "2+ consumers" promotion bar many times over
+(`encode_bytes` alone was byte-identical across 22 files) — plain
+functions, not a trait, since none of them have more than one real
+implementation to swap between. Kept in `examples/`, not `src/`: this
+is example glue (byte encoding, window sampling, the standard tiny-
+transformer forward/apply_grad pair), not an engine primitive.
 
 ## Engine (`src/`)
 
