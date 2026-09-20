@@ -815,13 +815,18 @@ fn main() {
 
     // Same model scale as tiny_lm_scaled.rs - isolates the corpus-size axis
     // on its own, rather than compounding it with a model-size change too.
-    // A 2x scale-up (matching tiny_lm_scaled2.rs's own factor) was tried
-    // here and reverted - see the commit introducing then reverting it for
-    // the honest fixed-step-budget negative result: bigger model, same
-    // 16000 steps, produced *worse* held-out loss (2.10 vs 1.93) and *more*
-    // seed-noise fragmentation (35 strict-consensus components vs 32), a
-    // compute-optimal-scaling confound (more parameters, same steps, less
-    // signal per parameter) rather than evidence capacity doesn't help.
+    // Model-size scale-up tried twice and reverted both times:
+    // - 2x model, SAME 16000 steps ([3ed92e9]): worse held-out loss (2.10
+    //   vs 1.93) and more fragmentation (35 strict-consensus components vs
+    //   32) - a compute-optimal-scaling confound, not evidence capacity
+    //   doesn't help.
+    // - 2x model, 4x steps (64000, compute-matched-ish) - confirms the
+    //   confound exactly: held-out loss 1.9417 (essentially identical to
+    //   1.9335) and 32 strict-consensus components (exactly matching).
+    //   But capacity doesn't clearly HELP either once fairly trained - it
+    //   just catches back up to parity, at ~20x the wall-clock cost
+    //   (20410s vs ~820-1020s) for no net gain. No free lunch from scaling
+    //   at this corpus size.
     let (d_model, n_heads, d_ff, seq_len, n_blocks) = (128, 8, 256, 64, 4);
     let vocab_size = 256;
     println!("model: d_model={d_model} n_heads={n_heads} d_ff={d_ff} seq_len={seq_len} n_blocks={n_blocks}");
