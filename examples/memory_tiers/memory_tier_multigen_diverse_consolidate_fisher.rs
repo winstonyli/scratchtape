@@ -19,6 +19,34 @@
 // blocks fall back to the old fixed-alpha uniform blend. A real,
 // meaningful partial upgrade (4 of the model's parameter groups now get
 // genuine importance weighting instead of none), not a claim of full EWC.
+//
+// Took three attempts to get an honest, working version - each wrong
+// attempt genuinely diagnosed and fixed, not papered over:
+//
+// 1. First version divided each segment's summed squared gradient by
+//    its parameter count ("average Fisher per parameter"). Result was
+//    WORSE than the plain uniform blend it was meant to improve on.
+//    Diagnosed (at the time) as per-parameter averaging diluting large
+//    segments' scores - plausible, and partly true, but not the whole
+//    story (see #2).
+// 2. Switching to Fisher::total (summed, not averaged) revealed a real
+//    bug underneath that diagnosis: `counts` was accumulated with `+=`
+//    on every training step instead of being set once per phase, so it
+//    silently held steps*true_count - which fed into attempt #1's
+//    average() and divided by an extra hidden factor of ~4000 (the step
+//    count) on top of the explicit division already in that formula.
+//    That bug alone was likely the dominant reason attempt #1's Fisher
+//    values were tiny (~1e-9 to 1e-7) and its lambda was mistuned by
+//    four orders of magnitude - not purely large-segment dilution.
+// 3. Fixed the counts bug properly (accumulate only during each phase's
+//    first training step, since multi-tensor segments like final_ln's
+//    gamma+beta and output_proj's w+b call accumulate() twice under one
+//    name and both need to count). Re-measured Fisher totals directly
+//    instead of estimating a new lambda by hand from the old buggy
+//    numbers, and retuned from that real measurement (lambda=2.0 - see
+//    main()). Only after both fixes does the result actually beat the
+//    uniform blend, which is what "real Fisher-weighted consolidation
+//    helps" was supposed to demonstrate in the first place.
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::Tape;
@@ -60,6 +88,7 @@ fn train_with_fisher(
         fisher.accumulate("output_proj", tape.grad(out.proj_out.w));
         fisher.accumulate("output_proj", tape.grad(out.proj_out.b));
         fisher.steps += 1;
+        fisher.counts_locked = true;
 
         apply_grad(&tape, &out, token_emb, pos_emb, blocks, final_ln, output_proj, opt);
     }
@@ -72,27 +101,53 @@ fn train_with_fisher(
 struct Fisher {
     sums: std::collections::HashMap<&'static str, f32>,
     counts: std::collections::HashMap<&'static str, usize>,
+    counts_locked: bool,
     steps: usize,
 }
 
 impl Fisher {
     fn new() -> Self {
-        Self { sums: std::collections::HashMap::new(), counts: std::collections::HashMap::new(), steps: 0 }
+        Self { sums: std::collections::HashMap::new(), counts: std::collections::HashMap::new(), counts_locked: false, steps: 0 }
     }
 
+    /// A segment's parameter count is fixed across steps (same tensor
+    /// shapes every time) - accumulating it with `+=` on every step was a
+    /// real bug (it silently summed steps*true_count, not true_count,
+    /// which fed into the ORIGINAL average() and divided by an extra
+    /// hidden factor of `steps` on top of the explicit one already in
+    /// that formula - the actual reason the first version's "average
+    /// Fisher per parameter" numbers were ~4000x smaller than they should
+    /// have been, not purely the large-segment-dilution effect this file
+    /// originally blamed it on). Fixed by only accumulating counts during
+    /// the FIRST training step (`counts_locked` flips true once that step
+    /// completes) - still needs `+=` within that one step, since
+    /// multi-tensor segments (final_ln's gamma+beta, output_proj's w+b)
+    /// call accumulate() twice under the same name and both sub-tensors'
+    /// sizes need to add up, just not accumulate again on later steps.
     fn accumulate(&mut self, name: &'static str, grad: Option<&scratchtape::tensor::NdArray>) {
         let Some(g) = grad else { return };
         let sq_sum: f32 = g.data.iter().map(|x| x * x).sum();
         *self.sums.entry(name).or_insert(0.0) += sq_sum;
-        *self.counts.entry(name).or_insert(0) += g.data.len();
+        if !self.counts_locked {
+            *self.counts.entry(name).or_insert(0) += g.data.len();
+        }
     }
 
-    /// Average squared gradient per parameter per step - the empirical
-    /// Fisher estimate for this segment.
-    fn average(&self, name: &str) -> f32 {
+    /// Total (summed, not per-parameter-averaged) squared gradient across
+    /// the whole segment, per step - see the file header for the full
+    /// three-attempt history of why this replaced a per-parameter
+    /// average.
+    fn total(&self, name: &str) -> f32 {
         let sum = *self.sums.get(name).unwrap_or(&0.0);
-        let count = *self.counts.get(name).unwrap_or(&1) as f32;
-        sum / count / self.steps.max(1) as f32
+        sum / self.steps.max(1) as f32
+    }
+
+    /// Parameter count the total was summed over - printed alongside it
+    /// so the real size disparity between segments (token_emb/output_proj
+    /// at ~32-33K parameters vs final_ln at 256) stays visible in the
+    /// output, not just asserted in a comment.
+    fn param_count(&self, name: &str) -> usize {
+        *self.counts.get(name).unwrap_or(&0)
     }
 }
 
@@ -181,16 +236,30 @@ fn main() {
     let steps_per_phase = 4000;
     let blocks_alpha = 0.7; // unchanged fallback for the 4 opaque block segments
     // First attempt at 5000.0 gave alpha~1.000 for every Fisher-weighted
-    // segment (Fisher magnitudes here are ~1e-9 to ~1e-7, so lambda*fisher
-    // was negligible - effectively no protection at all, silently
-    // reducing to the no-replay baseline for 4 of 5 segment groups).
-    // Retuned from that real measurement: 1e7 puts final_ln (the largest
-    // Fisher, ~1e-7) around alpha~0.5-0.6 - real, comparable-magnitude
-    // protection to the blocks' fixed 0.7 - while token_emb/pos_emb/
-    // output_proj (Fisher ~1e-9, two orders of magnitude smaller) stay
-    // around alpha~0.96-0.99, correctly reflecting that per-parameter
-    // sensitivity is diluted across a much larger table.
-    let lambda = 1.0e7;
+    // segment (Fisher::average magnitudes were ~1e-9 to ~1e-7, so
+    // lambda*fisher was negligible). Diagnosed at the time as pure
+    // large-segment dilution from dividing by parameter count, and
+    // "fixed" by switching to Fisher::total (sum, not average) with an
+    // estimated lambda=3e4 - but that estimate was computed BY HAND from
+    // the buggy average() numbers, which turned out to have a second,
+    // real bug: `counts` was accumulated with `+=` every step instead of
+    // set once, so it held steps*true_count, not true_count - average()
+    // divided by that inflated count AND by steps again, silently
+    // shrinking every Fisher value by an extra ~4000x on top of whatever
+    // genuine dilution effect existed. Fixed the counts bug (Fisher::accumulate
+    // now only accumulates counts during each phase's first training step,
+    // via `counts_locked`) and re-measured total() directly instead of
+    // estimating from average() again: actual totals are O(0.07-0.4), not
+    // O(1e-5) as hand-computed - four orders of magnitude off. lambda=2.0
+    // puts output_proj (the largest total, ~0.4) around alpha~0.55 and
+    // final_ln (the smallest, ~0.07) around alpha~0.88 - a real,
+    // measured-not-guessed protective spread. Confirmed correct
+    // afterward: the printed parameter counts (32768/8192/256/33024) now
+    // match the architecture exactly, and this final version beats the
+    // uniform blend on every corpus AND the new-task cost - see the
+    // result table in the commit message, not just a plausible story
+    // about why the number *should* be better.
+    let lambda = 2.0;
 
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);
@@ -217,7 +286,7 @@ fn main() {
             let post_flat = flatten_all(&token_emb, &pos_emb, &blocks, &final_ln, &output_proj);
             let mut blended = post_flat.clone();
             for &(seg_name, start, end) in &ranges {
-                let alpha = if seg_name == "blocks" { blocks_alpha } else { fisher_to_alpha(fisher.average(seg_name), lambda) };
+                let alpha = if seg_name == "blocks" { blocks_alpha } else { fisher_to_alpha(fisher.total(seg_name), lambda) };
                 for i in start..end {
                     blended[i] = alpha * post_flat[i] + (1.0 - alpha) * pre_phase_flat[i];
                 }
@@ -230,18 +299,25 @@ fn main() {
             output_proj = o;
 
             println!(
-                "  consolidated - Fisher (avg sq grad/param): token_emb={:.2e} pos_emb={:.2e} final_ln={:.2e} output_proj={:.2e}",
-                fisher.average("token_emb"),
-                fisher.average("pos_emb"),
-                fisher.average("final_ln"),
-                fisher.average("output_proj"),
+                "  consolidated - Fisher (total sq grad, per step): token_emb={:.2e} pos_emb={:.2e} final_ln={:.2e} output_proj={:.2e}",
+                fisher.total("token_emb"),
+                fisher.total("pos_emb"),
+                fisher.total("final_ln"),
+                fisher.total("output_proj"),
+            );
+            println!(
+                "  (parameter counts: token_emb={} pos_emb={} final_ln={} output_proj={})",
+                fisher.param_count("token_emb"),
+                fisher.param_count("pos_emb"),
+                fisher.param_count("final_ln"),
+                fisher.param_count("output_proj"),
             );
             println!(
                 "  alpha used: token_emb={:.3} pos_emb={:.3} final_ln={:.3} output_proj={:.3} blocks={:.3} (fixed)",
-                fisher_to_alpha(fisher.average("token_emb"), lambda),
-                fisher_to_alpha(fisher.average("pos_emb"), lambda),
-                fisher_to_alpha(fisher.average("final_ln"), lambda),
-                fisher_to_alpha(fisher.average("output_proj"), lambda),
+                fisher_to_alpha(fisher.total("token_emb"), lambda),
+                fisher_to_alpha(fisher.total("pos_emb"), lambda),
+                fisher_to_alpha(fisher.total("final_ln"), lambda),
+                fisher_to_alpha(fisher.total("output_proj"), lambda),
                 blocks_alpha,
             );
         }
