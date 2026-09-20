@@ -1,26 +1,15 @@
-use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
+use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
-use scratchtape::tape::{Tape, Var};
+use scratchtape::tape::Tape;
 use std::collections::HashMap;
+
+#[path = "../common/mod.rs"]
+mod common;
+use common::{apply_grad, decode_bytes, encode_bytes, forward, sample_window};
 
 /// Byte-level: fixed 256 vocab, token id = byte value. Duplicated from
 /// byte_tokenizer.rs rather than shared - each is a couple of lines,
 /// engineering a shared module for this would be more code than it saves.
-fn encode_bytes(text: &str) -> Vec<usize> {
-    text.bytes().map(|b| b as usize).collect()
-}
-
-fn decode_bytes(ids: &[usize]) -> String {
-    let bytes: Vec<u8> = ids.iter().map(|&i| i as u8).collect();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn sample_window(rng: &mut Rng, corpus: &[usize], seq_len: usize) -> (Vec<usize>, Vec<usize>) {
-    let max_start = corpus.len() - seq_len - 1;
-    let start = (rng.next_f32() * max_start as f32) as usize;
-    (corpus[start..start + seq_len].to_vec(), corpus[start + 1..start + seq_len + 1].to_vec())
-}
-
 /// Plain Lloyd's k-means, post-hoc analysis only - deliberately not routed
 /// through NdArray/Tape, since there's no gradient anywhere in this: it
 /// operates on the trained embedding table AFTER training finishes, not
@@ -86,60 +75,6 @@ And summer's lease hath all too short a date.";
 /// specific assembly (token embed + positional embed + N blocks + final
 /// norm + output projection), unlike those components which each had 2+
 /// known consumers before being promoted to the library.
-struct ForwardOut {
-    tok_out: EmbeddingOut,
-    pos_out: EmbeddingOut,
-    block_outs: Vec<TransformerBlockOut>,
-    ln_out: LayerNormOut,
-    proj_out: LinearOut,
-}
-
-fn forward(
-    tape: &mut Tape,
-    token_emb: &Embedding,
-    pos_emb: &Embedding,
-    blocks: &[TransformerBlock],
-    final_ln: &LayerNorm,
-    output_proj: &Linear,
-    input_ids: &[usize],
-) -> (Var, ForwardOut) {
-    let positions: Vec<usize> = (0..input_ids.len()).collect();
-    let tok_out = token_emb.forward(tape, input_ids);
-    let pos_out = pos_emb.forward(tape, &positions);
-    let mut x = tape.add(tok_out.y, pos_out.y);
-
-    let mut block_outs = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        let out = block.forward(tape, x);
-        x = out.y;
-        block_outs.push(out);
-    }
-
-    let ln_out = final_ln.forward(tape, x);
-    let proj_out = output_proj.forward(tape, ln_out.y);
-    let logits = proj_out.y;
-    (logits, ForwardOut { tok_out, pos_out, block_outs, ln_out, proj_out })
-}
-
-fn apply_grad(
-    tape: &Tape,
-    out: &ForwardOut,
-    token_emb: &mut Embedding,
-    pos_emb: &mut Embedding,
-    blocks: &mut [TransformerBlock],
-    final_ln: &mut LayerNorm,
-    output_proj: &mut Linear,
-    opt: &Sgd,
-) {
-    token_emb.apply_grad(tape, &out.tok_out, opt);
-    pos_emb.apply_grad(tape, &out.pos_out, opt);
-    for (block, block_out) in blocks.iter_mut().zip(out.block_outs.iter()) {
-        block.apply_grad(tape, block_out, opt);
-    }
-    final_ln.apply_grad(tape, &out.ln_out, opt);
-    output_proj.apply_grad(tape, &out.proj_out, opt);
-}
-
 /// Temperature-sampled decoding over a sliding window - no KV-cache (each
 /// step recomputes the whole window from scratch), so context is hard-capped
 /// at seq_len by the positional embedding table's fixed size. Plain scalar

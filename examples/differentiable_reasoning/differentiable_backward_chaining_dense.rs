@@ -41,39 +41,13 @@ use scratchtape::optim::{Adam, AdamState};
 use scratchtape::tape::{Tape, Var};
 use scratchtape::tensor::NdArray;
 
-fn precision_recall_f1(labels: &[usize], predictions: &[usize]) -> (f32, f32, f32) {
-    let mut tp = 0;
-    let mut fp = 0;
-    let mut fn_ = 0;
-    for i in 0..labels.len() {
-        match (predictions[i], labels[i]) {
-            (1, 1) => tp += 1,
-            (1, 0) => fp += 1,
-            (0, 1) => fn_ += 1,
-            _ => {}
-        }
-    }
-    let precision = if tp + fp == 0 { 0.0 } else { tp as f32 / (tp + fp) as f32 };
-    let recall = if tp + fn_ == 0 { 0.0 } else { tp as f32 / (tp + fn_) as f32 };
-    let f1 = if precision + recall == 0.0 { 0.0 } else { 2.0 * precision * recall / (precision + recall) };
-    (precision, recall, f1)
-}
-
-fn sigmoid_scalar(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
+#[path = "../common/mod.rs"]
+mod common;
+use common::{precision_recall_f1, sigmoid, sigmoid_scalar};
 
 fn parent_score(subj_table: &NdArray, obj_table: &NdArray, bias: f32, a: usize, b: usize, d: usize) -> f32 {
     let dot: f32 = (0..d).map(|k| subj_table.data[a * d + k] * obj_table.data[b * d + k]).sum();
     sigmoid_scalar(dot + bias)
-}
-
-fn sigmoid(tape: &mut Tape, x: Var) -> Var {
-    let neg_x = tape.scale(x, -1.0);
-    let exp_neg_x = tape.exp(neg_x);
-    let one = tape.leaf(NdArray::new(vec![1.0; tape.value(exp_neg_x).data.len()], tape.value(exp_neg_x).shape.clone()));
-    let denom = tape.add(one, exp_neg_x);
-    tape.div(one, denom)
 }
 
 fn pair_score(tape: &mut Tape, subj_emb: &Embedding, subj_table: Var, obj_emb: &Embedding, obj_table: Var, bias_var: Var, a_ids: &[usize], b_ids: &[usize]) -> Var {

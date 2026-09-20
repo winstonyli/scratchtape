@@ -1,10 +1,9 @@
-use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, TransformerBlock, TransformerBlockOut};
-use scratchtape::tape::{Tape, Var};
+use scratchtape::nn::{Embedding, LayerNorm, Linear, TransformerBlock};
 use std::fs;
 
-fn encode_bytes(text: &str) -> Vec<usize> {
-    text.bytes().map(|b| b as usize).collect()
-}
+#[path = "../common/mod.rs"]
+mod common;
+use common::{encode_bytes, eval_loss};
 
 const CORPUS_A: &str = "Shall I compare thee to a summer's day?\n\
 Thou art more lovely and more temperate.\n\
@@ -27,66 +26,6 @@ const VOCAB_SIZE: usize = 256;
 // backward), so it never needs these Vars for apply_grad the way
 // checkpoint_save.rs does with the otherwise-identical struct.
 #[allow(dead_code)]
-struct ForwardOut {
-    tok_out: EmbeddingOut,
-    pos_out: EmbeddingOut,
-    block_outs: Vec<TransformerBlockOut>,
-    ln_out: LayerNormOut,
-    proj_out: LinearOut,
-}
-
-fn forward(
-    tape: &mut Tape,
-    token_emb: &Embedding,
-    pos_emb: &Embedding,
-    blocks: &[TransformerBlock],
-    final_ln: &LayerNorm,
-    output_proj: &Linear,
-    input_ids: &[usize],
-) -> (Var, ForwardOut) {
-    let positions: Vec<usize> = (0..input_ids.len()).collect();
-    let tok_out = token_emb.forward(tape, input_ids);
-    let pos_out = pos_emb.forward(tape, &positions);
-    let mut x = tape.add(tok_out.y, pos_out.y);
-
-    let mut block_outs = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        let out = block.forward(tape, x);
-        x = out.y;
-        block_outs.push(out);
-    }
-
-    let ln_out = final_ln.forward(tape, x);
-    let proj_out = output_proj.forward(tape, ln_out.y);
-    let logits = proj_out.y;
-    (logits, ForwardOut { tok_out, pos_out, block_outs, ln_out, proj_out })
-}
-
-fn eval_loss(
-    token_emb: &Embedding,
-    pos_emb: &Embedding,
-    blocks: &[TransformerBlock],
-    final_ln: &LayerNorm,
-    output_proj: &Linear,
-    corpus: &[usize],
-    seq_len: usize,
-) -> f32 {
-    let mut total = 0.0f32;
-    let mut count = 0usize;
-    let mut start = 0;
-    while start + seq_len + 1 <= corpus.len() {
-        let input = &corpus[start..start + seq_len];
-        let target = &corpus[start + 1..start + seq_len + 1];
-        let mut tape = Tape::new();
-        let (logits, _) = forward(&mut tape, token_emb, pos_emb, blocks, final_ln, output_proj, input);
-        let loss = tape.cross_entropy(logits, target);
-        total += tape.value(loss).data[0];
-        count += 1;
-        start += seq_len;
-    }
-    total / count as f32
-}
-
 fn main() {
     let corpus_a = encode_bytes(CORPUS_A);
 

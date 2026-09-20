@@ -7,20 +7,14 @@
 // baseline, measuring both weight drift and forgetting for each -
 // answers "does drift track replay_prob monotonically" directly, in one
 // process, no per-value separate checkpoint files needed.
-use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
+use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
-use scratchtape::tape::{Tape, Var};
+use scratchtape::tape::Tape;
 use std::fs;
 
-fn encode_bytes(text: &str) -> Vec<usize> {
-    text.bytes().map(|b| b as usize).collect()
-}
-
-fn sample_window(rng: &mut Rng, corpus: &[usize], seq_len: usize) -> (Vec<usize>, Vec<usize>) {
-    let max_start = corpus.len() - seq_len - 1;
-    let start = (rng.next_f32() * max_start as f32) as usize;
-    (corpus[start..start + seq_len].to_vec(), corpus[start + 1..start + seq_len + 1].to_vec())
-}
+#[path = "../common/mod.rs"]
+mod common;
+use common::{apply_grad, encode_bytes, eval_loss, forward, sample_window};
 
 const CORPUS_A: &str = "Shall I compare thee to a summer's day?\n\
 Thou art more lovely and more temperate.\n\
@@ -42,85 +36,6 @@ const SEQ_LEN: usize = 16;
 const N_BLOCKS: usize = 2;
 const VOCAB_SIZE: usize = 256;
 const REPLAY_WINDOWS: usize = 8;
-
-struct ForwardOut {
-    tok_out: EmbeddingOut,
-    pos_out: EmbeddingOut,
-    block_outs: Vec<TransformerBlockOut>,
-    ln_out: LayerNormOut,
-    proj_out: LinearOut,
-}
-
-fn forward(
-    tape: &mut Tape,
-    token_emb: &Embedding,
-    pos_emb: &Embedding,
-    blocks: &[TransformerBlock],
-    final_ln: &LayerNorm,
-    output_proj: &Linear,
-    input_ids: &[usize],
-) -> (Var, ForwardOut) {
-    let positions: Vec<usize> = (0..input_ids.len()).collect();
-    let tok_out = token_emb.forward(tape, input_ids);
-    let pos_out = pos_emb.forward(tape, &positions);
-    let mut x = tape.add(tok_out.y, pos_out.y);
-
-    let mut block_outs = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        let out = block.forward(tape, x);
-        x = out.y;
-        block_outs.push(out);
-    }
-
-    let ln_out = final_ln.forward(tape, x);
-    let proj_out = output_proj.forward(tape, ln_out.y);
-    let logits = proj_out.y;
-    (logits, ForwardOut { tok_out, pos_out, block_outs, ln_out, proj_out })
-}
-
-fn apply_grad(
-    tape: &Tape,
-    out: &ForwardOut,
-    token_emb: &mut Embedding,
-    pos_emb: &mut Embedding,
-    blocks: &mut [TransformerBlock],
-    final_ln: &mut LayerNorm,
-    output_proj: &mut Linear,
-    opt: &Sgd,
-) {
-    token_emb.apply_grad(tape, &out.tok_out, opt);
-    pos_emb.apply_grad(tape, &out.pos_out, opt);
-    for (block, block_out) in blocks.iter_mut().zip(out.block_outs.iter()) {
-        block.apply_grad(tape, block_out, opt);
-    }
-    final_ln.apply_grad(tape, &out.ln_out, opt);
-    output_proj.apply_grad(tape, &out.proj_out, opt);
-}
-
-fn eval_loss(
-    token_emb: &Embedding,
-    pos_emb: &Embedding,
-    blocks: &[TransformerBlock],
-    final_ln: &LayerNorm,
-    output_proj: &Linear,
-    corpus: &[usize],
-    seq_len: usize,
-) -> f32 {
-    let mut total = 0.0f32;
-    let mut count = 0usize;
-    let mut start = 0;
-    while start + seq_len + 1 <= corpus.len() {
-        let input = &corpus[start..start + seq_len];
-        let target = &corpus[start + 1..start + seq_len + 1];
-        let mut tape = Tape::new();
-        let (logits, _) = forward(&mut tape, token_emb, pos_emb, blocks, final_ln, output_proj, input);
-        let loss = tape.cross_entropy(logits, target);
-        total += tape.value(loss).data[0];
-        count += 1;
-        start += seq_len;
-    }
-    total / count as f32
-}
 
 fn flat_of(token_emb: &Embedding, pos_emb: &Embedding, blocks: &[TransformerBlock], final_ln: &LayerNorm, output_proj: &Linear) -> Vec<f32> {
     let mut flat = token_emb.to_flat();

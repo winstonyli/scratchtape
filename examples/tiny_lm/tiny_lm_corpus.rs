@@ -1,4 +1,4 @@
-use scratchtape::nn::{Embedding, EmbeddingOut, LayerNorm, LayerNormOut, Linear, LinearOut, Rng, TransformerBlock, TransformerBlockOut};
+use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::{Adam, AdamState, Sgd};
 use scratchtape::tape::{Tape, Var};
 use scratchtape::tensor::NdArray;
@@ -6,25 +6,9 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Instant;
 
-fn encode_bytes(text: &str) -> Vec<usize> {
-    text.bytes().map(|b| b as usize).collect()
-}
-
-fn decode_bytes(ids: &[usize]) -> String {
-    let bytes: Vec<u8> = ids.iter().map(|&i| i as u8).collect();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-/// Fisher-Yates, same rng-driven-index style as kmeans's centroid picks.
-/// Used for the GNN k-fold split below - stratifying vowel/non-vowel
-/// indices separately needs each half shuffled independently before
-/// round-robin assignment into folds.
-fn shuffle(items: &mut [usize], rng: &mut Rng) {
-    for i in (1..items.len()).rev() {
-        let j = (rng.next_f32() * (i + 1) as f32) as usize;
-        items.swap(i, j);
-    }
-}
+#[path = "../common/mod.rs"]
+mod common;
+use common::{ForwardOut, apply_grad, decode_bytes, encode_bytes, precision_recall_f1, sample_window, shuffle};
 
 /// Stratified k-fold linear-probe comparison (frozen embedding-only vs
 /// graph-augmented with attention-graph neighbor mean), extracted from the
@@ -237,27 +221,6 @@ fn print_tree(tree: &Tree, indent: usize, positive_name: &str) {
     }
 }
 
-/// Precision/recall/F1 for a binary classifier's predictions against true
-/// labels - accuracy alone is a weak metric on these categories (most are
-/// under 15% positive, so majority-class accuracy is already high; a
-/// classifier that just predicts "not" every time still scores well on
-/// accuracy but has zero recall).
-fn precision_recall_f1(labels: &[usize], predictions: &[usize]) -> (f32, f32, f32) {
-    let (mut tp, mut fp, mut fn_) = (0, 0, 0);
-    for (&l, &p) in labels.iter().zip(predictions.iter()) {
-        match (l, p) {
-            (1, 1) => tp += 1,
-            (0, 1) => fp += 1,
-            (1, 0) => fn_ += 1,
-            _ => {}
-        }
-    }
-    let precision = if tp + fp == 0 { 0.0 } else { tp as f32 / (tp + fp) as f32 };
-    let recall = if tp + fn_ == 0 { 0.0 } else { tp as f32 / (tp + fn_) as f32 };
-    let f1 = if precision + recall == 0.0 { 0.0 } else { 2.0 * precision * recall / (precision + recall) };
-    (precision, recall, f1)
-}
-
 /// Typed knowledge-graph edge list: for a given relation predicate,
 /// `adj[i]` lists every `j` related to byte-index `i`. Reused across the
 /// three relation types (cluster, attention, embedding-NN) and their
@@ -296,12 +259,6 @@ fn bfs_reachable(start: usize, max_hops: usize, adj: &[Vec<usize>]) -> std::coll
         frontier = next_frontier;
     }
     visited
-}
-
-fn sample_window(rng: &mut Rng, corpus: &[usize], seq_len: usize) -> (Vec<usize>, Vec<usize>) {
-    let max_start = corpus.len() - seq_len - 1;
-    let start = (rng.next_f32() * max_start as f32) as usize;
-    (corpus[start..start + seq_len].to_vec(), corpus[start + 1..start + seq_len + 1].to_vec())
 }
 
 /// Plain Lloyd's k-means, post-hoc analysis only - duplicated from
@@ -358,14 +315,6 @@ fn kmeans(points: &[Vec<f32>], k: usize, iterations: usize, rng: &mut Rng) -> Ve
     assignments
 }
 
-struct ForwardOut {
-    tok_out: EmbeddingOut,
-    pos_out: EmbeddingOut,
-    block_outs: Vec<TransformerBlockOut>,
-    ln_out: LayerNormOut,
-    proj_out: LinearOut,
-}
-
 fn forward(
     tape: &mut Tape,
     token_emb: &Embedding,
@@ -400,25 +349,6 @@ fn forward(
     let proj_out = output_proj.forward(tape, ln_out.y);
     let logits = proj_out.y;
     (logits, ForwardOut { tok_out, pos_out, block_outs, ln_out, proj_out })
-}
-
-fn apply_grad(
-    tape: &Tape,
-    out: &ForwardOut,
-    token_emb: &mut Embedding,
-    pos_emb: &mut Embedding,
-    blocks: &mut [TransformerBlock],
-    final_ln: &mut LayerNorm,
-    output_proj: &mut Linear,
-    opt: &Sgd,
-) {
-    token_emb.apply_grad(tape, &out.tok_out, opt);
-    pos_emb.apply_grad(tape, &out.pos_out, opt);
-    for (block, block_out) in blocks.iter_mut().zip(out.block_outs.iter()) {
-        block.apply_grad(tape, block_out, opt);
-    }
-    final_ln.apply_grad(tape, &out.ln_out, opt);
-    output_proj.apply_grad(tape, &out.proj_out, opt);
 }
 
 /// Mean cross-entropy over `n_windows` random windows, no gradient update -

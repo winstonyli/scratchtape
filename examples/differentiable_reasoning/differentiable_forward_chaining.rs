@@ -43,39 +43,9 @@ use scratchtape::optim::Sgd;
 use scratchtape::tape::Tape;
 use scratchtape::tensor::NdArray;
 
-fn encode_bytes(text: &str) -> Vec<usize> {
-    text.bytes().map(|b| b as usize).collect()
-}
-
-fn shuffle(items: &mut [usize], rng: &mut Rng) {
-    for i in (1..items.len()).rev() {
-        let j = (rng.next_f32() * (i + 1) as f32) as usize;
-        items.swap(i, j);
-    }
-}
-
-/// Precision/recall/F1 for a binary classifier's predictions against true
-/// labels - same reasoning as tiny_lm_corpus.rs's identical helper: most
-/// of these categories are well under 50% positive, so accuracy alone
-/// can hide a rule that never fires correctly (high accuracy, zero
-/// recall).
-fn precision_recall_f1(labels: &[usize], predictions: &[usize]) -> (f32, f32, f32) {
-    let mut tp = 0;
-    let mut fp = 0;
-    let mut fn_ = 0;
-    for i in 0..labels.len() {
-        match (predictions[i], labels[i]) {
-            (1, 1) => tp += 1,
-            (1, 0) => fp += 1,
-            (0, 1) => fn_ += 1,
-            _ => {}
-        }
-    }
-    let precision = if tp + fp == 0 { 0.0 } else { tp as f32 / (tp + fp) as f32 };
-    let recall = if tp + fn_ == 0 { 0.0 } else { tp as f32 / (tp + fn_) as f32 };
-    let f1 = if precision + recall == 0.0 { 0.0 } else { 2.0 * precision * recall / (precision + recall) };
-    (precision, recall, f1)
-}
+#[path = "../common/mod.rs"]
+mod common;
+use common::{encode_bytes, precision_recall_f1, shuffle, sigmoid};
 
 /// Symmetric co-occurrence counts between distinct byte VALUES (not
 /// positions) within `window` positions of each other in the corpus.
@@ -135,14 +105,6 @@ fn hard_majority_vote(labels: &[usize], related: impl Fn(usize, usize) -> bool, 
             if pos > neg { 1 } else { 0 }
         })
         .collect()
-}
-
-fn sigmoid(tape: &mut Tape, x: scratchtape::tape::Var) -> scratchtape::tape::Var {
-    let neg_x = tape.scale(x, -1.0);
-    let exp_neg_x = tape.exp(neg_x);
-    let one = tape.leaf(NdArray::new(vec![1.0; tape.value(exp_neg_x).data.len()], tape.value(exp_neg_x).shape.clone()));
-    let denom = tape.add(one, exp_neg_x);
-    tape.div(one, denom)
 }
 
 /// Fits w_short/w_long/bias by gradient descent on the train fold, then
