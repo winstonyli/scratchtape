@@ -24,7 +24,7 @@ use std::time::Instant;
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{apply_grad, encode_bytes, eval_loss, forward, sample_window};
+use common::{apply_grad, encode_bytes, eval_loss, flatten_all, forward, reconstruct, sample_window};
 
 fn train(
     rng: &mut Rng,
@@ -48,41 +48,6 @@ fn train(
     }
 }
 
-fn flatten_all(
-    token_emb: &Embedding,
-    pos_emb: &Embedding,
-    blocks: &[TransformerBlock],
-    final_ln: &LayerNorm,
-    output_proj: &Linear,
-) -> Vec<f32> {
-    let mut flat = token_emb.to_flat();
-    flat.extend(pos_emb.to_flat());
-    for block in blocks {
-        flat.extend(block.to_flat());
-    }
-    flat.extend(final_ln.to_flat());
-    flat.extend(output_proj.to_flat());
-    flat
-}
-
-fn reconstruct(
-    flat: &[f32],
-    vocab_size: usize,
-    d_model: usize,
-    seq_len: usize,
-    n_blocks: usize,
-    n_heads: usize,
-    d_ff: usize,
-) -> (Embedding, Embedding, Vec<TransformerBlock>, LayerNorm, Linear) {
-    let mut offset = 0usize;
-    let token_emb = Embedding::from_flat(flat, &mut offset, vocab_size, d_model);
-    let pos_emb = Embedding::from_flat(flat, &mut offset, seq_len, d_model);
-    let blocks = (0..n_blocks).map(|_| TransformerBlock::from_flat(flat, &mut offset, d_model, n_heads, d_ff)).collect();
-    let final_ln = LayerNorm::from_flat(flat, &mut offset, d_model);
-    let output_proj = Linear::from_flat(flat, &mut offset, d_model, vocab_size);
-    assert_eq!(offset, flat.len(), "flat vector had leftover/missing floats - architecture mismatch");
-    (token_emb, pos_emb, blocks, final_ln, output_proj)
-}
 
 /// new=trained weights, old=pre-phase snapshot. alpha is the fraction of
 /// THIS phase's training that survives; (1-alpha) is pulled back toward

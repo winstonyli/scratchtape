@@ -213,3 +213,33 @@ pub fn composition(buffer: &[(&'static str, Vec<usize>, Vec<usize>)]) -> String 
     }
     counts.iter().map(|(l, c)| format!("{c}x{l}")).collect::<Vec<_>>().join(", ")
 }
+
+/// Concatenates every parameter into one flat vector, fixed order
+/// (token_emb, pos_emb, blocks..., final_ln, output_proj) - the same
+/// order `reconstruct` below expects. Second real consumer
+/// (memory_tier_multigen_diverse_consolidate.rs and
+/// memory_tier_multigen_diverse_consolidate_fisher.rs) is what promoted
+/// this out of being copy-pasted between them.
+pub fn flatten_all(token_emb: &Embedding, pos_emb: &Embedding, blocks: &[TransformerBlock], final_ln: &LayerNorm, output_proj: &Linear) -> Vec<f32> {
+    let mut flat = token_emb.to_flat();
+    flat.extend(pos_emb.to_flat());
+    for block in blocks {
+        flat.extend(block.to_flat());
+    }
+    flat.extend(final_ln.to_flat());
+    flat.extend(output_proj.to_flat());
+    flat
+}
+
+/// Inverse of flatten_all - rebuilds each component from its slice of
+/// the flat vector, in the same fixed order.
+pub fn reconstruct(flat: &[f32], vocab_size: usize, d_model: usize, seq_len: usize, n_blocks: usize, n_heads: usize, d_ff: usize) -> (Embedding, Embedding, Vec<TransformerBlock>, LayerNorm, Linear) {
+    let mut offset = 0usize;
+    let token_emb = Embedding::from_flat(flat, &mut offset, vocab_size, d_model);
+    let pos_emb = Embedding::from_flat(flat, &mut offset, seq_len, d_model);
+    let blocks = (0..n_blocks).map(|_| TransformerBlock::from_flat(flat, &mut offset, d_model, n_heads, d_ff)).collect();
+    let final_ln = LayerNorm::from_flat(flat, &mut offset, d_model);
+    let output_proj = Linear::from_flat(flat, &mut offset, d_model, vocab_size);
+    assert_eq!(offset, flat.len(), "flat vector had leftover/missing floats - architecture mismatch");
+    (token_emb, pos_emb, blocks, final_ln, output_proj)
+}
