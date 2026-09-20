@@ -106,6 +106,10 @@ name = "softmax1_comparison"
 path = "examples/alternative_mechanisms/softmax1_comparison.rs"
 
 [[example]]
+name = "softmax1_divergence_diagnosis"
+path = "examples/alternative_mechanisms/softmax1_divergence_diagnosis.rs"
+
+[[example]]
 name = "predictive_coding"
 path = "examples/alternative_mechanisms/predictive_coding.rs"
 

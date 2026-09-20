@@ -82,6 +82,23 @@ shape directly rather than citing it), `softmax1_comparison.rs`
 later, diverged regardless of learning rate, reverted; the mechanism
 itself is kept as an opt-in `TransformerBlock::forward_full` flag).
 
+That divergence was originally parked with a guess ("same failure
+class as the PC-precision instabilities") never actually tested -
+`softmax1_divergence_diagnosis.rs` tested it directly by instrumenting
+a real run instead of citing the comparison. The guess was wrong: this
+isn't a discontinuous warm-up jump like PC's (no smooth ramp would fix
+it). It's a continuous, accelerating runaway from step 0 — block0's
+Q/K weight norms and their own gradient grow together (confirmed via a
+side-by-side run against plain softmax from identical seeds: plain
+softmax's Q/K gradient stays bounded for 2000+ steps, softmax1's
+accelerates from ~6 to ~195 before NaN at step 775). One clean
+candidate explanation for *why* softmax1 lacks plain softmax's
+self-limiting saturation — the local derivative of the max-attention-
+weight term — was checked by direct calculation and is identical for
+both variants, ruling it out rather than confirming it; the real
+mechanism is a multi-layer effect (softmax1's variable row-sum
+interacting with the residual stream) not fully decomposed here.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data
