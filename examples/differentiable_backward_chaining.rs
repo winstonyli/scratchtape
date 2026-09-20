@@ -59,6 +59,28 @@
 // RECOVERED parent_score, which it was never directly supervised on,
 // actually match the 10 true parent facts - or did it find some other,
 // non-veridical way to satisfy the observed 2-hop constraints?
+//
+// Phase 4: tests the literature's own named fix for phase 3's failure -
+// "propagating loss across a beam of top-k proof paths" instead of
+// greedy single-path max. Implemented as beam_or: a softmax-weighted
+// average over candidates (needs zero new tape primitives - just
+// existing softmax+mul+sum_last_axis composed together), so every near-
+// winning candidate gets gradient each step, not only the current
+// argmax. Result: it doesn't fix check 2 - still 0/0/0 recovering the
+// true facts, and at temperature=0.5 it hallucinates MORE spurious
+// relations than phase 3's hard max did (22 vs 7), not fewer. A much
+// sharper temperature (0.05, close to hard max) was also tried and
+// collapsed differently - it failed even the TRAINED objective (check 1
+// also 0/0/0), suggesting numerical/optimization sensitivity at that
+// extreme rather than a cleaner result. The honest reading: beam/soft-OR
+// is a fix for greedy-max's OPTIMIZATION pathology (getting stuck in a
+// bad local minimum during search) - it is not a fix for this task's
+// actual problem, which is INFORMATION-theoretic: existence-only
+// supervision ("some y satisfies this" - never which y) genuinely
+// underdetermines the base relation among several equally-consistent
+// alternatives, and no amount of smoothing the aggregation function can
+// inject bridge-identity information that was never in the training
+// signal to begin with.
 use scratchtape::nn::{Embedding, Rng};
 use scratchtape::optim::{Adam, AdamState};
 use scratchtape::tape::Tape;
@@ -126,16 +148,15 @@ fn pair_score(
     sigmoid(tape, logit)
 }
 
-/// The differentiable OR/AND modules, batched over a whole query set at
-/// once: for each of the n entities as a candidate Y, computes
-/// parent_score(x,y)*parent_score(y,z) (AND-module - product of both
-/// atoms) as one column, concatenates all n candidates' columns
-/// (Tape::concat, along the last axis - exactly what it's for), then
-/// max_last_axis picks the best candidate PER QUERY ROW (OR-module -
-/// existential search over Y) - differentiably, so gradient reaches
-/// every candidate's embeddings during training, not just whichever one
-/// happens to win on a given step.
-fn batched_grandparent_score(
+/// The AND-module, batched over a whole query set and every candidate Y
+/// at once: for each of the n entities as a candidate, computes
+/// parent_score(x,y)*parent_score(y,z) (product of both atoms) as one
+/// column, concatenates all n candidates' columns (Tape::concat, along
+/// the last axis - exactly what it's for) into one [q, n] matrix. The
+/// OR-module (how to reduce across candidates) is deliberately a
+/// separate step - see max_or/beam_or below, both consume this same
+/// matrix.
+fn candidate_scores(
     tape: &mut Tape,
     subj_emb: &Embedding,
     subj_table: scratchtape::tape::Var,
@@ -154,8 +175,33 @@ fn batched_grandparent_score(
         let s2 = pair_score(tape, subj_emb, subj_table, obj_emb, obj_table, bias_var, &y_ids, zs);
         columns.push(tape.mul(s1, s2));
     }
-    let all_scores = tape.concat(&columns);
-    tape.max_last_axis(all_scores)
+    tape.concat(&columns)
+}
+
+/// OR-module v1: hard max over candidates (phase 3's version, kept for
+/// comparison) - existential search over Y, but only the single winning
+/// candidate gets any gradient each step.
+fn max_or(tape: &mut Tape, scores: scratchtape::tape::Var) -> scratchtape::tape::Var {
+    tape.max_last_axis(scores)
+}
+
+/// OR-module v2 (phase 4): a smooth "beam" relaxation of top-k proof
+/// supervision - the literature's own named fix for greedy-max's local
+/// minima (see differentiable_backward_chaining.rs's phase 3 doc
+/// comment). Needs no new tape primitive at all: a softmax-weighted
+/// average over candidates (attention over proof paths, closer to how
+/// Conditional Theorem Provers replace exhaustive enumeration with
+/// attention-based clause selection) is just existing softmax + mul +
+/// sum_last_axis composed together - every near-winning candidate gets
+/// gradient proportional to its weight, not just whichever one is
+/// currently ahead. `temperature` controls how close to hard-max this
+/// gets: low temperature sharpens toward max_or, high temperature
+/// spreads weight more broadly across all n candidates.
+fn beam_or(tape: &mut Tape, scores: scratchtape::tape::Var, temperature: f32) -> scratchtape::tape::Var {
+    let scaled = tape.scale(scores, 1.0 / temperature);
+    let weights = tape.softmax(scaled);
+    let weighted = tape.mul(scores, weights);
+    tape.sum_last_axis(weighted)
 }
 
 fn main() {
@@ -359,7 +405,8 @@ fn main() {
         let obj_table_var = tape.leaf(obj_emb3.table.clone());
         let bias_var = tape.leaf(bias3.clone());
 
-        let proof = batched_grandparent_score(&mut tape, &subj_emb3, subj_table_var, &obj_emb3, obj_table_var, bias_var, &gp_xs, &gp_zs, n);
+        let scores = candidate_scores(&mut tape, &subj_emb3, subj_table_var, &obj_emb3, obj_table_var, bias_var, &gp_xs, &gp_zs, n);
+        let proof = max_or(&mut tape, scores);
 
         let one = tape.leaf(NdArray::new(vec![1.0; q], vec![q, 1]));
         let y = tape.leaf(NdArray::new(gp_labels.clone(), vec![q, 1]));
@@ -420,6 +467,92 @@ fn main() {
     println!("  (facts it inferred as `parent` that were never directly supervised:)");
     for i in 0..n_pairs {
         if recovered_predictions[i] == 1 {
+            let matches_truth = if fact_labels_usize[i] == 1 { "true parent fact" } else { "NOT a true parent fact" };
+            println!("    parent({}, {}) - {matches_truth}", names[subj_ids[i]], names[obj_ids[i]]);
+        }
+    }
+
+    // Phase 4: same setup as phase 3 (fresh embeddings, only grandparent
+    // supervision, never shown a `parent` fact directly) but with beam_or
+    // instead of max_or - does spreading gradient across every near-
+    // winning candidate, not just the single argmax, actually fix what
+    // phase 3 got wrong?
+    println!("\nphase 4: same as phase 3, but beam_or (softmax-weighted, temperature=0.5) instead of hard max_or");
+    let mut rng4 = Rng::new(1);
+    let mut subj_emb4 = Embedding::new(&mut rng4, n, d);
+    let mut obj_emb4 = Embedding::new(&mut rng4, n, d);
+    let mut bias4 = NdArray::new(vec![0.0], vec![1, 1]);
+    let adam4 = Adam { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 };
+    let mut subj_state4 = AdamState::zeros_like(&subj_emb4.table);
+    let mut obj_state4 = AdamState::zeros_like(&obj_emb4.table);
+    let mut bias_state4 = AdamState::zeros_like(&bias4);
+    let temperature = 0.5;
+
+    let steps4 = 2000;
+    for step in 0..steps4 {
+        let mut tape = Tape::new();
+        let subj_table_var = tape.leaf(subj_emb4.table.clone());
+        let obj_table_var = tape.leaf(obj_emb4.table.clone());
+        let bias_var = tape.leaf(bias4.clone());
+
+        let scores = candidate_scores(&mut tape, &subj_emb4, subj_table_var, &obj_emb4, obj_table_var, bias_var, &gp_xs, &gp_zs, n);
+        let proof = beam_or(&mut tape, scores, temperature);
+
+        let one = tape.leaf(NdArray::new(vec![1.0; q], vec![q, 1]));
+        let y = tape.leaf(NdArray::new(gp_labels.clone(), vec![q, 1]));
+        let eps = tape.leaf(NdArray::new(vec![1e-6; q], vec![q, 1]));
+        let proof_eps = tape.add(proof, eps);
+        let one_minus_proof = tape.sub(one, proof);
+        let one_minus_proof_eps = tape.add(one_minus_proof, eps);
+        let one_minus_y = tape.sub(one, y);
+        let log_p = tape.log(proof_eps);
+        let log_one_minus_p = tape.log(one_minus_proof_eps);
+        let term1 = tape.mul(y, log_p);
+        let term2 = tape.mul(one_minus_y, log_one_minus_p);
+        let sum_terms = tape.add(term1, term2);
+        let neg_mean = tape.scale(sum_terms, -1.0 / q as f32);
+        let loss = tape.sum(neg_mean);
+
+        tape.backward(loss);
+        adam4.step(&mut subj_emb4.table, tape.grad(subj_table_var).unwrap(), &mut subj_state4);
+        adam4.step(&mut obj_emb4.table, tape.grad(obj_table_var).unwrap(), &mut obj_state4);
+        adam4.step(&mut bias4, tape.grad(bias_var).unwrap(), &mut bias_state4);
+
+        if step % 200 == 0 {
+            println!("  phase 4 step {step:>4}: loss = {:.4}", tape.value(loss).data[0]);
+        }
+    }
+
+    let mut gp_predictions4 = vec![0usize; q];
+    for i in 0..q {
+        let mut best = 0.0f32;
+        for y in 0..n {
+            if y == gp_xs[i] || y == gp_zs[i] {
+                continue;
+            }
+            let s = parent_score(&subj_emb4.table, &obj_emb4.table, bias4.data[0], gp_xs[i], y, d)
+                * parent_score(&subj_emb4.table, &obj_emb4.table, bias4.data[0], y, gp_zs[i], d);
+            if s > best {
+                best = s;
+            }
+        }
+        gp_predictions4[i] = if best > 0.5 { 1 } else { 0 };
+    }
+    let (gp_p4, gp_r4, gp_f14) = precision_recall_f1(&gp_labels_usize, &gp_predictions4);
+    println!("phase 4 check 1 - the trained objective (grandparent prediction): precision={gp_p4:.3} recall={gp_r4:.3} f1={gp_f14:.3}");
+
+    let mut recovered_predictions4 = vec![0usize; n_pairs];
+    for i in 0..n_pairs {
+        let s = parent_score(&subj_emb4.table, &obj_emb4.table, bias4.data[0], subj_ids[i], obj_ids[i], d);
+        recovered_predictions4[i] = if s > 0.5 { 1 } else { 0 };
+    }
+    let (rp4, rr4, rf14) = precision_recall_f1(&fact_labels_usize, &recovered_predictions4);
+    println!(
+        "phase 4 check 2 - did it recover the TRUE `parent` facts as a byproduct: precision={rp4:.3} recall={rr4:.3} f1={rf14:.3}"
+    );
+    println!("  (facts it inferred as `parent` that were never directly supervised:)");
+    for i in 0..n_pairs {
+        if recovered_predictions4[i] == 1 {
             let matches_truth = if fact_labels_usize[i] == 1 { "true parent fact" } else { "NOT a true parent fact" };
             println!("    parent({}, {}) - {matches_truth}", names[subj_ids[i]], names[obj_ids[i]]);
         }
