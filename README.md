@@ -133,18 +133,21 @@ layer's `apply_grad` was hardcoded to `Sgd` even though Adam had grown
 abstraction - fixed with an `Optimizer` trait unifying both behind
 `Linear::apply_grad_with`.
 
+`Linear`/`Embedding`/`LayerNorm::forward()` used to leaf a fresh copy of
+their parameters on every call, so reusing one layer across multiple
+`forward()` calls in a single tape (RNN/SSM-style weight tying) silently
+dropped gradient contributions — real enough that `ssm_recall.rs` had to
+work around it by hand. Fixed: each layer now has a `forward_shared`
+taking pre-leafed `Var`s for tied reuse, and `apply_grad` panics instead
+of silently computing a partial gradient if it's ever called with a
+stale output from before a later `forward()` call.
+
 ## Open threads
 
 - **A persistent, on-device GPU training backend** — the current GPU
   kernel is correct but pays a full host round-trip per call, which is
   why it doesn't win at this model's scale. Scoped as its own
   multi-day project, not a small addition.
-- **Weight-tied layer reuse within one tape** — `Linear`/`Embedding`/
-  `LayerNorm::forward()` leaf a fresh copy per call, so reusing one
-  layer across multiple `forward()` calls in a single tape (RNN/SSM-
-  style weight tying) silently drops gradient contributions unless
-  worked around manually (`ssm_recall.rs` already does). Documented as
-  a footgun at the source; not fixed there yet.
 
 ## A note on the name
 
