@@ -92,6 +92,41 @@ crate); `memory_tier_save.rs`/`memory_tier_load.rs`/
 separate process can resume replay-mitigated training, then diffing the
 resulting weights layer-by-layer against a no-replay control.
 
+Diffing weights instead of just loss surfaced a counter-intuitive
+result: replay causes *more* overall L2 drift from the phase-1
+baseline than no-replay (+12.2%), not less — only `LayerNorm` shows the
+naive "protection" pattern. `memory_tier_sweep.rs` followed up by
+sweeping `replay_prob` from a single loaded baseline: drift turns out
+to be a threshold effect, not a dial (flat from 0.05 to 0.50; forgetting
+drops sharply the moment *any* replay exists and barely improves with
+more of it), and the one setting that does slash drift (`1.0`, training
+on nothing but the 8-window snapshot) does it by failing to learn the
+new corpus at all, not by protecting the old one. `memory_tier_multigen.rs`
+extended this to a 4-corpus sequence with a half-life replay-curation
+policy and found even actively-replayed corpora can still forget almost
+completely once corpora start competing for a fixed 8-window budget,
+and that learning each new task gets *harder* as generations
+accumulate — replay isn't free.
+
+All of the above ran at toy scale (`d_model=32`, 4-line nursery-rhyme
+corpora). `memory_tier_multigen_scaled.rs` reran the same 4-corpus
+multigen setup at `tiny_lm_corpus.rs`'s real scale (`d_model=128`,
+Aesop's Fables) — but split one book into 4 contiguous quarters instead
+of using distinct texts, and found essentially *no* forgetting: every
+phase's loss on earlier "corpora" stayed flat or improved, since all
+four quarters share the same vocabulary and register. Swapping in 4
+genuinely different real texts (`memory_tier_multigen_diverse.rs`:
+Aesop's Fables, Sherlock Holmes, *On the Origin of Species*, *Leaves of
+Grass*) restored real forgetting — mild (~0.1-0.4 loss drift), nowhere
+near the toy demo's ~8x blowup. A no-replay control
+(`memory_tier_multigen_diverse_no_replay.rs`) then closed the loop:
+budget=8 replay made no measurable difference at this scale, so the
+mildness is saturation (real prose shares enough universal byte-level
+structure that there's a floor to how much any phase can forget), not
+replay mitigation — 8 fixed windows replayed 15% of the time is a
+negligible fraction of a ~59KB corpus, unlike the toy case where it
+covered a real share of the whole task.
+
 **`tiny_lm_corpus.rs`** is the project's largest and most-iterated file
 by far — a byte-level LM plus an extended symbolic/KR&R (knowledge
 representation & reasoning) investigation built on top of it:
