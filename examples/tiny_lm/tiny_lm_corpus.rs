@@ -371,11 +371,32 @@ fn forward_full(
 /// (loss on text the model never trained on), and separately on the train
 /// region for a directly comparable in-sample number.
 fn eval_loss(rng: &mut Rng, token_emb: &Embedding, pos_emb: &Embedding, blocks: &[TransformerBlock], final_ln: &LayerNorm, output_proj: &Linear, corpus: &[usize], seq_len: usize, n_windows: usize) -> f32 {
+    eval_loss_full(rng, token_emb, pos_emb, blocks, final_ln, output_proj, corpus, seq_len, n_windows, false, false)
+}
+
+/// Same as eval_loss, plus softmax1/QK-norm switches threaded through to
+/// forward_full - a model trained under those flags must be EVALUATED
+/// under them too, same reasoning as attention_graph_full. Existing callers
+/// stay on eval_loss (plain softmax, no QK-norm), unaffected.
+fn eval_loss_full(
+    rng: &mut Rng,
+    token_emb: &Embedding,
+    pos_emb: &Embedding,
+    blocks: &[TransformerBlock],
+    final_ln: &LayerNorm,
+    output_proj: &Linear,
+    corpus: &[usize],
+    seq_len: usize,
+    n_windows: usize,
+    use_softmax1: bool,
+    use_qknorm: bool,
+) -> f32 {
     let mut total = 0.0;
     for _ in 0..n_windows {
         let (input, target) = sample_window(rng, corpus, seq_len);
         let mut tape = Tape::new();
-        let (logits, _) = forward(&mut tape, token_emb, pos_emb, blocks, final_ln, output_proj, &input);
+        let (logits, _) =
+            forward_full(&mut tape, token_emb, pos_emb, blocks, final_ln, output_proj, &input, use_softmax1, use_qknorm);
         let loss = tape.cross_entropy(logits, &target);
         total += tape.value(loss).data[0];
     }
@@ -1592,43 +1613,41 @@ fn main() {
     // Revisits the frequency-sink theory ([f30c608]) against softmax1+QK-norm,
     // now that QK-norm is proven ([e9d5721]) to eliminate the exact runaway
     // the original softmax1 attempt ([d54c8f2]) hit on this same
-    // TransformerBlock architecture - that attempt never got to test whether
-    // softmax1 actually helps the sink, only that it diverged. Closes the
-    // loop on a real, corpus-scale model rather than the standalone
-    // CustomBlock the fix was originally proven in. Same controlled-
-    // comparison rigor as that diagnosis: identical seed/data/step count,
-    // varying only use_softmax1+use_qknorm together (the fix requires both -
-    // softmax1 alone is the known-divergent condition), fresh seed (4, unused
-    // above) so this isn't confounded with the cross-seed clustering/
-    // attention-graph checks already run on seeds 1-3. Concurrent via
-    // thread::scope, same reasoning as the 3-seed run above.
-    println!("\nrevisiting the frequency-sink theory: softmax1+QK-norm vs plain softmax, identical seed/data/steps...");
+    // TransformerBlock architecture. The first pass at this (single seed 4)
+    // found a diversity increase but left two things unchecked - exactly the
+    // gap this project's own methodology already flagged once before:
+    // ccd411e found single-seed attention-graph findings (like the original
+    // 'a'-sink itself) can be seed-arbitrary, not real structure, so a
+    // single-seed comparison here proves nothing on its own; and nothing
+    // measured whether the fix costs or helps actual language-modeling
+    // quality, only that it doesn't diverge and reshapes attention. Three
+    // fresh seeds (4,5,6 - unused by the seeds-1-3 clustering/attention-graph
+    // cross-seed checks above, so this replication is fully independent of
+    // them), each trained as a control/treatment pair from identical
+    // seed+data+steps, varying only use_softmax1+use_qknorm together (the
+    // fix requires both - softmax1 alone is the known-divergent condition).
+    // All 6 runs concurrent via thread::scope, same reasoning as the 3-seed
+    // run above.
+    println!("\nrevisiting the frequency-sink theory across 3 fresh seeds: softmax1+QK-norm vs plain softmax, identical seed/data/steps per pair...");
     let qknorm_wall_clock_start = Instant::now();
-    let (control_model, treatment_model) = thread::scope(|scope| {
-        let control_handle = scope.spawn(|| {
-            train_token_embedding_full(4, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps, false, false)
-        });
-        let treatment_handle = scope.spawn(|| {
-            train_token_embedding_full(4, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps, true, true)
-        });
-        (control_handle.join().unwrap(), treatment_handle.join().unwrap())
+    let qknorm_seeds = [4u64, 5, 6];
+    let (control_models, treatment_models): (Vec<TrainedModel>, Vec<TrainedModel>) = thread::scope(|scope| {
+        let handles: Vec<_> = qknorm_seeds
+            .iter()
+            .map(|&seed| {
+                let control = scope.spawn(move || {
+                    train_token_embedding_full(seed, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps, false, false)
+                });
+                let treatment = scope.spawn(move || {
+                    train_token_embedding_full(seed, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps, true, true)
+                });
+                (control, treatment)
+            })
+            .collect();
+        handles.into_iter().map(|(c, t)| (c.join().unwrap(), t.join().unwrap())).unzip()
     });
-    println!("control + treatment trained in {:.1}s wall-clock", qknorm_wall_clock_start.elapsed().as_secs_f32());
+    println!("all {} control+treatment pairs trained in {:.1}s wall-clock", qknorm_seeds.len(), qknorm_wall_clock_start.elapsed().as_secs_f32());
 
-    // Analyzed under the SAME flags each was trained with - plain forward()
-    // on the treatment model would silently measure plain-softmax behavior
-    // applied to softmax1/QK-norm-trained parameters, not what the model
-    // actually does.
-    let (control_graph, _) = attention_graph_full(&control_model, train, &filtered_bytes, seq_len, attn_windows, 777, false, false);
-    let (treatment_graph, _) =
-        attention_graph_full(&treatment_model, train, &filtered_bytes, seq_len, attn_windows, 777, true, true);
-
-    // Same two facets of "sink" already reported above for the primary run:
-    // how many bytes default to the specific byte ('a') repeatedly named as
-    // the sink target across this investigation, and how many distinct
-    // bytes get chosen as anyone's top-1 target at all (a sink-dominated
-    // graph collapses onto few distinct targets; less sink behavior spreads
-    // top-1 targets across more of them).
     let sink_idx = filtered_bytes.iter().position(|&b| b == b'a' as usize);
     let count_top1_target = |graph: &[Vec<(usize, f32)>], target_idx: usize| {
         graph.iter().filter(|targets| targets.first().map(|&(j, _)| j) == Some(target_idx)).count()
@@ -1639,13 +1658,57 @@ fn main() {
         targets.dedup();
         targets.len()
     };
-    println!("\nfrequency-sink comparison (top-1 attention target per byte, block 0 head 0, {} filtered bytes):", filtered_bytes.len());
-    if let Some(idx) = sink_idx {
-        println!("  bytes defaulting to 'a' as top-1 target - plain softmax: {}, softmax1+QK-norm: {}",
-            count_top1_target(&control_graph, idx), count_top1_target(&treatment_graph, idx));
-    } else {
-        println!("  'a' was excluded as noise this run - skipping the named-sink count");
+
+    println!(
+        "\nper-seed comparison (train loss | held-out loss | distinct top-1 targets of {} | bytes defaulting to 'a'):",
+        filtered_bytes.len()
+    );
+    let mut diversity_deltas = Vec::with_capacity(qknorm_seeds.len());
+    let mut held_out_deltas = Vec::with_capacity(qknorm_seeds.len());
+    for (i, &seed) in qknorm_seeds.iter().enumerate() {
+        let (control, treatment) = (&control_models[i], &treatment_models[i]);
+        // Fresh eval rng per model/corpus combination, same convention
+        // train_with_diagnostics's own periodic eval already uses -
+        // n_windows=20 matches that call's own sample size.
+        let control_train_loss =
+            eval_loss_full(&mut Rng::new(seed), &control.token_emb, &control.pos_emb, &control.blocks, &control.final_ln, &control.output_proj, train, seq_len, 20, false, false);
+        let control_held_out_loss =
+            eval_loss_full(&mut Rng::new(seed), &control.token_emb, &control.pos_emb, &control.blocks, &control.final_ln, &control.output_proj, held_out, seq_len, 20, false, false);
+        let treatment_train_loss =
+            eval_loss_full(&mut Rng::new(seed), &treatment.token_emb, &treatment.pos_emb, &treatment.blocks, &treatment.final_ln, &treatment.output_proj, train, seq_len, 20, true, true);
+        let treatment_held_out_loss =
+            eval_loss_full(&mut Rng::new(seed), &treatment.token_emb, &treatment.pos_emb, &treatment.blocks, &treatment.final_ln, &treatment.output_proj, held_out, seq_len, 20, true, true);
+
+        // Analyzed under the SAME flags each was trained with - plain
+        // forward() on the treatment model would silently measure
+        // plain-softmax behavior applied to softmax1/QK-norm-trained
+        // parameters, not what the model actually does.
+        let (control_graph, _) = attention_graph_full(control, train, &filtered_bytes, seq_len, attn_windows, 777, false, false);
+        let (treatment_graph, _) = attention_graph_full(treatment, train, &filtered_bytes, seq_len, attn_windows, 777, true, true);
+        let (control_diversity, treatment_diversity) = (distinct_top1_targets(&control_graph), distinct_top1_targets(&treatment_graph));
+        let (control_sink, treatment_sink) =
+            sink_idx.map_or((0, 0), |idx| (count_top1_target(&control_graph, idx), count_top1_target(&treatment_graph, idx)));
+
+        println!(
+            "  seed {seed} control:   {control_train_loss:.4} | {control_held_out_loss:.4} | {control_diversity} | {control_sink}"
+        );
+        println!(
+            "  seed {seed} treatment: {treatment_train_loss:.4} | {treatment_held_out_loss:.4} | {treatment_diversity} | {treatment_sink}"
+        );
+        diversity_deltas.push(treatment_diversity as i32 - control_diversity as i32);
+        held_out_deltas.push(treatment_held_out_loss - control_held_out_loss);
     }
-    println!("  distinct bytes chosen as anyone's top-1 target - plain softmax: {}, softmax1+QK-norm: {} (of {} possible)",
-        distinct_top1_targets(&control_graph), distinct_top1_targets(&treatment_graph), filtered_bytes.len());
+
+    // The actual replication check: does the diversity increase found on
+    // seed 4 alone hold up, or was it that one seed's own noise (the
+    // ccd411e concern this rerun exists to address)? And separately, does
+    // the fix cost anything in held-out loss, the question the first pass
+    // never asked at all.
+    let seeds_with_higher_diversity = diversity_deltas.iter().filter(|&&d| d > 0).count();
+    let mean_diversity_delta = diversity_deltas.iter().sum::<i32>() as f32 / diversity_deltas.len() as f32;
+    let mean_held_out_delta = held_out_deltas.iter().sum::<f32>() / held_out_deltas.len() as f32;
+    println!(
+        "\ncross-seed summary: {seeds_with_higher_diversity} of {} seeds show higher top-1-target diversity under softmax1+QK-norm (mean delta {mean_diversity_delta:+.1}); mean held-out loss delta (treatment - control) {mean_held_out_delta:+.4}",
+        qknorm_seeds.len()
+    );
 }

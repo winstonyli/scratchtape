@@ -122,6 +122,22 @@ to 68 (of 92) under softmax1+QK-norm — attention spreading across more
 distinct targets instead of concentrating, real evidence for the
 original theory on the model it was always about.
 
+That first pass used one seed — the same shape of claim this project's
+own methodology already flagged as unreliable ([ccd411e] found the
+original single-seed 'a'-sink itself was seed-arbitrary), and never
+checked whether the fix costs anything in modeling quality. Reran with
+3 fresh seeds, each a control/treatment pair from identical seed/data/
+steps: the diversity result replicates cleanly (3 of 3 seeds higher,
+48→68/48→68/44→72, mean +22.7) — real, seed-stable structure. But it
+isn't free: held-out loss is consistently worse under softmax1+QK-norm
+on every seed (mean delta +0.216 nats). The fix does what it was
+designed to do — attention stops concentrating onto a small shared
+set — but at this matched step count that costs real modeling quality,
+not a free improvement. Left open: whether that gap is a step-budget
+confound (this project's own 2x-model-scale precedent closed almost
+its entire gap once given proportionally more steps) or a genuine
+tradeoff intrinsic to the mechanism.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data
