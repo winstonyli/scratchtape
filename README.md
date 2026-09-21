@@ -107,6 +107,21 @@ a full 2000-step run with zero divergence, Q/K weight norm and gradient
 both staying flat the whole time, against the same setup's step-775 NaN
 without it.
 
+That proof lived entirely in a standalone reimplementation, not the real
+`TransformerBlock` any actual model uses. Closed the loop: QK-norm is
+now a `use_qknorm` flag on `TransformerBlock::forward_full` itself
+(opt-in, every existing call site unchanged, gradient-checked against
+finite differences), then re-ran the frequency-sink question on
+`tiny_lm_corpus.rs`'s real scaled corpus rather than the demo — a
+matched control/treatment pair from an identical seed, full 16000
+steps (8x the demo's own proof). Zero divergence either run. The named
+sink target ('a') stayed a 1-byte edge case under both, consistent
+with it never being a reliable seed-stable sink to begin with, but
+distinct bytes chosen as anyone's top-1 attention target rose from 48
+to 68 (of 92) under softmax1+QK-norm — attention spreading across more
+distinct targets instead of concentrating, real evidence for the
+original theory on the model it was always about.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data

@@ -324,23 +324,38 @@ fn forward(
     output_proj: &Linear,
     input_ids: &[usize],
 ) -> (Var, ForwardOut) {
+    forward_full(tape, token_emb, pos_emb, blocks, final_ln, output_proj, input_ids, false, false)
+}
+
+/// Same as forward(), plus softmax1/QK-norm switches threaded straight
+/// through to TransformerBlock::forward_full - added to directly re-test
+/// the frequency-sink theory below (softmax1 was tried against it once,
+/// diverged regardless of lr, reverted; QK-norm was later proven elsewhere
+/// ([e9d5721]) to eliminate that exact divergence in a standalone block,
+/// but never tried on this real corpus-scale model). forward() itself stays
+/// a thin plain-softmax/no-QK-norm wrapper so every existing call site
+/// (eval_loss, generate, train_with_diagnostics, and both flag-less callers
+/// below) keeps working and keeps producing bit-identical, already-recorded
+/// results - this is opt-in, not a default change.
+fn forward_full(
+    tape: &mut Tape,
+    token_emb: &Embedding,
+    pos_emb: &Embedding,
+    blocks: &[TransformerBlock],
+    final_ln: &LayerNorm,
+    output_proj: &Linear,
+    input_ids: &[usize],
+    use_softmax1: bool,
+    use_qknorm: bool,
+) -> (Var, ForwardOut) {
     let positions: Vec<usize> = (0..input_ids.len()).collect();
     let tok_out = token_emb.forward(tape, input_ids);
     let pos_out = pos_emb.forward(tape, &positions);
     let mut x = tape.add(tok_out.y, pos_out.y);
 
-    // softmax1 was tried here to test the frequency-sink theory from the
-    // attention-graph rerun (plain softmax forces every row's weights to
-    // sum to exactly 1, so a head with nothing specific to attend to dumps
-    // mass onto a reliable high-frequency byte as a no-op) - reverted:
-    // diverges to NaN regardless of lr (0.3->step 110, 0.1->216, 0.03->507,
-    // 0.01->1443, roughly tripling as lr drops ~3x - the signature of a
-    // compounding/unbounded dynamic, not a step-size mismatch, same failure
-    // class as the parked PC-precision instabilities). Back to plain
-    // softmax, the known-good state.
     let mut block_outs = Vec::with_capacity(blocks.len());
     for block in blocks {
-        let out = block.forward(tape, x);
+        let out = block.forward_full(tape, x, 1, use_softmax1, use_qknorm);
         x = out.y;
         block_outs.push(out);
     }
@@ -429,6 +444,27 @@ fn train_token_embedding(
     vocab_size: usize,
     steps: usize,
 ) -> TrainedModel {
+    train_token_embedding_full(seed, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps, false, false)
+}
+
+/// Same as train_token_embedding, plus softmax1/QK-norm switches threaded
+/// through to forward_full - lets the frequency-sink re-test below train a
+/// real model under the condition being tested, not just analyze one
+/// trained under the default. Existing callers stay on train_token_embedding
+/// (plain softmax, no QK-norm), unaffected.
+fn train_token_embedding_full(
+    seed: u64,
+    train: &[usize],
+    d_model: usize,
+    n_heads: usize,
+    d_ff: usize,
+    seq_len: usize,
+    n_blocks: usize,
+    vocab_size: usize,
+    steps: usize,
+    use_softmax1: bool,
+    use_qknorm: bool,
+) -> TrainedModel {
     let mut rng = Rng::new(seed);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);
     let mut pos_emb = Embedding::new(&mut rng, seq_len, d_model);
@@ -438,11 +474,23 @@ fn train_token_embedding(
     let mut output_proj = Linear::new(&mut rng, d_model, vocab_size);
     let opt = Sgd { lr: 0.3 };
 
-    for _ in 0..=steps {
+    for step in 0..=steps {
         let (input, target) = sample_window(&mut rng, train, seq_len);
         let mut tape = Tape::with_capacity(2000);
-        let (logits, out) = forward(&mut tape, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &input);
+        let (logits, out) =
+            forward_full(&mut tape, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &input, use_softmax1, use_qknorm);
         let loss = tape.cross_entropy(logits, &target);
+        let loss_val = tape.value(loss).data[0];
+        // Only reachable with use_softmax1/use_qknorm - plain softmax (every
+        // existing caller) never diverges here, so this is a strict addition
+        // for an under-tested combination at a step count ([e9d5721]'s own
+        // proof only ran 2000), not a behavior change for anything recorded
+        // so far. Breaks early with a clear signal rather than burning the
+        // rest of the run on NaN-corrupted weights.
+        if loss_val.is_nan() {
+            println!("  seed {seed} (softmax1={use_softmax1}, qknorm={use_qknorm}) diverged to NaN at step {step}");
+            break;
+        }
         tape.backward(loss);
         apply_grad(&tape, &out, &mut token_emb, &mut pos_emb, &mut blocks, &mut final_ln, &mut output_proj, &opt);
     }
@@ -536,6 +584,25 @@ fn attention_graph(
     attn_windows: usize,
     window_seed: u64,
 ) -> (Vec<Vec<(usize, f32)>>, usize) {
+    attention_graph_full(model, train, filtered_bytes, seq_len, attn_windows, window_seed, false, false)
+}
+
+/// Same as attention_graph, plus softmax1/QK-norm switches threaded through
+/// to forward_full - a model trained under those flags must also be
+/// ANALYZED under them, or the extracted attention weights would reflect
+/// plain-softmax behavior applied to softmax1/QK-norm-trained parameters,
+/// not what the model actually does. Existing callers stay on
+/// attention_graph (plain softmax, no QK-norm), unaffected.
+fn attention_graph_full(
+    model: &TrainedModel,
+    train: &[usize],
+    filtered_bytes: &[usize],
+    seq_len: usize,
+    attn_windows: usize,
+    window_seed: u64,
+    use_softmax1: bool,
+    use_qknorm: bool,
+) -> (Vec<Vec<(usize, f32)>>, usize) {
     let byte_index: HashMap<usize, usize> = filtered_bytes.iter().enumerate().map(|(i, &b)| (b, i)).collect();
     let n_bytes = filtered_bytes.len();
     let mut weight_sum = vec![0.0f32; n_bytes * n_bytes];
@@ -550,8 +617,17 @@ fn attention_graph(
         }
         windows_used += 1;
         let mut tape = Tape::new();
-        let (_, out) =
-            forward(&mut tape, &model.token_emb, &model.pos_emb, &model.blocks, &model.final_ln, &model.output_proj, &window);
+        let (_, out) = forward_full(
+            &mut tape,
+            &model.token_emb,
+            &model.pos_emb,
+            &model.blocks,
+            &model.final_ln,
+            &model.output_proj,
+            &window,
+            use_softmax1,
+            use_qknorm,
+        );
         let weights = tape.value(out.block_outs[0].head_weights[0]);
         for qi in 0..seq_len {
             let qi_idx = byte_index[&window[qi]];
@@ -1512,4 +1588,64 @@ fn main() {
             println!("    {rel_name}: 1-hop reaches {one_hop}, 2-hop reaches {two_hop} (of {} total)", n_nodes - 1);
         }
     }
+
+    // Revisits the frequency-sink theory ([f30c608]) against softmax1+QK-norm,
+    // now that QK-norm is proven ([e9d5721]) to eliminate the exact runaway
+    // the original softmax1 attempt ([d54c8f2]) hit on this same
+    // TransformerBlock architecture - that attempt never got to test whether
+    // softmax1 actually helps the sink, only that it diverged. Closes the
+    // loop on a real, corpus-scale model rather than the standalone
+    // CustomBlock the fix was originally proven in. Same controlled-
+    // comparison rigor as that diagnosis: identical seed/data/step count,
+    // varying only use_softmax1+use_qknorm together (the fix requires both -
+    // softmax1 alone is the known-divergent condition), fresh seed (4, unused
+    // above) so this isn't confounded with the cross-seed clustering/
+    // attention-graph checks already run on seeds 1-3. Concurrent via
+    // thread::scope, same reasoning as the 3-seed run above.
+    println!("\nrevisiting the frequency-sink theory: softmax1+QK-norm vs plain softmax, identical seed/data/steps...");
+    let qknorm_wall_clock_start = Instant::now();
+    let (control_model, treatment_model) = thread::scope(|scope| {
+        let control_handle = scope.spawn(|| {
+            train_token_embedding_full(4, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps, false, false)
+        });
+        let treatment_handle = scope.spawn(|| {
+            train_token_embedding_full(4, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps, true, true)
+        });
+        (control_handle.join().unwrap(), treatment_handle.join().unwrap())
+    });
+    println!("control + treatment trained in {:.1}s wall-clock", qknorm_wall_clock_start.elapsed().as_secs_f32());
+
+    // Analyzed under the SAME flags each was trained with - plain forward()
+    // on the treatment model would silently measure plain-softmax behavior
+    // applied to softmax1/QK-norm-trained parameters, not what the model
+    // actually does.
+    let (control_graph, _) = attention_graph_full(&control_model, train, &filtered_bytes, seq_len, attn_windows, 777, false, false);
+    let (treatment_graph, _) =
+        attention_graph_full(&treatment_model, train, &filtered_bytes, seq_len, attn_windows, 777, true, true);
+
+    // Same two facets of "sink" already reported above for the primary run:
+    // how many bytes default to the specific byte ('a') repeatedly named as
+    // the sink target across this investigation, and how many distinct
+    // bytes get chosen as anyone's top-1 target at all (a sink-dominated
+    // graph collapses onto few distinct targets; less sink behavior spreads
+    // top-1 targets across more of them).
+    let sink_idx = filtered_bytes.iter().position(|&b| b == b'a' as usize);
+    let count_top1_target = |graph: &[Vec<(usize, f32)>], target_idx: usize| {
+        graph.iter().filter(|targets| targets.first().map(|&(j, _)| j) == Some(target_idx)).count()
+    };
+    let distinct_top1_targets = |graph: &[Vec<(usize, f32)>]| {
+        let mut targets: Vec<usize> = graph.iter().filter_map(|t| t.first().map(|&(j, _)| j)).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        targets.len()
+    };
+    println!("\nfrequency-sink comparison (top-1 attention target per byte, block 0 head 0, {} filtered bytes):", filtered_bytes.len());
+    if let Some(idx) = sink_idx {
+        println!("  bytes defaulting to 'a' as top-1 target - plain softmax: {}, softmax1+QK-norm: {}",
+            count_top1_target(&control_graph, idx), count_top1_target(&treatment_graph, idx));
+    } else {
+        println!("  'a' was excluded as noise this run - skipping the named-sink count");
+    }
+    println!("  distinct bytes chosen as anyone's top-1 target - plain softmax: {}, softmax1+QK-norm: {} (of {} possible)",
+        distinct_top1_targets(&control_graph), distinct_top1_targets(&treatment_graph), filtered_bytes.len());
 }

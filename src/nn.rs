@@ -481,22 +481,42 @@ impl TransformerBlock {
     /// dense-stack-then-mask version was rejected (wastes O(batch) more
     /// compute than this).
     pub fn forward_batched(&self, tape: &mut Tape, x: Var, batch_size: usize) -> TransformerBlockOut {
-        self.forward_full(tape, x, batch_size, false)
+        self.forward_full(tape, x, batch_size, false, false)
     }
 
-    /// Same as forward_batched, plus a switch between plain softmax and
-    /// softmax1 (Tape::softmax1, "Attention Is Off By One") for the
-    /// per-head attention weights. A separate most-general method rather
-    /// than a new parameter on forward_batched itself, so every existing
-    /// call site (forward(), forward_batched(...)) keeps working unchanged
-    /// and stays on plain softmax - this is opt-in, not a default change to
-    /// already-recorded experiments elsewhere in the project.
+    /// Same as forward_batched, plus two independent opt-in switches: plain
+    /// softmax vs softmax1 (Tape::softmax1, "Attention Is Off By One"), and
+    /// whether Q/K get L2-normalized per position before the dot product
+    /// (QK-norm - `softmax1_qknorm_fix.rs` proved this eliminates softmax1's
+    /// Q/K-weight-norm runaway in a standalone block; wired in here so a
+    /// real trained model, not just that demo, can use it). A separate
+    /// most-general method rather than new parameters on forward_batched
+    /// itself, so every existing call site (forward(), forward_batched(...))
+    /// keeps working unchanged and stays on plain softmax/no QK-norm - both
+    /// are opt-in, not a default change to already-recorded experiments
+    /// elsewhere in the project.
     ///
     /// Inherits Linear::forward's fresh-leaf-per-call caveat transitively,
     /// through every Linear/LayerNorm this composes (q/k/v/out_proj heads,
     /// ln1, ln2, ffn1, ffn2) - calling this more than once on the same
     /// TransformerBlock within one tape is not weight-tie-safe either.
-    pub fn forward_full(&self, tape: &mut Tape, x: Var, batch_size: usize, use_softmax1: bool) -> TransformerBlockOut {
+    /// L2-normalizes each row (position) of `x` to unit length - the QK-norm
+    /// step, moved here unchanged from `softmax1_qknorm_fix.rs` (already
+    /// proved out there against the exact known divergence) now that a real
+    /// consumer needs it inside the library rather than a standalone demo
+    /// block. A small eps before sqrt guards a theoretical all-zero row
+    /// (never observed, but matches this project's existing eps-before-
+    /// sqrt/log safety convention rather than assuming it can't happen).
+    fn l2_normalize_rows(tape: &mut Tape, x: Var) -> Var {
+        let sq = tape.mul(x, x);
+        let sum_sq = tape.sum_last_axis(sq);
+        let eps = tape.leaf(NdArray::new(vec![1e-8; tape.value(sum_sq).data.len()], tape.value(sum_sq).shape.clone()));
+        let sum_sq_eps = tape.add(sum_sq, eps);
+        let norm = tape.sqrt(sum_sq_eps);
+        tape.div(x, norm)
+    }
+
+    pub fn forward_full(&self, tape: &mut Tape, x: Var, batch_size: usize, use_softmax1: bool, use_qknorm: bool) -> TransformerBlockOut {
         let seq_len = tape.value(x).shape[0] / batch_size;
         let mask_value = {
             let mut cache = self.mask_cache.borrow_mut();
@@ -522,7 +542,12 @@ impl TransformerBlock {
             let k_out = self.k_heads[h].forward(tape, normed1);
             let v_out = self.v_heads[h].forward(tape, normed1);
 
-            let scores = tape.batched_matmul(q_out.y, k_out.y, batch_size, true);
+            let (q_for_scores, k_for_scores) = if use_qknorm {
+                (Self::l2_normalize_rows(tape, q_out.y), Self::l2_normalize_rows(tape, k_out.y))
+            } else {
+                (q_out.y, k_out.y)
+            };
+            let scores = tape.batched_matmul(q_for_scores, k_for_scores, batch_size, true);
             let scaled = tape.scale(scores, 1.0 / (self.d_k as f32).sqrt());
             let masked = tape.add(scaled, mask);
             let weights = if use_softmax1 { tape.softmax1(masked) } else { tape.softmax(masked) };
@@ -688,6 +713,69 @@ mod tests {
             (numerical - ffn1_w_grad.data[0]).abs() < 1e-2,
             "ffn1.w[0] grad mismatch: numerical {numerical} vs analytical {}",
             ffn1_w_grad.data[0]
+        );
+    }
+
+    /// Same shape of check as transformer_block_backward_matches_finite_difference,
+    /// with use_qknorm=true - QK-norm composes only pre-existing, already-
+    /// gradient-checked ops (mul, sum_last_axis, add, sqrt, div, same as
+    /// softmax1_qknorm_fix.rs's standalone proof), but this checks the real
+    /// wiring inside forward_full itself, not just the op composition in
+    /// isolation. Spot-checks a q_heads weight instead of out_proj/ffn1 -
+    /// the parameter closest to the new normalization, most likely to catch
+    /// a wiring bug (e.g. scores computed from the un-normalized q/k instead
+    /// of the normalized ones) that the existing plain-softmax test can't
+    /// see at all.
+    #[test]
+    fn transformer_block_qknorm_backward_matches_finite_difference() {
+        let mut rng = Rng::new(2);
+        let (d_model, n_heads, d_ff, seq_len) = (8, 2, 16, 4);
+        let block = TransformerBlock::new(&mut rng, d_model, n_heads, d_ff);
+
+        let x_data: Vec<f32> = (0..seq_len * d_model).map(|i| ((i as f32) * 0.53).cos() * 0.5).collect();
+
+        let loss_with = |block: &TransformerBlock, x_data: &[f32]| -> f32 {
+            let mut tape = Tape::new();
+            let x = tape.leaf(NdArray::new(x_data.to_vec(), vec![seq_len, d_model]));
+            let out = block.forward_full(&mut tape, x, 1, false, true);
+            let loss = tape.sum(out.y);
+            tape.value(loss).data[0]
+        };
+
+        let mut tape = Tape::new();
+        let x = tape.leaf(NdArray::new(x_data.clone(), vec![seq_len, d_model]));
+        let out = block.forward_full(&mut tape, x, 1, false, true);
+        let loss = tape.sum(out.y);
+        tape.backward(loss);
+        let x_grad = tape.grad(x).unwrap().clone();
+        let q0_w_grad = tape.grad(out.q_outs[0].w).unwrap().clone();
+
+        let eps = 1e-3;
+        for i in 0..x_data.len() {
+            let mut xp = x_data.clone();
+            xp[i] += eps;
+            let mut xm = x_data.clone();
+            xm[i] -= eps;
+            let numerical = (loss_with(&block, &xp) - loss_with(&block, &xm)) / (2.0 * eps);
+            assert!(
+                (numerical - x_grad.data[i]).abs() < 1e-2,
+                "x grad[{i}] mismatch: numerical {numerical} vs analytical {}",
+                x_grad.data[i]
+            );
+        }
+
+        let mut block = block;
+        let orig = block.q_heads[0].w.data[0];
+        block.q_heads[0].w.data[0] = orig + eps;
+        let lp = loss_with(&block, &x_data);
+        block.q_heads[0].w.data[0] = orig - eps;
+        let lm = loss_with(&block, &x_data);
+        block.q_heads[0].w.data[0] = orig;
+        let numerical = (lp - lm) / (2.0 * eps);
+        assert!(
+            (numerical - q0_w_grad.data[0]).abs() < 1e-2,
+            "q_heads[0].w[0] grad mismatch: numerical {numerical} vs analytical {}",
+            q0_w_grad.data[0]
         );
     }
 
