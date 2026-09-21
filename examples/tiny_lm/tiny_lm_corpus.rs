@@ -1665,6 +1665,7 @@ fn main() {
     );
     let mut diversity_deltas = Vec::with_capacity(qknorm_seeds.len());
     let mut held_out_deltas = Vec::with_capacity(qknorm_seeds.len());
+    let mut control_held_out_losses = Vec::with_capacity(qknorm_seeds.len());
     for (i, &seed) in qknorm_seeds.iter().enumerate() {
         let (control, treatment) = (&control_models[i], &treatment_models[i]);
         // Fresh eval rng per model/corpus combination, same convention
@@ -1697,6 +1698,7 @@ fn main() {
         );
         diversity_deltas.push(treatment_diversity as i32 - control_diversity as i32);
         held_out_deltas.push(treatment_held_out_loss - control_held_out_loss);
+        control_held_out_losses.push(control_held_out_loss);
     }
 
     // The actual replication check: does the diversity increase found on
@@ -1710,5 +1712,56 @@ fn main() {
     println!(
         "\ncross-seed summary: {seeds_with_higher_diversity} of {} seeds show higher top-1-target diversity under softmax1+QK-norm (mean delta {mean_diversity_delta:+.1}); mean held-out loss delta (treatment - control) {mean_held_out_delta:+.4}",
         qknorm_seeds.len()
+    );
+
+    // Tests whether that held-out-loss gap is a step-budget confound - this
+    // project's own precedent ([dbdfd85]: a 2x-size model that looked
+    // strictly worse at matched steps closed almost its entire gap once
+    // given proportionally more steps) - or a real cost intrinsic to the
+    // mechanism. Unlike that precedent, QK-norm adds no meaningful per-step
+    // compute (a per-position L2-norm is vanishingly small next to the
+    // matmuls it sits beside), so this isn't compute-matching in the FLOPs
+    // sense - extending only the treatment and comparing against the
+    // control numbers already recorded above tests convergence speed
+    // directly: does more training let it catch up, or does it plateau
+    // above control regardless of budget? Same 4x extension factor as that
+    // precedent (steps -> 4*steps), same 3 seeds - control needs no
+    // retraining, its numbers are already in control_held_out_losses.
+    println!("\ntesting whether the held-out-loss gap is a step-budget confound: softmax1+QK-norm at 4x steps vs the control numbers already recorded above...");
+    let extended_steps = steps * 4;
+    let extended_wall_clock_start = Instant::now();
+    let extended_treatment_models: Vec<TrainedModel> = thread::scope(|scope| {
+        let handles: Vec<_> = qknorm_seeds
+            .iter()
+            .map(|&seed| {
+                scope.spawn(move || {
+                    train_token_embedding_full(
+                        seed, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, extended_steps, true, true,
+                    )
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    println!(
+        "all {} extended treatment runs ({extended_steps} steps) trained in {:.1}s wall-clock",
+        qknorm_seeds.len(),
+        extended_wall_clock_start.elapsed().as_secs_f32()
+    );
+
+    println!("\nheld-out loss: control@{steps} steps | treatment@{extended_steps} steps (4x):");
+    let mut extended_deltas = Vec::with_capacity(qknorm_seeds.len());
+    for (i, &seed) in qknorm_seeds.iter().enumerate() {
+        let extended = &extended_treatment_models[i];
+        let extended_held_out_loss = eval_loss_full(
+            &mut Rng::new(seed), &extended.token_emb, &extended.pos_emb, &extended.blocks, &extended.final_ln, &extended.output_proj,
+            held_out, seq_len, 20, true, true,
+        );
+        println!("  seed {seed}: {:.4} | {extended_held_out_loss:.4}", control_held_out_losses[i]);
+        extended_deltas.push(extended_held_out_loss - control_held_out_losses[i]);
+    }
+    let mean_extended_delta = extended_deltas.iter().sum::<f32>() / extended_deltas.len() as f32;
+    println!(
+        "\nmean held-out loss delta at 4x steps (extended treatment - control@{steps} steps): {mean_extended_delta:+.4} (compare to the {steps}-step delta of {mean_held_out_delta:+.4} above - closing toward 0 or crossing it supports a step-budget confound, staying similar or widening supports a real cost)"
     );
 }

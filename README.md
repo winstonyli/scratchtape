@@ -138,6 +138,18 @@ confound (this project's own 2x-model-scale precedent closed almost
 its entire gap once given proportionally more steps) or a genuine
 tradeoff intrinsic to the mechanism.
 
+That question is answered, not left open: it's a step-budget confound.
+Retrained the same 3 treatment seeds at 4x the steps (64000, same
+extension factor as the 2x-model-scale precedent), control unchanged
+(QK-norm adds no meaningful per-step compute, so this tests
+convergence speed, not FLOPs-matching). The mean held-out-loss delta
+against control collapses from +0.216 at matched steps to -0.010 at
+4x steps — crossing to a hair better, with 2 of 3 seeds beating their
+own control outright. Softmax1+QK-norm just converges slower per
+step; given a fair budget it reaches parity or better while keeping
+the attention-diversity gain. The fix works, replicates, and costs
+nothing once fairly trained.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data
