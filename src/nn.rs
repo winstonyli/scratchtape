@@ -408,6 +408,12 @@ pub struct TransformerBlockOut {
     /// Per-head (Q-norm, K-norm) outputs; empty unless the block was built
     /// `with_qk_norm`.
     pub qk_norm_outs: Vec<(LayerNormOut, LayerNormOut)>,
+    /// Per-head gate Linear outputs (pre-sigmoid) and the sigmoid gate
+    /// values actually applied; empty unless built `with_attn_gate`.
+    pub attn_gate_outs: Vec<LinearOut>,
+    pub attn_gate_values: Vec<Var>,
+    /// Per-head sink-logit leaves; empty unless built `with_sink_logit`.
+    pub sink_leaves: Vec<Var>,
 }
 
 /// Pre-norm transformer block: x + Attn(LN(x)), then x + FFN(LN(x)).
@@ -439,6 +445,15 @@ pub struct TransformerBlock {
     /// gamma is the learnable scale that version lacked, and at init
     /// logits already span ~+/-sqrt(d_k) rather than +/-1/sqrt(d_k).
     qk_norms: Vec<(LayerNorm, LayerNorm)>,
+    /// Per-head output gates, Qwen's gated attention (Qiu et al. 2025, the
+    /// elementwise "G1" form): head_out *= sigmoid(LN1(x) W_g + b_g). A way
+    /// for a head to abstain (gate -> 0) while its scores stay under plain,
+    /// shift-invariant softmax. Empty = no gate.
+    attn_gates: Vec<Linear>,
+    /// Per-head learnable sink logit s_h - a phantom key with zero value:
+    /// weights = exp(x_i) / (exp(s_h) + sum_j exp(x_j)) = softmax1(x - s_h),
+    /// so s_h = 0 is exactly softmax1. Empty = no sink.
+    sink_logits: Vec<NdArray>,
     /// Causal mask is identical on every call for a fixed (seq_len,
     /// batch_size) - cached rather than rebuilt (fresh allocation +
     /// O(seq_len^2) fill loop, now O(batch_size*seq_len^2)) on every forward
@@ -469,6 +484,8 @@ impl TransformerBlock {
             ffn1: Linear::new(rng, d_model, d_ff),
             ffn2: Linear::new(rng, d_ff, d_model),
             qk_norms: Vec::new(),
+            attn_gates: Vec::new(),
+            sink_logits: Vec::new(),
             mask_cache: RefCell::new(None),
         }
     }
@@ -481,12 +498,40 @@ impl TransformerBlock {
         self
     }
 
-    /// Checkpoint counterpart of `with_qk_norm`: reads the Q/K norms that
-    /// `to_flat` appends after a QK-norm block's other parameters.
-    pub fn with_qk_norm_from_flat(mut self, data: &[f32], offset: &mut usize) -> Self {
-        self.qk_norms = (0..self.n_heads)
-            .map(|_| (LayerNorm::from_flat(data, offset, self.d_k), LayerNorm::from_flat(data, offset, self.d_k)))
-            .collect();
+    /// Adds per-head output gates. Takes its own rng so a caller can keep
+    /// the rest of the model's init identical to a gateless run.
+    pub fn with_attn_gate(mut self, rng: &mut Rng) -> Self {
+        let d_model = self.out_proj.w.shape[0];
+        self.attn_gates = (0..self.n_heads).map(|_| Linear::new(rng, d_model, self.d_k)).collect();
+        self
+    }
+
+    /// Adds per-head sink logits, initialized to 0 (= softmax1). Consumes
+    /// no rng.
+    pub fn with_sink_logit(mut self) -> Self {
+        self.sink_logits = (0..self.n_heads).map(|_| NdArray::scalar(0.0)).collect();
+        self
+    }
+
+    /// Checkpoint counterpart of the `with_*` builders: reads whichever
+    /// extras the block was saved with, in `to_flat`'s order (Q/K norms,
+    /// gates, sinks - all after a plain block's layout).
+    pub fn extras_from_flat(mut self, data: &[f32], offset: &mut usize, qk_norm: bool, gate: bool, sink: bool) -> Self {
+        let (h, d_k, d_model) = (self.n_heads, self.d_k, self.out_proj.w.shape[0]);
+        if qk_norm {
+            self.qk_norms = (0..h).map(|_| (LayerNorm::from_flat(data, offset, d_k), LayerNorm::from_flat(data, offset, d_k))).collect();
+        }
+        if gate {
+            self.attn_gates = (0..h).map(|_| Linear::from_flat(data, offset, d_model, d_k)).collect();
+        }
+        if sink {
+            self.sink_logits = (0..h)
+                .map(|_| {
+                    *offset += 1;
+                    NdArray::scalar(data[*offset - 1])
+                })
+                .collect();
+        }
         self
     }
 
@@ -547,6 +592,9 @@ impl TransformerBlock {
         let mut head_outputs = Vec::with_capacity(self.n_heads);
         let mut head_weights = Vec::with_capacity(self.n_heads);
         let mut qk_norm_outs = Vec::with_capacity(self.qk_norms.len());
+        let mut attn_gate_outs = Vec::with_capacity(self.attn_gates.len());
+        let mut attn_gate_values = Vec::with_capacity(self.attn_gates.len());
+        let mut sink_leaves = Vec::with_capacity(self.sink_logits.len());
         for h in 0..self.n_heads {
             let q_out = self.q_heads[h].forward(tape, normed1);
             let k_out = self.k_heads[h].forward(tape, normed1);
@@ -563,8 +611,32 @@ impl TransformerBlock {
             let scores = tape.batched_matmul(q_for_scores, k_for_scores, batch_size, true);
             let scaled = tape.scale(scores, 1.0 / (self.d_k as f32).sqrt());
             let masked = tape.add(scaled, mask);
-            let weights = if use_softmax1 { tape.softmax1(masked) } else { tape.softmax(masked) };
-            head_outputs.push(tape.batched_matmul(weights, v_out.y, batch_size, false));
+            let weights = if let Some(s) = self.sink_logits.get(h) {
+                let s_leaf = tape.leaf(s.clone());
+                sink_leaves.push(s_leaf);
+                let shifted = tape.sub(masked, s_leaf);
+                tape.softmax1(shifted)
+            } else if use_softmax1 {
+                tape.softmax1(masked)
+            } else {
+                tape.softmax(masked)
+            };
+            let head_out = tape.batched_matmul(weights, v_out.y, batch_size, false);
+            head_outputs.push(if let Some(gate) = self.attn_gates.get(h) {
+                let gate_out = gate.forward(tape, normed1);
+                // sigmoid(z) = 1 / (1 + exp(-z)), composed from existing ops.
+                let neg = tape.scale(gate_out.y, -1.0);
+                let e = tape.exp(neg);
+                let one = tape.leaf(NdArray::scalar(1.0));
+                let denom = tape.add(e, one);
+                let one_again = tape.leaf(NdArray::scalar(1.0));
+                let g = tape.div(one_again, denom);
+                attn_gate_outs.push(gate_out);
+                attn_gate_values.push(g);
+                tape.mul(head_out, g)
+            } else {
+                head_out
+            });
             head_weights.push(weights);
 
             q_outs.push(q_out);
@@ -582,7 +654,22 @@ impl TransformerBlock {
         let ffn2_out = self.ffn2.forward(tape, hidden);
         let y = tape.add(x1, ffn2_out.y); // residual
 
-        TransformerBlockOut { y, head_weights, ln1_out, q_outs, k_outs, v_outs, out_proj_out, ln2_out, ffn1_out, ffn2_out, qk_norm_outs }
+        TransformerBlockOut {
+            y,
+            head_weights,
+            ln1_out,
+            q_outs,
+            k_outs,
+            v_outs,
+            out_proj_out,
+            ln2_out,
+            ffn1_out,
+            ffn2_out,
+            qk_norm_outs,
+            attn_gate_outs,
+            attn_gate_values,
+            sink_leaves,
+        }
     }
 
     pub fn apply_grad(&mut self, tape: &Tape, out: &TransformerBlockOut, opt: &Sgd) {
@@ -600,12 +687,19 @@ impl TransformerBlock {
             q_norm.apply_grad(tape, q_out, opt);
             k_norm.apply_grad(tape, k_out, opt);
         }
+        for (gate, gate_out) in self.attn_gates.iter_mut().zip(&out.attn_gate_outs) {
+            gate.apply_grad(tape, gate_out, opt);
+        }
+        for (s, &leaf) in self.sink_logits.iter_mut().zip(&out.sink_leaves) {
+            opt.step(s, tape.grad(leaf).unwrap());
+        }
     }
 
     /// Purely mechanical - concatenates each sub-component's own to_flat in
     /// a fixed order. No special logic needed since every leaf here is
-    /// already a plain NdArray. Q/K norms (if any) go last, so a plain
-    /// block's layout is unchanged and `from_flat` reads it as before.
+    /// already a plain NdArray. Extras (Q/K norms, gates, sinks - if any) go
+    /// last, so a plain block's layout is unchanged and `from_flat` reads it
+    /// as before; `extras_from_flat` reads the rest.
     pub fn to_flat(&self) -> Vec<f32> {
         let mut out = self.ln1.to_flat();
         for l in &self.q_heads {
@@ -625,13 +719,19 @@ impl TransformerBlock {
             out.extend(q_norm.to_flat());
             out.extend(k_norm.to_flat());
         }
+        for gate in &self.attn_gates {
+            out.extend(gate.to_flat());
+        }
+        for s in &self.sink_logits {
+            out.extend_from_slice(&s.data);
+        }
         out
     }
 
     /// Same (d_model, n_heads, d_ff) arguments as `new` - shapes aren't
     /// self-described in the file, so the caller must reconstruct with the
     /// identical architecture that produced the checkpoint (chain
-    /// `with_qk_norm_from_flat` for a QK-norm block).
+    /// `extras_from_flat` for a block built with any `with_*` extras).
     pub fn from_flat(data: &[f32], offset: &mut usize, d_model: usize, n_heads: usize, d_ff: usize) -> Self {
         let d_k = d_model / n_heads;
         let ln1 = LayerNorm::from_flat(data, offset, d_model);
@@ -642,7 +742,7 @@ impl TransformerBlock {
         let ln2 = LayerNorm::from_flat(data, offset, d_model);
         let ffn1 = Linear::from_flat(data, offset, d_model, d_ff);
         let ffn2 = Linear::from_flat(data, offset, d_ff, d_model);
-        Self { n_heads, d_k, ln1, q_heads, k_heads, v_heads, out_proj, ln2, ffn1, ffn2, qk_norms: Vec::new(), mask_cache: RefCell::new(None) }
+        Self { n_heads, d_k, ln1, q_heads, k_heads, v_heads, out_proj, ln2, ffn1, ffn2, qk_norms: Vec::new(), attn_gates: Vec::new(), sink_logits: Vec::new(), mask_cache: RefCell::new(None) }
     }
 }
 
@@ -754,7 +854,7 @@ mod tests {
 
         let flat = block.to_flat();
         let mut offset = 0;
-        let restored = TransformerBlock::from_flat(&flat, &mut offset, d_model, n_heads, d_ff).with_qk_norm_from_flat(&flat, &mut offset);
+        let restored = TransformerBlock::from_flat(&flat, &mut offset, d_model, n_heads, d_ff).extras_from_flat(&flat, &mut offset, true, false, false);
         assert_eq!(offset, flat.len());
         assert_eq!(restored.to_flat(), flat);
 
@@ -818,6 +918,70 @@ mod tests {
             k1_gamma_grad.data[0]
         );
         assert!(k1_gamma_grad.data[0].abs() > 1e-6, "k-norm gamma gets no gradient - scale not wired into scores");
+    }
+
+    /// Gate and sink logit are new wiring (a composed sigmoid, a broadcast
+    /// scalar subtracted before softmax1): finite-difference check on x, a
+    /// gate weight and a sink logit, plus the checkpoint round trip.
+    #[test]
+    fn transformer_block_gate_and_sink_backward_matches_finite_difference() {
+        let mut rng = Rng::new(3);
+        let (d_model, n_heads, d_ff, seq_len) = (8, 2, 16, 4);
+        let mut gate_rng = Rng::new(4);
+        let mut block = TransformerBlock::new(&mut rng, d_model, n_heads, d_ff).with_attn_gate(&mut gate_rng).with_sink_logit();
+        block.sink_logits[1] = NdArray::scalar(0.3);
+
+        let flat = block.to_flat();
+        let mut offset = 0;
+        let restored = TransformerBlock::from_flat(&flat, &mut offset, d_model, n_heads, d_ff).extras_from_flat(&flat, &mut offset, false, true, true);
+        assert_eq!(offset, flat.len());
+        assert_eq!(restored.to_flat(), flat);
+
+        let x_data: Vec<f32> = (0..seq_len * d_model).map(|i| ((i as f32) * 0.37).sin() * 0.5).collect();
+        let loss_with = |block: &TransformerBlock, x_data: &[f32]| -> f32 {
+            let mut tape = Tape::new();
+            let x = tape.leaf(NdArray::new(x_data.to_vec(), vec![seq_len, d_model]));
+            let out = block.forward_full(&mut tape, x, 1, false);
+            let loss = tape.sum(out.y);
+            tape.value(loss).data[0]
+        };
+
+        let mut tape = Tape::new();
+        let x = tape.leaf(NdArray::new(x_data.clone(), vec![seq_len, d_model]));
+        let out = block.forward_full(&mut tape, x, 1, false);
+        let loss = tape.sum(out.y);
+        tape.backward(loss);
+        let x_grad = tape.grad(x).unwrap().clone();
+        let gate_w_grad = tape.grad(out.attn_gate_outs[0].w).unwrap().data[0];
+        let sink_grad = tape.grad(out.sink_leaves[1]).unwrap().data[0];
+
+        let eps = 1e-3;
+        for i in 0..x_data.len() {
+            let (mut xp, mut xm) = (x_data.clone(), x_data.clone());
+            xp[i] += eps;
+            xm[i] -= eps;
+            let numerical = (loss_with(&block, &xp) - loss_with(&block, &xm)) / (2.0 * eps);
+            assert!((numerical - x_grad.data[i]).abs() < 1e-2, "x grad[{i}]: numerical {numerical} vs analytical {}", x_grad.data[i]);
+        }
+
+        let orig = block.attn_gates[0].w.data[0];
+        block.attn_gates[0].w.data[0] = orig + eps;
+        let lp = loss_with(&block, &x_data);
+        block.attn_gates[0].w.data[0] = orig - eps;
+        let lm = loss_with(&block, &x_data);
+        block.attn_gates[0].w.data[0] = orig;
+        let numerical = (lp - lm) / (2.0 * eps);
+        assert!((numerical - gate_w_grad).abs() < 1e-2, "gate w grad: numerical {numerical} vs analytical {gate_w_grad}");
+
+        let orig = block.sink_logits[1].data[0];
+        block.sink_logits[1].data[0] = orig + eps;
+        let lp = loss_with(&block, &x_data);
+        block.sink_logits[1].data[0] = orig - eps;
+        let lm = loss_with(&block, &x_data);
+        block.sink_logits[1].data[0] = orig;
+        let numerical = (lp - lm) / (2.0 * eps);
+        assert!((numerical - sink_grad).abs() < 1e-2, "sink grad: numerical {numerical} vs analytical {sink_grad}");
+        assert!(sink_grad.abs() > 1e-6, "sink logit gets no gradient");
     }
 
     /// forward_batched must compute EXACTLY what running the unbatched

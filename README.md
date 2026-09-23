@@ -323,6 +323,29 @@ softmax1's upside at small scale in the hundredths of a nat (abstention
 sink-logit variants (Qwen's gated attention, NeurIPS 2025; a learnable
 phantom key) get abstention without unbounded logits. One seed.
 
+**Correction: the runaway was a `Tape::softmax1` bug, present since
+`20e5038`.** Writing a finite-difference test for a new sink-logit op
+exposed it. softmax1 subtracted the row max for overflow safety but kept
+the literal "+1", computing exp(x)/(Σexp(x) + exp(max x)) — a phantom key
+pinned at the row's max, not at 0 (0.44 instead of 0.71 on a test row).
+That forward pass ignores a uniform shift of the row; the gradient,
+taken with the max detached, doesn't. So any parameter that shifts a
+whole row (a key bias, a K-norm β) received a steady gradient that
+changed nothing in the loss, and drifted without bound: exactly the
+~2e8 K-norm bias and ~1e9 gains above, and very likely the "Q/K-weight-
+norm runaway" behind softmax1's original step-775 NaN
+(`softmax1_divergence_diagnosis.rs`). The paragraph above explains it
+as softmax1 legitimately rewarding shifts; that's wrong for the code
+that ran. Fixed: shift by max(max x, 0) and use exp(−m) for the phantom
+term — exactly softmax over [x, 0], where detaching the shift is valid.
+A new test checks values against the definition and gradients against
+finite differences (it fails on the old code). Every softmax1 result in
+this project — `softmax1_comparison.rs`, the divergence diagnosis, the
+QK-norm fix, the promotion, and the run above — used the broken op. The
+project never had a direct gradient check on softmax1 because it
+"composed already-checked ops"; the composition itself was the bug.
+Rerun with the fixed op pending.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data

@@ -65,6 +65,17 @@ const SEQ_LEN: usize = 64;
 const N_BLOCKS: usize = 4;
 const VOCAB: usize = 256;
 
+/// One attention configuration. `softmax1` picks the normalizer (a sink
+/// logit implies softmax1 on shifted scores regardless); the rest are
+/// TransformerBlock extras.
+#[derive(Clone, Copy)]
+struct Variant {
+    softmax1: bool,
+    qknorm: bool,
+    gate: bool,
+    sink: bool,
+}
+
 struct Model {
     token_emb: Embedding,
     pos_emb: Embedding,
@@ -121,14 +132,27 @@ fn eval_loss(
 
 /// Mirrors train_with_diagnostics (seed 1), minus generation. Also returns
 /// grad_accum, which the noise filter needs to reproduce filtered_bytes.
-fn train(train_set: &[usize], held_out: &[usize], steps: usize, softmax1: bool, qknorm: bool, log: &mut Vec<String>) -> (Model, Vec<f32>) {
+fn train(train_set: &[usize], held_out: &[usize], steps: usize, v: Variant, log: &mut Vec<String>) -> (Model, Vec<f32>) {
+    let softmax1 = v.softmax1;
     let mut rng = Rng::new(1);
+    // Gates draw from their own stream so every other parameter's init
+    // matches the gateless runs exactly.
+    let mut gate_rng = Rng::new(0x9a7e);
     let mut token_emb = Embedding::new(&mut rng, VOCAB, D_MODEL);
     let mut pos_emb = Embedding::new(&mut rng, SEQ_LEN, D_MODEL);
     let mut blocks: Vec<TransformerBlock> = (0..N_BLOCKS)
         .map(|_| {
-            let block = TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF);
-            if qknorm { block.with_qk_norm() } else { block }
+            let mut block = TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF);
+            if v.qknorm {
+                block = block.with_qk_norm();
+            }
+            if v.gate {
+                block = block.with_attn_gate(&mut gate_rng);
+            }
+            if v.sink {
+                block = block.with_sink_logit();
+            }
+            block
         })
         .collect();
     let mut final_ln = LayerNorm::new(D_MODEL);
@@ -141,6 +165,10 @@ fn train(train_set: &[usize], held_out: &[usize], steps: usize, softmax1: bool, 
         let mut tape = Tape::with_capacity(2000);
         let (logits, out) = forward(&mut tape, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &input, softmax1);
         let loss = tape.cross_entropy(logits, &target);
+        if tape.value(loss).data[0].is_nan() {
+            log.push(format!("diverged to NaN at step {step}"));
+            break;
+        }
         tape.backward(loss);
         let tok_grad = tape.grad(out.tok_out.table).unwrap();
         for b in 0..VOCAB {
@@ -162,24 +190,24 @@ fn save(path: &str, m: &Model, grad_accum: &[f32]) {
     std::fs::write(path, format!("{}\n{}\n", join(grad_accum), join(&flat))).unwrap();
 }
 
-fn load(path: &str, qknorm: bool) -> Option<(Model, Vec<f32>)> {
+fn load(path: &str, v: Variant) -> Option<(Model, Vec<f32>)> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     let parse = |l: &str| l.split_whitespace().map(|x| x.parse::<f32>().unwrap()).collect::<Vec<f32>>();
     let grad_accum = parse(lines.next()?);
     let flat = parse(lines.next()?);
-    // common::reconstruct, plus the Q/K norms a QK-norm block appends.
+    // common::reconstruct, plus whatever extras the blocks were built with.
     let mut offset = 0;
     let token_emb = Embedding::from_flat(&flat, &mut offset, VOCAB, D_MODEL);
     let pos_emb = Embedding::from_flat(&flat, &mut offset, SEQ_LEN, D_MODEL);
     let mut blocks = Vec::with_capacity(N_BLOCKS);
     for _ in 0..N_BLOCKS {
         let block = TransformerBlock::from_flat(&flat, &mut offset, D_MODEL, N_HEADS, D_FF);
-        blocks.push(if qknorm { block.with_qk_norm_from_flat(&flat, &mut offset) } else { block });
+        blocks.push(block.extras_from_flat(&flat, &mut offset, v.qknorm, v.gate, v.sink));
     }
     let final_ln = LayerNorm::from_flat(&flat, &mut offset, D_MODEL);
     let output_proj = Linear::from_flat(&flat, &mut offset, D_MODEL, VOCAB);
-    assert_eq!(offset, flat.len(), "{path}: checkpoint doesn't match the qknorm={qknorm} architecture");
+    assert_eq!(offset, flat.len(), "{path}: checkpoint doesn't match this variant's architecture");
     Some((Model { token_emb, pos_emb, blocks, final_ln, output_proj }, grad_accum))
 }
 
@@ -200,14 +228,17 @@ fn argmax_targets(sum: &[f32], count: &[u32], n: usize) -> Vec<Option<usize>> {
         .collect()
 }
 
-fn analyze(name: &str, m: &Model, train_set: &[usize], filtered: &[usize], softmax1: bool) -> Vec<String> {
+fn analyze(name: &str, m: &Model, train_set: &[usize], filtered: &[usize], v: Variant) -> Vec<String> {
+    let softmax1 = v.softmax1;
     let byte_index: HashMap<usize, usize> = filtered.iter().enumerate().map(|(i, &b)| (b, i)).collect();
     let n = filtered.len();
     let heads = N_BLOCKS * N_HEADS;
     let mut wsum = vec![0.0f32; heads * n * n];
     let mut count = vec![0u32; n * n];
     let mut null_sum = vec![0.0f32; n * n];
-    let null_plus = if softmax1 { 2.0 } else { 1.0 };
+    let null_plus = if softmax1 || v.sink { 2.0 } else { 1.0 };
+    let (mut gate_sum, mut gate_n) = (vec![0.0f64; N_BLOCKS], 0u64);
+    let mut sink_values = vec![Vec::new(); N_BLOCKS];
     let (mut kl, mut peak, mut mass) = (vec![0.0f64; heads], vec![0.0f64; heads], vec![0.0f64; heads]);
     let mut rows = 0u64;
     let mut rng = Rng::new(777);
@@ -222,6 +253,20 @@ fn analyze(name: &str, m: &Model, train_set: &[usize], filtered: &[usize], softm
         let idxs: Vec<usize> = window.iter().map(|b| byte_index[b]).collect();
         let mut tape = Tape::new();
         let (_, out) = forward(&mut tape, &m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj, &window, softmax1);
+        if !out.block_outs[0].attn_gate_values.is_empty() {
+            gate_n += 1;
+            for (b, bo) in out.block_outs.iter().enumerate() {
+                for &g in &bo.attn_gate_values {
+                    let d = &tape.value(g).data;
+                    gate_sum[b] += d.iter().map(|&x| x as f64).sum::<f64>() / d.len() as f64;
+                }
+            }
+        }
+        if used == 1 {
+            for (b, bo) in out.block_outs.iter().enumerate() {
+                sink_values[b] = bo.sink_leaves.iter().map(|&s| tape.value(s).data[0]).collect();
+            }
+        }
         for qi in 0..SEQ_LEN {
             for ki in 0..SEQ_LEN {
                 let cell = idxs[qi] * n + idxs[ki];
@@ -301,6 +346,14 @@ fn analyze(name: &str, m: &Model, train_set: &[usize], filtered: &[usize], softm
     }
     let hn = heads as f64;
     lines.push(format!("  mean over {heads} heads: KL={:.5} peak={:.3} mass={:.3} null-argmax-agreement={:.2}", kl_all / hn, peak_all / hn, mass_all / hn, agree_all / hn));
+    if gate_n > 0 {
+        let per_block: Vec<String> = gate_sum.iter().map(|g| format!("{:.3}", g / (gate_n as f64 * N_HEADS as f64))).collect();
+        lines.push(format!("  mean gate value per block: {}", per_block.join(" ")));
+    }
+    for (b, sv) in sink_values.iter().enumerate().filter(|(_, sv)| !sv.is_empty()) {
+        let vals: Vec<String> = sv.iter().map(|x| format!("{x:.2}")).collect();
+        lines.push(format!("  block {b} sink logits: {}", vals.join(" ")));
+    }
     lines
 }
 
@@ -312,21 +365,32 @@ fn main() {
     // seconds; the real run uses the defaults.
     let steps: usize = std::env::var("STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64000);
 
-    let conditions = [("softmax1+lnqknorm", true, true), ("plain+lnqknorm", false, true), ("plain", false, false)];
+    let v = |softmax1, qknorm, gate, sink| Variant { softmax1, qknorm, gate, sink };
+    let conditions = [
+        ("softmax1", v(true, false, false, false)),
+        ("softmax1+lnqknorm", v(true, true, false, false)),
+        ("plain+gate", v(false, false, true, false)),
+        ("sink", v(false, false, false, true)),
+        ("plain+lnqknorm", v(false, true, false, false)),
+        ("plain", v(false, false, false, false)),
+    ];
     let results: Vec<(Vec<String>, Vec<String>)> = thread::scope(|scope| {
         let handles: Vec<_> = conditions
             .iter()
-            .map(|&(name, softmax1, qknorm)| {
+            .map(|&(name, v)| {
                 scope.spawn(move || {
                     let path = format!("attention_uniformity_{}.txt", name.replace('+', "_"));
                     let mut log = Vec::new();
-                    let (model, grad_accum) = match load(&path, qknorm) {
+                    let (model, grad_accum) = match load(&path, v) {
                         Some(loaded) => {
                             log.push(format!("loaded checkpoint {path}, skipped training"));
                             loaded
                         }
                         None => {
-                            let (m, g) = train(train_set, held_out, steps, softmax1, qknorm, &mut log);
+                            let (m, g) = train(train_set, held_out, steps, v, &mut log);
+                            if log.iter().any(|l| l.contains("NaN")) {
+                                return (log, Vec::new());
+                            }
                             save(&path, &m, &g);
                             log.push(format!("saved checkpoint {path}"));
                             (m, g)
@@ -340,14 +404,14 @@ fn main() {
                     let noise_floor = grad_accum[by_accum[distinct.len() / 5]];
                     let filtered: Vec<usize> = distinct.iter().copied().filter(|&b| grad_accum[b] >= noise_floor).collect();
                     log.push(format!("{} of {} bytes pass the noise filter", filtered.len(), distinct.len()));
-                    let analysis = analyze(name, &model, train_set, &filtered, softmax1);
+                    let analysis = analyze(name, &model, train_set, &filtered, v);
                     (log, analysis)
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    for ((name, _, _), (log, analysis)) in conditions.iter().zip(results.iter()) {
+    for ((name, _), (log, analysis)) in conditions.iter().zip(results.iter()) {
         println!("== {name} ==");
         for l in log {
             println!("{l}");

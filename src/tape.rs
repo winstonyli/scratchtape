@@ -299,19 +299,33 @@ impl Tape {
     /// a forced-uniform distribution. Side benefit: also slightly more
     /// robust than plain softmax against the all-very-negative-logits case
     /// - the +1 floors the denominator at 1, so it can't collapse toward
-    /// zero the way plain softmax's denominator can. Now ALSO has the same
-    /// max-subtraction fix as softmax (updated once the overflow risk
-    /// stopped being theoretical) - same detached-leaf reasoning applies
-    /// unchanged, the "+1" in the denominator doesn't interact with it.
+    /// zero the way plain softmax's denominator can.
+    ///
+    /// Overflow-safe form: softmax1(x) is exactly softmax over [x, 0] (a
+    /// phantom key with logit 0 and zero value), so shift by
+    /// m = max(max(x), 0) and use exp(-m) for the phantom term:
+    /// exp(x-m) / (sum exp(x-m) + exp(-m)). Detaching m is valid only
+    /// because that full [x, 0] softmax is shift-invariant. The version
+    /// used from 20e5038 until this fix shifted by max(x) but kept "+1",
+    /// which computes exp(x) / (sum exp(x) + exp(max x)) - a phantom key
+    /// at the row's max, not at 0 - so the forward pass was shift-invariant
+    /// while the detached-max gradient was not. Parameters that shift a
+    /// whole row equally (a key bias) got a steady gradient with no effect
+    /// on the loss, and grew without bound (attention_uniformity_check.rs:
+    /// K-norm gains ~1e9). Every softmax1 result before the fix used it.
     pub fn softmax1(&mut self, a: Var) -> Var {
-        let max_val = self.nodes[a.idx].value.max_last_axis();
+        let mut max_val = self.nodes[a.idx].value.max_last_axis();
+        for m in max_val.data.iter_mut() {
+            *m = m.max(0.0);
+        }
+        let phantom = NdArray { data: max_val.data.iter().map(|m| (-m).exp()).collect(), shape: max_val.shape.clone() };
         let max_leaf = self.leaf(max_val);
         let shifted = self.sub(a, max_leaf);
         let e = self.exp(shifted);
         let s = self.sum_last_axis(e);
-        let one = self.leaf(NdArray::scalar(1.0));
-        let s_plus_one = self.add(s, one);
-        self.div(e, s_plus_one)
+        let phantom_leaf = self.leaf(phantom);
+        let denom = self.add(s, phantom_leaf);
+        self.div(e, denom)
     }
 
     /// Differentiable log. Unlike Exp/Sqrt, this needs the PARENT's value,
@@ -1000,6 +1014,57 @@ mod tests {
                 "x grad[{i}] mismatch: numerical {numerical} vs analytical {}",
                 x_grad.data[i]
             );
+        }
+    }
+
+    /// softmax1 had no direct check, and its max-subtraction silently
+    /// changed the function (see its doc comment). Values must equal
+    /// exp(x)/(1+sum exp(x)) - including rows with positive logits, where
+    /// the old form diverged from it - stay finite at large logits, honor
+    /// -inf masking, and the gradient must match finite differences.
+    #[test]
+    fn softmax1_matches_definition_and_finite_difference() {
+        let x0 = vec![2.0f32, -1.0, 0.5, f32::NEG_INFINITY, 3.0, 1.0, -0.5, 0.2];
+        let c = [0.7f32, -1.3, 0.4, 2.0, -0.6, 1.1, 0.9, -0.2];
+        let run = |x: &[f32]| -> (f32, Vec<f32>) {
+            let mut tape = Tape::new();
+            let xv = tape.leaf(NdArray::new(x.to_vec(), vec![2, 4]));
+            let w = tape.softmax1(xv);
+            let weights = tape.value(w).data.clone();
+            let cv = tape.leaf(NdArray::new(c.to_vec(), vec![2, 4]));
+            let prod = tape.mul(w, cv);
+            let loss = tape.sum(prod);
+            (tape.value(loss).data[0], weights)
+        };
+
+        let (_, weights) = run(&x0);
+        for row in 0..2 {
+            let r = &x0[row * 4..row * 4 + 4];
+            let denom = 1.0 + r.iter().map(|v| v.exp()).sum::<f32>();
+            for j in 0..4 {
+                let expected = r[j].exp() / denom;
+                assert!((weights[row * 4 + j] - expected).abs() < 1e-6, "weight [{row},{j}]: {} vs {expected}", weights[row * 4 + j]);
+            }
+        }
+
+        let (_, big) = run(&[80.0, 79.0, 0.0, f32::NEG_INFINITY, 80.0, 80.0, 80.0, 80.0]);
+        assert!(big.iter().all(|w| w.is_finite()), "overflow at large logits: {big:?}");
+
+        let mut tape = Tape::new();
+        let xv = tape.leaf(NdArray::new(x0.clone(), vec![2, 4]));
+        let w = tape.softmax1(xv);
+        let cv = tape.leaf(NdArray::new(c.to_vec(), vec![2, 4]));
+        let prod = tape.mul(w, cv);
+        let loss = tape.sum(prod);
+        tape.backward(loss);
+        let grad = tape.grad(xv).unwrap().clone();
+        let eps = 1e-3;
+        for i in (0..x0.len()).filter(|&i| x0[i].is_finite()) {
+            let (mut xp, mut xm) = (x0.clone(), x0.clone());
+            xp[i] += eps;
+            xm[i] -= eps;
+            let numerical = (run(&xp).0 - run(&xm).0) / (2.0 * eps);
+            assert!((numerical - grad.data[i]).abs() < 1e-2, "grad[{i}]: numerical {numerical} vs analytical {}", grad.data[i]);
         }
     }
 }
