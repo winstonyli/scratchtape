@@ -191,6 +191,32 @@ sitting alongside, not resolved by, the top-1-diversity gain the
 mechanism was adopted for. Both are real; they measure different
 things.
 
+Traced why `'¼'` specifically, from data already on hand: it occurs 8
+times in the 237,882-byte corpus (0.0034%) — among the rarest bytes
+that still clear the noise filter — with accumulated |gradient| 113.2
+over 64000 steps, 7th-lowest of the 92 filtered bytes (~300–450x
+smaller than common letters). Barely ever sampled as a target, its
+embedding stays near initialization while every well-trained byte's
+embedding moves substantially, and the top-2 attention dump shows most
+of the defaults to it sitting at weight 0.02–0.11 — barely above
+uniform (1/64), a weak tie-break, not confident attention. That's the
+mechanistic split from plain softmax: its score is an unnormalized dot
+product scaling with magnitude, so an undertrained embedding produces
+a weak score and rarely wins — plain-softmax sinks instead form around
+whichever byte's key happens to develop a large norm in a given run,
+hence seed-arbitrary and head-varied. QK-norm discards magnitude
+entirely; an embedding that stayed near small-random init (from almost
+never getting a gradient) sits in a comparatively generic direction,
+which tends toward moderate, non-negative cosine similarity to a broad
+range of other directions — a structural "least-bad default." Every
+block/head reads the same shared embedding table, so that byte's
+peculiarity is available identically everywhere, explaining the
+cross-block, cross-head, and cross-seed convergence plain softmax
+never showed. Not verified directly: this chains corpus frequency →
+gradient starvation → attention weight, not the trained K-vectors' own
+cosine geometry — that would need a checkpoint dump, left as an
+optional deeper confirmation.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data
