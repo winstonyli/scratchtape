@@ -359,6 +359,18 @@ self-attention rates spread over 0.10–0.74. Seed-1 held-out loss is
 figures belong to the L2 softmax1+QK-norm model, run with the buggy
 softmax1, and aren't reproducible from the current code.
 
+**A count model beats the transformer.** `ngram_baseline.rs` fits
+interpolated Kneser-Ney over bytes (Ney discounts per order, uniform
+floor, sum-to-1 checked at every order). It scores held-out with the
+transformer's own windowing: 64-byte windows, context reset at each
+window. Held-out CE falls from 3.266 (unigram) to **1.655 nats/byte at
+order 7**, then flattens. The plain-softmax transformer logged 1.738 at
+step 64000 and averaged 1.868 over its last 8 evals. That eval is a
+noisy 20-window sample, so a deterministic full-held-out eval of each
+checkpoint on the same windows is next. Either way, this model isn't
+clearly beating a 1998-era count model, and every mechanism comparison
+here is happening below that bar.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data
@@ -752,8 +764,8 @@ it means here.
 **Sibling project: `humble-cortex`** (`../humble-cortex`, predictive
 coding in Rust). Its 95 checks overlap here in three places. First, every
 model is benchmarked against the simplest baseline for the task
-(persistence, OLS, backoff n-gram, kNN); scratchtape's tiny LMs had none
-until the n-gram baseline below. Second, partial replay + consolidation
+(persistence, OLS, backoff n-gram, kNN). scratchtape's tiny LMs had none
+until `ngram_baseline.rs`, which the current model doesn't clearly beat. Second, partial replay + consolidation
 compounded (37.6% / 41.2% alone, 54.0% combined, over 3 repeats), which is
 untested here. Third, retention is normalized by how much was learned,
 because raw forgetting deltas hid a floor effect.
