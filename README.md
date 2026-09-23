@@ -325,6 +325,33 @@ specific finding that echoes — via a completely different method —
 `tiny_lm_corpus.rs`'s own finding that attention behaves very
 differently by depth.
 
+`memory_tier_reconsolidation.rs` tested a prediction the Fisher work's
+own EWC lineage raises but nothing here had checked: reconsolidation —
+retrieving a consolidated memory briefly returns it to a labile state
+before it re-stabilizes, rather than being a passive readout. Trained
+on corpus A alone (last 500 steps = an "actively learning, nearly
+converged" baseline), then on corpus B while replaying A at `p=0.15`,
+bucketing every step's per-segment squared gradient by A-replay/B-fresh
+× early/late phase 2. Mixed result, reported honestly: retrieving A
+does elevate gradient above the phase-1 baseline in every segment but
+`output_proj` — real lability, not a frozen readout — but that can't be
+cleanly separated from ordinary interference (B-training has already
+pulled shared weights away from A, so some corrective gradient on
+replay is expected regardless of any reconsolidation-like effect). In
+the embedding/attention-block layers, gradient grows late vs early for
+*both* A-replay and B-fresh (B-fresh growing faster) — a general
+within-phase trend, not a retrieval-specific one. But `final_ln`
+(0.39×) and `output_proj` (0.43×) show A-replay's gradient shrinking
+sharply late vs early while B-fresh stays flat or grows — repeated
+retrieval specifically re-stabilizing the output head, the one place
+matching real reconsolidation's "windows narrow with repetition"
+signature. `block0` again has the largest raw gradient of any segment
+under every condition — a third independent metric landing on the same
+earliest-layer-most-sensitive finding. Left open: the natural control
+(continue phase 2 on corpus A alone, no B, same step count) to check
+whether A's gradient decays on the same schedule from continued
+optimization alone — not run here.
+
 **Differentiable reasoning / neural theorem proving** — surveyed against
 recent NTP (neural theorem prover) literature, testing whether making
 `tiny_lm_corpus.rs`'s rule-chaining engine's combination rule *learned*
