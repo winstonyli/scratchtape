@@ -114,6 +114,10 @@ name = "softmax1_qknorm_fix"
 path = "examples/alternative_mechanisms/softmax1_qknorm_fix.rs"
 
 [[example]]
+name = "attention_null_baseline"
+path = "examples/alternative_mechanisms/attention_null_baseline.rs"
+
+[[example]]
 name = "predictive_coding"
 path = "examples/alternative_mechanisms/predictive_coding.rs"
 

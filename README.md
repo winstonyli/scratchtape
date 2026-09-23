@@ -217,6 +217,41 @@ gradient starvation → attention weight, not the trained K-vectors' own
 cosine geometry — that would need a checkpoint dump, left as an
 optional deeper confirmation.
 
+**Correction — the sink-uniformity finding and the `'¼'` mechanism
+above are largely a measurement artifact.** Before spending an hour on
+a checkpoint retrain, ran the cheapest discriminating test: the same
+sink metric with no model at all, on exactly uniform causal attention
+(`attention_null_baseline.rs`). It reproduces the reported result: the
+same 19953 usable windows, self-attention rate 0.72 (reported
+0.64–0.78), and `'¼'` as top sink with 10 votes (reported 9–11).
+Cause: softmax1+QK-norm bounds every score to ±0.25, so no weight in a
+row can exceed another by more than e^0.5 ≈ 1.65× — attention is
+near-uniform by construction. The metric averages weight per (query
+byte, key byte) pair over one fixed window set shared by every head and
+seed and takes the argmax; with almost no content signal that argmax
+is decided by where each key byte sat in those windows plus small-
+sample noise for rare bytes (`'¼'` occurs 6 times in train). Plain
+softmax's peaky attention overrides that baseline, hence its varied
+sinks. The "undertrained embedding → generic K direction" story is
+retracted — it explained a pattern the null already produces (and never
+explained why `'¼'` beat bytes with lower gradient sums). Also in
+doubt, since they read attention argmax over the same windows: the
+top-1-target diversity gain (48→68), the cross-seed stability jump
+(7→20→63 unanimous — shared windows make a window-determined argmax
+agree across seeds by construction), and the attention-neighbor KG/
+graph-probe results. Standing: everything computed from embeddings
+alone (the clean 7-vowel k-means cluster; is-vowel decision-tree
+0.815→0.859→0.924, isolated from the step budget by the plain-softmax
+control), zero divergence, and held-out-loss parity at 64000 steps.
+The real mechanism-specific fact is that QK-norm makes attention
+near-uniform; whether the trained model deviates meaningfully from
+uniform at all is the open question, needing a checkpoint and a direct
+per-head KL-from-uniform measurement rather than another argmax metric.
+The promotion rested partly on the diversity evidence, now unproven;
+the loss-parity leg holds. Lesson, same shape as the earlier single-
+seed one: an argmax-style metric needs a null baseline before its
+output is read as structure.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data
