@@ -368,6 +368,22 @@ survives there too. The open question is answered: the output-facing
 layers show genuine reconsolidation-like lability, not confounded
 generic convergence.
 
+Sharpened the early/late split into what "windows narrow with
+repetition" actually claims: `memory_tier_reconsolidation_repetition.rs`
+keys each replay by which of the 8 buffer windows was drawn and how
+many times THAT window has itself been retrieved so far, pooled into
+one dose-response curve per repetition count rather than by phase-2
+wall-clock position. The curve confirms and sharpens the finding:
+`final_ln` drops from 0.165 (1st replay) to 0.027 (21st+) and
+`output_proj` from 0.613 to 0.171 — both largely-monotonic declines
+substantially resolved by ~5 repetitions, at an average phase-2 step of
+only ~320 of 4000, well before elapsed time could explain it.
+`token_emb` and all 4 blocks show no comparable trend — noisy, flat, or
+mildly rising by the 21+ bucket — consistent with their behavior being
+the generic within-phase growth already isolated by the control. The
+more direct confirmation: re-stabilization tracks repetition count of
+the specific retrieved memory, not just elapsed training time.
+
 A different brain analog from the same line: Josselyn & Frankland's
 neurogenesis-forgetting hypothesis — new hippocampal neurons
 integrating into an existing circuit are proposed to *cause* forgetting

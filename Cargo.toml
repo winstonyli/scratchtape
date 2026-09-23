@@ -191,6 +191,10 @@ name = "memory_tier_reconsolidation_control"
 path = "examples/memory_tiers/memory_tier_reconsolidation_control.rs"
 
 [[example]]
+name = "memory_tier_reconsolidation_repetition"
+path = "examples/memory_tiers/memory_tier_reconsolidation_repetition.rs"
+
+[[example]]
 name = "memory_tier_neurogenesis"
 path = "examples/memory_tiers/memory_tier_neurogenesis.rs"
 
