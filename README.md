@@ -150,6 +150,28 @@ step; given a fair budget it reaches parity or better while keeping
 the attention-diversity gain. The fix works, replicates, and costs
 nothing once fairly trained.
 
+Promoted to `tiny_lm_corpus.rs`'s sole attention path (softmax1+QK-norm
+always on, `steps` at the proven-necessary 64000), then re-ran every
+downstream KR&R check against the old plain-softmax baseline. Several
+findings sharpen: the k-means vowel cluster, previously a case-mixed
+grab-bag, is now exactly the 7 vowels and nothing else; block-0/head-0
+cross-seed attention stability jumps from 7 unanimous/43 majority/37
+all-different (plain softmax) to 63/24/0 (softmax1+QK-norm) out of 92
+bytes; is-vowel decision-tree accuracy rises from 0.815 to 0.924. None
+of that can be credited to the mechanism alone from this run — the
+mechanism and the step budget both changed in the same commit, and
+this project's own step-budget-confound precedent already showed step
+count alone moves these numbers. A plain-softmax control at the same
+64000 steps would be needed to isolate it. One result cuts against the
+fix's own motivation: `attention_graph_all_heads()` now shows all 32
+(block, head) combinations converging on the identical top sink target
+byte, with uniformly high self-attention rates (0.64–0.78), versus the
+baseline's per-head-varied sinks and widely spread rates (0.07–0.74) —
+a *more* homogeneous sink pattern, not less, at the all-heads level.
+Reported as found: softmax1+QK-norm doesn't obviously reduce sink
+concentration once every head is examined; it may just relocate which
+byte the sink converges on.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data
