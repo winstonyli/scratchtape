@@ -172,6 +172,25 @@ Reported as found: softmax1+QK-norm doesn't obviously reduce sink
 concentration once every head is examined; it may just relocate which
 byte the sink converges on.
 
+Ran the isolating control both open questions raised: plain softmax at
+the same 64000 steps (a temporary local flip, reverted right after),
+same seeds, same everything else. Cross-seed attention stability goes
+7→20→63 unanimous (16k plain softmax → 64k plain softmax → 64k
+softmax1+QK-norm); is-vowel decision-tree accuracy goes 0.815→0.859→
+0.924, same shape; the vowel cluster stays a case-mixed grab-bag under
+plain softmax even at 64000 steps, only softmax1+QK-norm produces the
+clean 7-vowel cluster. More training alone buys a real but partial
+gain — the mechanism adds substantially more on top of it, resolving
+the confound. And the uniform-sink surprise turns out not to be a
+training-length artifact either: plain softmax at 64000 steps still
+shows 32 different per-head sinks and a wide self-attention-rate
+spread (0.10–0.74), unchanged in kind from the 16k baseline. All 32
+heads converging on one shared sink byte is a genuine, previously-
+unseen behavior specific to softmax1+QK-norm at this step budget —
+sitting alongside, not resolved by, the top-1-diversity gain the
+mechanism was adopted for. Both are real; they measure different
+things.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data
