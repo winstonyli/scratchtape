@@ -148,7 +148,9 @@ against control collapses from +0.216 at matched steps to -0.010 at
 own control outright. Softmax1+QK-norm just converges slower per
 step; given a fair budget it reaches parity or better while keeping
 the attention-diversity gain. The fix works, replicates, and costs
-nothing once fairly trained.
+nothing once fairly trained. *(Retracted below: this compared 64000
+treatment steps to 16000 control steps; at equal steps plain softmax
+wins by ~0.28 nats.)*
 
 Promoted to `tiny_lm_corpus.rs`'s sole attention path (softmax1+QK-norm
 always on, `steps` at the proven-necessary 64000), then re-ran every
@@ -242,15 +244,48 @@ agree across seeds by construction), and the attention-neighbor KG/
 graph-probe results. Standing: everything computed from embeddings
 alone (the clean 7-vowel k-means cluster; is-vowel decision-tree
 0.815→0.859→0.924, isolated from the step budget by the plain-softmax
-control), zero divergence, and held-out-loss parity at 64000 steps.
+control) and zero divergence. (This paragraph originally also listed
+held-out-loss parity at 64000 steps as standing — retracted in the next
+paragraph.)
 The real mechanism-specific fact is that QK-norm makes attention
 near-uniform; whether the trained model deviates meaningfully from
 uniform at all is the open question, needing a checkpoint and a direct
 per-head KL-from-uniform measurement rather than another argmax metric.
-The promotion rested partly on the diversity evidence, now unproven;
-the loss-parity leg holds. Lesson, same shape as the earlier single-
-seed one: an argmax-style metric needs a null baseline before its
-output is read as structure.
+The promotion rested partly on the diversity evidence, now unproven.
+Lesson, same shape as the earlier single-seed one: an argmax-style
+metric needs a null baseline before its output is read as structure.
+
+**Measured directly, and the promotion doesn't survive.**
+`attention_uniformity_check.rs` retrains the seed-1 model under both
+conditions at the same 64000 steps (reproducing tiny_lm_corpus.rs's
+runs exactly: identical loss trajectories), saves checkpoints, and
+measures every head over the sink metric's windows. Softmax1+QK-norm:
+mean KL from uniform 0.0043 nats, peak weight 1.16× uniform (the
+construction allows 1.65×), row mass 0.94, and 93% of query bytes'
+argmax keys identical to the uniform null's — every head in every
+block is effectively a causal mean-pool. Plain softmax: KL 2.24, peak
+21×, 36% null agreement — genuinely selective, so its varied per-head
+sinks (newline, `;`, `:`, `.`) are mostly real content, and its 7/20
+unanimous cross-seed counts are not the artifact the 63 is. Worse, the
+"parity" leg was a step-unmatched comparison all along: the step-budget
+test gave the treatment 64000 steps but compared it to the control's
+16000. At matched steps (seed 1) held-out loss is 2.026
+(softmax1+QK-norm) vs 1.738 (plain), plain lower at all 40 evals after
+init — a ~0.28-nat cost (mean of the last 8 evals: 2.145 vs 1.868), not
+a slower route to the same place. "Costs nothing once fairly trained"
+above is wrong: the fair comparison is equal steps, and it costs. Root
+cause is an implementation gap, not the idea: `l2_normalize_rows` in
+`src/nn.rs` normalizes Q/K with no learnable scale, then divides by
+√d_k, capping logits at ±0.25. Published QK-norm (Henry et al. 2020)
+replaces that fixed 1/√d_k with a learned scalar exactly so attention
+can sharpen. It still eliminates softmax1's divergence — by making
+attention too flat to diverge. What stands from the promotion: zero
+divergence, and the embedding-only results (vowel cluster, 0.924
+decision tree) as measurements of *this* model, though with attention
+this flat those may reflect the model leaning on per-byte embeddings
+because it can't select context — not a better attention mechanism.
+One seed; the held-out eval is noisy (±0.2 between evals), but the
+sign held at every one.
 
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention

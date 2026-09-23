@@ -118,6 +118,10 @@ name = "attention_null_baseline"
 path = "examples/alternative_mechanisms/attention_null_baseline.rs"
 
 [[example]]
+name = "attention_uniformity_check"
+path = "examples/alternative_mechanisms/attention_uniformity_check.rs"
+
+[[example]]
 name = "predictive_coding"
 path = "examples/alternative_mechanisms/predictive_coding.rs"
 
