@@ -85,6 +85,10 @@ name = "tiny_lm_corpus"
 path = "examples/tiny_lm/tiny_lm_corpus.rs"
 
 [[example]]
+name = "ngram_baseline"
+path = "examples/tiny_lm/ngram_baseline.rs"
+
+[[example]]
 name = "gnn_byte_classification"
 path = "examples/tiny_lm/gnn_byte_classification.rs"
 

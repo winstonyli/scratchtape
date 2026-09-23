@@ -346,6 +346,19 @@ project never had a direct gradient check on softmax1 because it
 "composed already-checked ops"; the composition itself was the bug.
 Rerun with the fixed op pending.
 
+**What `tiny_lm_corpus.rs` reports now (plain softmax, 64000 steps).**
+The plain-softmax control run above *is* the current file's output, so
+its numbers replace the headline figures from the promotion paragraph.
+The is-vowel decision tree scores 0.859, not 0.924. Block-0/head-0
+cross-seed attention stability is 20 unanimous of 92 bytes, not 63.
+k-means gives no clean vowel cluster: 'A' 'I' 'O' 'U' 'u' cluster
+together with '-' and two stray bytes, while 'a' 'e' 'i' 'o' sit in a
+large lowercase cluster. Per-head sinks vary across all 32 heads, with
+self-attention rates spread over 0.10–0.74. Seed-1 held-out loss is
+1.738 (1.93 at 16000 steps). The 0.924, clean 7-vowel, and 63-unanimous
+figures belong to the L2 softmax1+QK-norm model, run with the buggy
+softmax1, and aren't reproducible from the current code.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data
@@ -667,8 +680,91 @@ taking pre-leafed `Var`s for tied reuse, and `apply_grad` panics instead
 of silently computing a partial gradient if it's ever called with a
 stale output from before a later `forward()` call.
 
+## Related work
+
+Literature (surveyed 2026-09-23) and a sibling project, each with what
+it means here.
+
+**QK-norm**
+- Henry et al. 2020, *Query-Key Normalization for Transformers*
+  ([arXiv 2010.04245](https://arxiv.org/abs/2010.04245)): L2-normalize Q/K, then
+  *multiply* by a learnable scale in place of 1/√d. This project's first
+  version kept 1/√d and dropped the learnable scale; that's why attention
+  went uniform.
+- Loshchilov et al. 2024, *nGPT* ([arXiv 2410.01131](https://arxiv.org/abs/2410.01131)):
+  unit-normalized q·k has variance 1/d_k, so the softmax factor should be
+  √d_k, plus a learnable per-head s_qk. An independent diagnosis of the
+  same bug.
+- Dehghani et al. 2023, *ViT-22B* ([arXiv 2302.05442](https://arxiv.org/abs/2302.05442)):
+  LayerNorm on Q/K, 1/√d kept. The form `TransformerBlock::with_qk_norm`
+  uses. Per-head beats layer-wise Q/K norm at suppressing logit growth.
+- Wortsman et al. 2023, *Small-scale proxies for large-scale Transformer
+  training instabilities* ([arXiv 2309.14322](https://arxiv.org/abs/2309.14322)):
+  attention-logit growth reproduces in small models at high LR, and
+  qk-layernorm fixes it there. Relevant to lr 0.3 SGD here.
+- Zhai et al. 2023, σReparam ([arXiv 2303.06296](https://arxiv.org/abs/2303.06296)):
+  attention *entropy collapse* destabilizes training. The L2 bug hit the
+  opposite pole (maximum entropy, heads as mean-pools).
+
+**softmax1, attention sinks, abstention**
+- Miller 2023, *Attention Is Off By One*
+  ([blog](https://www.evanmiller.org/attention-is-off-by-one.html)): softmax1.
+  Follow-up tests found only small outlier reductions.
+- Bondarenko et al. 2023, *Quantizable Transformers* ([arXiv 2306.12929](https://arxiv.org/abs/2306.12929)):
+  outliers come from heads learning no-ops. The fixes are clipped softmax
+  and gated attention.
+- Gu et al., ICLR 2025, *When Attention Sink Emerges* ([arXiv 2410.10781](https://arxiv.org/abs/2410.10781)):
+  sinks stem from softmax normalization. Sigmoid attention without
+  normalization removes them up to 1B params.
+- Qiu et al. 2025, *Gated Attention for LLMs* (NeurIPS 2025 best paper,
+  [arXiv 2505.06708](https://arxiv.org/abs/2505.06708)): an elementwise sigmoid
+  gate after attention removes sinks and improves loss. The form
+  `with_attn_gate` uses.
+- Zuhri et al. 2025, *Softpick* ([arXiv 2504.20966](https://arxiv.org/abs/2504.20966)):
+  rectified, not-sum-to-one softmax. 0% sink rate at 340M/1.8B.
+- Wang 2026, *Abstention and Noise Filtering* ([arXiv 2609.22005](https://arxiv.org/abs/2609.22005),
+  preprint): abstention (off-by-one, sink logit) is worth ~0.019 nats at
+  10M params and shrinks with scale. Gated noise filtering grows with
+  scale, and sink logit + gate is best. At this project's ~0.6M params,
+  softmax1-style abstention should help slightly, if at all.
+- Rizwan et al. 2026 ([arXiv 2609.08574](https://arxiv.org/abs/2609.08574), preprint):
+  at 1M params gated attention never learned sparsity (mean gate 0.69 vs
+  0.12 at scale). Sinks were driven by the training objective as much as
+  the architecture. A caution for mechanisms tested at this scale.
+
+**Continual learning / memory tiers**
+- McClelland, McNaughton & O'Reilly 1995 (complementary learning
+  systems); Kirkpatrick et al. 2017 (EWC); Zenke et al. 2017 (Synaptic
+  Intelligence): the lineage of the replay and Fisher-consolidation
+  experiments.
+- Arani et al. 2022, *CLS-ER* ([arXiv 2201.12604](https://arxiv.org/abs/2201.12604)):
+  fast (plastic) and slow (stable) EMA copies of the working model plus a
+  consistency loss. A concrete, published version of the untried
+  "two-speed" tier idea.
+- Replay + EWC together is standard in continual language learning
+  (e.g. Distill-and-Replay, [COLING 2020](https://aclanthology.org/2020.coling-main.318.pdf)).
+  Never tried together here.
+- *EWC Done Right* 2026 ([arXiv 2603.18596](https://arxiv.org/abs/2603.18596)):
+  Fisher-based importance can suffer gradient vanishing and misallocate
+  protection. A candidate factor in the Fisher run's new-task cost,
+  unverified.
+
+**Sibling project: `humble-cortex`** (`../humble-cortex`, predictive
+coding in Rust). Its 95 checks overlap here in three places. First, every
+model is benchmarked against the simplest baseline for the task
+(persistence, OLS, backoff n-gram, kNN); scratchtape's tiny LMs had none
+until the n-gram baseline below. Second, partial replay + consolidation
+compounded (37.6% / 41.2% alone, 54.0% combined, over 3 repeats), which is
+untested here. Third, retention is normalized by how much was learned,
+because raw forgetting deltas hid a floor effect.
+
 ## Open threads
 
+- **Replay + Fisher consolidation together** — humble-cortex found them
+  synergistic. Here each was only tried alone, and Fisher's new-task cost
+  might be offset by replay.
+- **CLS-ER-style two-speed memory** — fast and slow EMA copies of the
+  model with a consistency loss (Arani et al. 2022).
 - **A persistent, on-device GPU training backend** — the current GPU
   kernel is correct but pays a full host round-trip per call, which is
   why it doesn't win at this model's scale. Scoped as its own
