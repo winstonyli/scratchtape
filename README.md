@@ -368,6 +368,40 @@ survives there too. The open question is answered: the output-facing
 layers show genuine reconsolidation-like lability, not confounded
 generic convergence.
 
+A different brain analog from the same line: Josselyn & Frankland's
+neurogenesis-forgetting hypothesis — new hippocampal neurons
+integrating into an existing circuit are proposed to *cause* forgetting
+of memories that circuit already held, independent of time or how much
+else gets learned (the leading explanation for infantile amnesia).
+Adult neurogenesis specifically occurs in the dentate gyrus, an early
+hippocampal stage — motivating `memory_tier_neurogenesis.rs` to
+reinitialize `block0` specifically (also the segment Fisher-
+consolidation and reconsolidation independently found most sensitive).
+Trained once on corpus A, snapshotted, then forked into two phase-2
+branches seeing the *identical* corpus-B training sequence — one
+control, one with `block0` reinitialized to fresh random weights
+first.
+
+A real but modest effect, with a real confound. Neither branch
+actually forgets A outright at this scale (matching the established
+saturation finding — real prose shares enough universal byte-level
+structure that there's a floor on how much any phase can forget); both
+branches' loss on A slightly *improves* after phase 2 (control:
+2.382→2.334; neurogenesis: 2.382→2.358). But the improvement is
+roughly half as large under reinitialization (−0.048 vs −0.024), and
+loss on B is *worse* too (2.127 vs 2.168) — reinitializing block0 cost
+both retention and new-task learning simultaneously, not a clean
+stability/plasticity trade-off, because the reinitialized block has to
+relearn its role from random init in the same step budget rather than
+arriving "unencumbered." Honest caveat: reinitializing an entire
+existing block is a harsher "wipe and regrow" than the biological
+analog — real adult-born neurons integrate *alongside* existing,
+undisturbed synapses, they don't erase them. This conflates "new
+growth disrupts old memories" with "a block relearning from scratch is
+just a worse starting point." A more faithful test would add new
+capacity (an extra head or block) without erasing what's already
+there — not run here.
+
 **Differentiable reasoning / neural theorem proving** — surveyed against
 recent NTP (neural theorem prover) literature, testing whether making
 `tiny_lm_corpus.rs`'s rule-chaining engine's combination rule *learned*
