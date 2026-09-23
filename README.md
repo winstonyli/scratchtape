@@ -402,6 +402,21 @@ just a worse starting point." A more faithful test would add new
 capacity (an extra head or block) without erasing what's already
 there — not run here.
 
+Ran that more faithful test (`memory_tier_neurogenesis_additive.rs`):
+blocks 0-3 stay byte-for-byte untouched, phase 2 simply appends a fresh
+block4, and every parameter — old and new — stays trainable. The
+effect disappears: retention on A is statistically indistinguishable
+from control (−0.048 control vs −0.050 additive), and learning B is
+also slightly better with the extra block (2.118 vs 2.127). Side by
+side, the two experiments say something more precise than either
+alone: the reinit run's real cost wasn't caused by the mere presence of
+new, untrained capacity — it was caused by the *destructive* act of
+erasing already-useful weights and forcing that segment to relearn
+from scratch. Made faithful to what real neurogenesis actually does
+(add without erasing), this system shows no measurable neurogenesis-
+forgetting effect at all — a genuine, clarifying negative result that
+locates the disruptive ingredient precisely, not a failed replication.
+
 **Differentiable reasoning / neural theorem proving** — surveyed against
 recent NTP (neural theorem prover) literature, testing whether making
 `tiny_lm_corpus.rs`'s rule-chaining engine's combination rule *learned*

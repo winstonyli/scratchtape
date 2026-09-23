@@ -194,6 +194,10 @@ path = "examples/memory_tiers/memory_tier_reconsolidation_control.rs"
 name = "memory_tier_neurogenesis"
 path = "examples/memory_tiers/memory_tier_neurogenesis.rs"
 
+[[example]]
+name = "memory_tier_neurogenesis_additive"
+path = "examples/memory_tiers/memory_tier_neurogenesis_additive.rs"
+
 # differentiable reasoning / neural theorem proving
 [[example]]
 name = "differentiable_forward_chaining"
