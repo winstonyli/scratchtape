@@ -352,6 +352,22 @@ earliest-layer-most-sensitive finding. Left open: the natural control
 whether A's gradient decays on the same schedule from continued
 optimization alone — not run here.
 
+Ran that control (`memory_tier_reconsolidation_control.rs`): identical
+phase 1, then phase 2 continues on corpus A alone, no B, no replay. The
+embedding/attention-block growth trend survives unchanged (1.15–1.63×,
+if anything larger) — confirming that part is generic optimization
+dynamics, unrelated to retrieval. But `final_ln`/`output_proj` invert:
+under uninterrupted A training they hold flat or grow slightly (1.12×,
+0.93×) instead of shrinking, unlike the sharp decay under interference
+(0.39×, 0.43×). That isolates the effect: `final_ln`'s reconsolidation-
+like re-stabilization is genuinely retrieval-specific, not continued-
+training artifact. `output_proj` is partial — the control's own mild
+decay (0.93×) explains some but not most of the interference run's
+shrinkage (0.43×), so a real, smaller retrieval-specific component
+survives there too. The open question is answered: the output-facing
+layers show genuine reconsolidation-like lability, not confounded
+generic convergence.
+
 **Differentiable reasoning / neural theorem proving** — surveyed against
 recent NTP (neural theorem prover) literature, testing whether making
 `tiny_lm_corpus.rs`'s rule-chaining engine's combination rule *learned*
