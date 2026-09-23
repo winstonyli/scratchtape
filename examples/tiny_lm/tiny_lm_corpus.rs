@@ -315,19 +315,19 @@ fn kmeans(points: &[Vec<f32>], k: usize, iterations: usize, rng: &mut Rng) -> Ve
     assignments
 }
 
-/// softmax1+QK-norm, promoted to the only path here after being proven a
-/// genuine, replicated, no-cost improvement: it eliminates the frequency-
-/// sink concentration the original attention-graph rerun found ([f30c608]),
-/// the diversity gain replicates across 3 independent seeds (not the
-/// single-seed noise [ccd411e] already warned this project about once), and
-/// its apparent held-out-loss cost at matched steps turned out to be a
-/// step-budget confound - it reaches parity or better once given a fair
-/// training budget (see `steps` below). Plain softmax/no-QK-norm is no
-/// longer exercised anywhere in this file; TransformerBlock::forward_full's
-/// own use_softmax1/use_qknorm flags stay general-purpose at the library
-/// level (still opt-in there, still used elsewhere e.g.
-/// softmax1_divergence_diagnosis.rs) - this file just no longer needs to
-/// choose between the two.
+/// Plain softmax, no QK-norm - back from softmax1+QK-norm ([e4820bd]),
+/// whose promotion evidence fell (README "Correction", "Measured
+/// directly"): the diversity gain was an argmax artifact of the original
+/// L2 QK-norm making every head a near-exact mean-pool, and the loss
+/// "parity" compared 64000 treatment steps with 16000 control steps. With a
+/// learnable-scale (LayerNorm) QK-norm instead, softmax1 runs away (block
+/// 0's Q/K norm gains ~1e9, loss stuck near unigram level) - its "no
+/// divergence" came entirely from the L2 cap. LayerNorm QK-norm under
+/// plain softmax is stable but ties plain softmax on held-out loss (1.740
+/// vs 1.738), so it isn't worth its parameters here.
+/// attention_uniformity_check.rs has all three conditions. Results in
+/// this file recorded between [e4820bd] and this change used the L2
+/// softmax1+QK-norm model.
 fn forward(
     tape: &mut Tape,
     token_emb: &Embedding,
@@ -344,7 +344,7 @@ fn forward(
 
     let mut block_outs = Vec::with_capacity(blocks.len());
     for block in blocks {
-        let out = block.forward_full(tape, x, 1, true, true);
+        let out = block.forward(tape, x);
         x = out.y;
         block_outs.push(out);
     }
@@ -448,10 +448,9 @@ fn train_token_embedding(
         let (logits, out) = forward(&mut tape, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &input);
         let loss = tape.cross_entropy(logits, &target);
         let loss_val = tape.value(loss).data[0];
-        // softmax1+QK-norm never diverges at this step count ([e4820bd]
-        // confirmed zero divergence at 4x this budget across 3 seeds), but
-        // the check costs nothing and catches a regression clearly instead
-        // of burning the rest of the run on NaN-corrupted weights.
+        // Plain softmax has never diverged at this budget, but the check
+        // costs nothing and catches a regression clearly instead of
+        // burning the rest of the run on NaN-corrupted weights.
         if loss_val.is_nan() {
             println!("  seed {seed} diverged to NaN at step {step}");
             break;
@@ -770,17 +769,14 @@ fn main() {
     //   at this corpus size.
     let (d_model, n_heads, d_ff, seq_len, n_blocks) = (128, 8, 256, 64, 4);
     let vocab_size = 256;
-    println!("model: d_model={d_model} n_heads={n_heads} d_ff={d_ff} seq_len={seq_len} n_blocks={n_blocks}, softmax1+QK-norm ([e4820bd])");
+    println!("model: d_model={d_model} n_heads={n_heads} d_ff={d_ff} seq_len={seq_len} n_blocks={n_blocks}, plain softmax");
 
     // Originally 4x tiny_lm_corpus's step count to test the undertraining
     // theory from the cross-seed stability check (confirmed: stability rose
-    // broadly). Bumped again to 64000 ([e4820bd]) for a different reason -
-    // softmax1+QK-norm (now this file's only mechanism, see forward())
-    // converges slower per step than plain softmax did; at the previous
-    // 16000 it trailed plain softmax's held-out loss on every seed, but at
-    // this budget it reaches parity or better while keeping the attention-
-    // diversity gain that motivated adopting it. Not re-tuned further -
-    // this is the budget the fix was actually proven at, not a guess.
+    // broadly). Bumped again to 64000 ([e4820bd]) for softmax1+QK-norm's
+    // slower convergence; kept after reverting to plain softmax, which also
+    // improves over 16000 -> 64000 (held-out 1.93 -> 1.74, seed 1) and is
+    // the budget every current comparison was measured at.
     let steps = 64000;
 
     // The 3 seed runs (1 primary + diagnostics, 2 lean) are fully

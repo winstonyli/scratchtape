@@ -93,7 +93,7 @@ fn forward_variant(
 
     let mut block_outs = Vec::with_capacity(blocks.len());
     for block in blocks {
-        let out = block.forward_full(tape, x, 1, use_softmax1, false);
+        let out = block.forward_full(tape, x, 1, use_softmax1);
         x = out.y;
         block_outs.push(out);
     }

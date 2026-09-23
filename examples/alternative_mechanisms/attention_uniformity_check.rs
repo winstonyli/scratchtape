@@ -12,8 +12,7 @@
 //   - KL(row / row-mass || uniform over visible keys), mean over rows -
 //     0 means exactly uniform.
 //   - peak factor: max normalized weight x visible-key count - 1.0 is
-//     uniform, larger is peakier. QK-norm caps it near e^0.5 =~ 1.65 per
-//     row by construction (scores are +/-0.25).
+//     uniform, larger is peakier.
 //   - row mass: sum of weights (softmax1 lets it fall below 1).
 //   - argmax agreement with the null: fraction of query bytes whose top
 //     key under this head equals the top key under uniform attention on
@@ -22,14 +21,32 @@
 // (including the eval_loss draws every 1600 steps) so the seed-1 models
 // match tiny_lm_corpus.rs's.
 //
-// Result (32-head means): softmax1+QK-norm KL=0.0043, peak=1.16, mass=0.94,
-// null-argmax agreement 0.93 - effectively a causal mean-pool; its sink
-// tables are the null's. Plain softmax KL=2.24, peak=21.4, agreement 0.36 -
-// genuinely selective, so its per-head sinks are mostly real content.
-// Held-out loss at the same 64000 steps: 2.026 (softmax1+QK-norm) vs 1.738
-// (plain), plain lower at all 40 evals after init. Root cause: QK-norm here
-// has no learnable scale, so logits are capped at +/-0.25; the published
-// form (Henry et al. 2020) learns that scale.
+// First result, with the original L2-normalized QK-norm (32-head means;
+// that variant is gone from the library, see commit 1d84ca5):
+// softmax1+QK-norm KL=0.0043, peak=1.16, mass=0.94, null-argmax agreement
+// 0.93 - effectively a causal mean-pool; its sink tables are the null's.
+// Plain softmax KL=2.24, peak=21.4, agreement 0.36 - genuinely selective,
+// so its per-head sinks are mostly real content. Held-out loss at the same
+// 64000 steps: 2.026 (softmax1+QK-norm) vs 1.738 (plain), plain lower at
+// all 40 evals after init. Root cause: no learnable scale, so logits were
+// capped at +/-0.25.
+//
+// Now: TransformerBlock::with_qk_norm's LayerNorm QK-norm (learnable
+// gamma, ViT-22B's form) under softmax1 - the promoted mechanism, fixed -
+// and under plain softmax, which separates softmax1's contribution from
+// QK-norm's. The plain checkpoint is unchanged (a plain block's layout
+// didn't change) so it's reused.
+//
+// Result: plain+LN-QK-norm is stable and selective (KL=1.71, peak=15.8,
+// agreement 0.47) and ties plain on held-out loss (1.740 vs 1.738; train
+// 1.24 vs 1.36). softmax1+LN-QK-norm tracks the others to step 1600, then
+// jumps to ~3.0 nats and stays (unigram CE is ~3.27) with no NaN: in the
+// checkpoint, block 0's Q/K norm gains are ~1e9 and its K-norm bias ~2e8,
+// while blocks 1-3 sit near init. A K bias shifts every logit in a row
+// equally - zero gradient under plain softmax (its K biases stayed 0.00),
+// but softmax1's row mass depends on it, so nothing bounds it. The L2
+// variant's "no divergence" came from capping the logits, not from fixing
+// that pressure.
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::{Tape, Var};
@@ -39,7 +56,7 @@ use std::time::Instant;
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{ForwardOut, apply_grad, encode_bytes, flatten_all, reconstruct, sample_window};
+use common::{ForwardOut, apply_grad, encode_bytes, flatten_all, sample_window};
 
 const D_MODEL: usize = 128;
 const N_HEADS: usize = 8;
@@ -65,7 +82,6 @@ fn forward(
     output_proj: &Linear,
     input_ids: &[usize],
     softmax1: bool,
-    qknorm: bool,
 ) -> (Var, ForwardOut) {
     let positions: Vec<usize> = (0..input_ids.len()).collect();
     let tok_out = token_emb.forward(tape, input_ids);
@@ -73,7 +89,7 @@ fn forward(
     let mut x = tape.add(tok_out.y, pos_out.y);
     let mut block_outs = Vec::with_capacity(blocks.len());
     for block in blocks {
-        let out = block.forward_full(tape, x, 1, softmax1, qknorm);
+        let out = block.forward_full(tape, x, 1, softmax1);
         x = out.y;
         block_outs.push(out);
     }
@@ -91,13 +107,12 @@ fn eval_loss(
     output_proj: &Linear,
     corpus: &[usize],
     softmax1: bool,
-    qknorm: bool,
 ) -> f32 {
     let mut total = 0.0;
     for _ in 0..20 {
         let (input, target) = sample_window(rng, corpus, SEQ_LEN);
         let mut tape = Tape::new();
-        let (logits, _) = forward(&mut tape, token_emb, pos_emb, blocks, final_ln, output_proj, &input, softmax1, qknorm);
+        let (logits, _) = forward(&mut tape, token_emb, pos_emb, blocks, final_ln, output_proj, &input, softmax1);
         let loss = tape.cross_entropy(logits, &target);
         total += tape.value(loss).data[0];
     }
@@ -110,7 +125,12 @@ fn train(train_set: &[usize], held_out: &[usize], steps: usize, softmax1: bool, 
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, VOCAB, D_MODEL);
     let mut pos_emb = Embedding::new(&mut rng, SEQ_LEN, D_MODEL);
-    let mut blocks: Vec<TransformerBlock> = (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF)).collect();
+    let mut blocks: Vec<TransformerBlock> = (0..N_BLOCKS)
+        .map(|_| {
+            let block = TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF);
+            if qknorm { block.with_qk_norm() } else { block }
+        })
+        .collect();
     let mut final_ln = LayerNorm::new(D_MODEL);
     let mut output_proj = Linear::new(&mut rng, D_MODEL, VOCAB);
     let opt = Sgd { lr: 0.3 };
@@ -119,7 +139,7 @@ fn train(train_set: &[usize], held_out: &[usize], steps: usize, softmax1: bool, 
     for step in 0..=steps {
         let (input, target) = sample_window(&mut rng, train_set, SEQ_LEN);
         let mut tape = Tape::with_capacity(2000);
-        let (logits, out) = forward(&mut tape, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &input, softmax1, qknorm);
+        let (logits, out) = forward(&mut tape, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &input, softmax1);
         let loss = tape.cross_entropy(logits, &target);
         tape.backward(loss);
         let tok_grad = tape.grad(out.tok_out.table).unwrap();
@@ -128,8 +148,8 @@ fn train(train_set: &[usize], held_out: &[usize], steps: usize, softmax1: bool, 
         }
         apply_grad(&tape, &out, &mut token_emb, &mut pos_emb, &mut blocks, &mut final_ln, &mut output_proj, &opt);
         if step % 1600 == 0 {
-            let tr = eval_loss(&mut rng, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, train_set, softmax1, qknorm);
-            let ho = eval_loss(&mut rng, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, held_out, softmax1, qknorm);
+            let tr = eval_loss(&mut rng, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, train_set, softmax1);
+            let ho = eval_loss(&mut rng, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, held_out, softmax1);
             log.push(format!("step {step:>5}: eval train = {tr:.4}, eval held-out = {ho:.4} ({:.1}s)", start.elapsed().as_secs_f32()));
         }
     }
@@ -142,13 +162,24 @@ fn save(path: &str, m: &Model, grad_accum: &[f32]) {
     std::fs::write(path, format!("{}\n{}\n", join(grad_accum), join(&flat))).unwrap();
 }
 
-fn load(path: &str) -> Option<(Model, Vec<f32>)> {
+fn load(path: &str, qknorm: bool) -> Option<(Model, Vec<f32>)> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     let parse = |l: &str| l.split_whitespace().map(|x| x.parse::<f32>().unwrap()).collect::<Vec<f32>>();
     let grad_accum = parse(lines.next()?);
     let flat = parse(lines.next()?);
-    let (token_emb, pos_emb, blocks, final_ln, output_proj) = reconstruct(&flat, VOCAB, D_MODEL, SEQ_LEN, N_BLOCKS, N_HEADS, D_FF);
+    // common::reconstruct, plus the Q/K norms a QK-norm block appends.
+    let mut offset = 0;
+    let token_emb = Embedding::from_flat(&flat, &mut offset, VOCAB, D_MODEL);
+    let pos_emb = Embedding::from_flat(&flat, &mut offset, SEQ_LEN, D_MODEL);
+    let mut blocks = Vec::with_capacity(N_BLOCKS);
+    for _ in 0..N_BLOCKS {
+        let block = TransformerBlock::from_flat(&flat, &mut offset, D_MODEL, N_HEADS, D_FF);
+        blocks.push(if qknorm { block.with_qk_norm_from_flat(&flat, &mut offset) } else { block });
+    }
+    let final_ln = LayerNorm::from_flat(&flat, &mut offset, D_MODEL);
+    let output_proj = Linear::from_flat(&flat, &mut offset, D_MODEL, VOCAB);
+    assert_eq!(offset, flat.len(), "{path}: checkpoint doesn't match the qknorm={qknorm} architecture");
     Some((Model { token_emb, pos_emb, blocks, final_ln, output_proj }, grad_accum))
 }
 
@@ -169,7 +200,7 @@ fn argmax_targets(sum: &[f32], count: &[u32], n: usize) -> Vec<Option<usize>> {
         .collect()
 }
 
-fn analyze(name: &str, m: &Model, train_set: &[usize], filtered: &[usize], softmax1: bool, qknorm: bool) -> Vec<String> {
+fn analyze(name: &str, m: &Model, train_set: &[usize], filtered: &[usize], softmax1: bool) -> Vec<String> {
     let byte_index: HashMap<usize, usize> = filtered.iter().enumerate().map(|(i, &b)| (b, i)).collect();
     let n = filtered.len();
     let heads = N_BLOCKS * N_HEADS;
@@ -190,7 +221,7 @@ fn analyze(name: &str, m: &Model, train_set: &[usize], filtered: &[usize], softm
         used += 1;
         let idxs: Vec<usize> = window.iter().map(|b| byte_index[b]).collect();
         let mut tape = Tape::new();
-        let (_, out) = forward(&mut tape, &m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj, &window, softmax1, qknorm);
+        let (_, out) = forward(&mut tape, &m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj, &window, softmax1);
         for qi in 0..SEQ_LEN {
             for ki in 0..SEQ_LEN {
                 let cell = idxs[qi] * n + idxs[ki];
@@ -281,7 +312,7 @@ fn main() {
     // seconds; the real run uses the defaults.
     let steps: usize = std::env::var("STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64000);
 
-    let conditions = [("softmax1+qknorm", true, true), ("plain", false, false)];
+    let conditions = [("softmax1+lnqknorm", true, true), ("plain+lnqknorm", false, true), ("plain", false, false)];
     let results: Vec<(Vec<String>, Vec<String>)> = thread::scope(|scope| {
         let handles: Vec<_> = conditions
             .iter()
@@ -289,7 +320,7 @@ fn main() {
                 scope.spawn(move || {
                     let path = format!("attention_uniformity_{}.txt", name.replace('+', "_"));
                     let mut log = Vec::new();
-                    let (model, grad_accum) = match load(&path) {
+                    let (model, grad_accum) = match load(&path, qknorm) {
                         Some(loaded) => {
                             log.push(format!("loaded checkpoint {path}, skipped training"));
                             loaded
@@ -309,7 +340,7 @@ fn main() {
                     let noise_floor = grad_accum[by_accum[distinct.len() / 5]];
                     let filtered: Vec<usize> = distinct.iter().copied().filter(|&b| grad_accum[b] >= noise_floor).collect();
                     log.push(format!("{} of {} bytes pass the noise filter", filtered.len(), distinct.len()));
-                    let analysis = analyze(name, &model, train_set, &filtered, softmax1, qknorm);
+                    let analysis = analyze(name, &model, train_set, &filtered, softmax1);
                     (log, analysis)
                 })
             })

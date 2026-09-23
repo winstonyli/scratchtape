@@ -152,7 +152,8 @@ nothing once fairly trained. *(Retracted below: this compared 64000
 treatment steps to 16000 control steps; at equal steps plain softmax
 wins by ~0.28 nats.)*
 
-Promoted to `tiny_lm_corpus.rs`'s sole attention path (softmax1+QK-norm
+*(Promotion later reversed — see "Fixing QK-norm doesn't rescue
+softmax1" below.)* Promoted to `tiny_lm_corpus.rs`'s sole attention path (softmax1+QK-norm
 always on, `steps` at the proven-necessary 64000), then re-ran every
 downstream KR&R check against the old plain-softmax baseline. Several
 findings sharpen: the k-means vowel cluster, previously a case-mixed
@@ -286,6 +287,41 @@ this flat those may reflect the model leaning on per-byte embeddings
 because it can't select context — not a better attention mechanism.
 One seed; the held-out eval is noisy (±0.2 between evals), but the
 sign held at every one.
+
+**Fixing QK-norm doesn't rescue softmax1; it exposes it.** Replaced the
+library's L2 QK-norm with per-head LayerNorm on Q and K
+(`TransformerBlock::with_qk_norm`, ViT-22B's form: learnable γ, 1/√d_k
+kept, so logits start near ±√d_k instead of ±0.25; nGPT independently
+diagnoses the same bug: unit-normalized q·k has variance 1/d_k, so the
+right factor is √d_k). Reran `attention_uniformity_check.rs` with three
+conditions, seed 1, 64000 steps:
+
+| Condition | KL from uniform | Peak | Null agreement | Held-out | Train |
+|---|---|---|---|---|---|
+| plain softmax | 2.24 | 21.4× | 0.36 | 1.738 | 1.362 |
+| plain + LN QK-norm | 1.71 | 15.8× | 0.47 | 1.740 | 1.239 |
+| softmax1 + LN QK-norm | 0.40 | 5.0× | 0.61 | 2.976 | 3.013 |
+
+LN QK-norm under plain softmax is stable, keeps attention selective, and
+ties plain on held-out loss (fits train better, generalizes no better).
+Softmax1 with it tracks the other two to step 1600 (2.82 held-out), then
+jumps to ~3.0 and stays there — barely better than a unigram model (3.27)
+— with no NaN. The checkpoint shows why: block 0's Q/K norm gains grew to
+~1e9 and its K-norm bias to ~2e8, while blocks 1–3 sit at their init
+norms. A key bias shifts every logit in a row by the same amount, which
+has exactly zero gradient under plain softmax (its K biases stayed 0.00)
+but moves softmax1's row mass, so nothing bounds it: the same unbounded
+pressure behind softmax1's original divergence. The L2 version's "zero
+divergence" came from capping logits at ±0.25, which also removed
+selectivity. Net: softmax1 isn't viable in this setup (SGD, lr 0.3)
+without bounding the logit scale some other way, and the promotion is
+reversed: `tiny_lm_corpus.rs` is back on plain softmax. Every
+`tiny_lm_corpus.rs` result recorded between `e4820bd` and this change
+came from the L2 softmax1+QK-norm model. For context, recent work puts
+softmax1's upside at small scale in the hundredths of a nat (abstention
+~0.019 nats at 10M params, shrinking with scale; Wang 2026). Gated or
+sink-logit variants (Qwen's gated attention, NeurIPS 2025; a learnable
+phantom key) get abstention without unbounded logits. One seed.
 
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention

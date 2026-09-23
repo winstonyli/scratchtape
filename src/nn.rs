@@ -405,6 +405,9 @@ pub struct TransformerBlockOut {
     pub ln2_out: LayerNormOut,
     pub ffn1_out: LinearOut,
     pub ffn2_out: LinearOut,
+    /// Per-head (Q-norm, K-norm) outputs; empty unless the block was built
+    /// `with_qk_norm`.
+    pub qk_norm_outs: Vec<(LayerNormOut, LayerNormOut)>,
 }
 
 /// Pre-norm transformer block: x + Attn(LN(x)), then x + FFN(LN(x)).
@@ -428,6 +431,14 @@ pub struct TransformerBlock {
     ln2: LayerNorm,
     ffn1: Linear,
     ffn2: Linear,
+    /// Per-head (Q, K) LayerNorms over d_k - QK-norm as ViT-22B does it
+    /// (Dehghani et al. 2023), 1/sqrt(d_k) kept. Empty = no QK-norm. An
+    /// earlier version L2-normalized Q/K with no learnable scale, capping
+    /// logits at +/-1/sqrt(d_k) = +/-0.25 and making every trained head a
+    /// near-exact mean-pool (attention_uniformity_check.rs); LayerNorm's
+    /// gamma is the learnable scale that version lacked, and at init
+    /// logits already span ~+/-sqrt(d_k) rather than +/-1/sqrt(d_k).
+    qk_norms: Vec<(LayerNorm, LayerNorm)>,
     /// Causal mask is identical on every call for a fixed (seq_len,
     /// batch_size) - cached rather than rebuilt (fresh allocation +
     /// O(seq_len^2) fill loop, now O(batch_size*seq_len^2)) on every forward
@@ -457,8 +468,26 @@ impl TransformerBlock {
             ln2: LayerNorm::new(d_model),
             ffn1: Linear::new(rng, d_model, d_ff),
             ffn2: Linear::new(rng, d_ff, d_model),
+            qk_norms: Vec::new(),
             mask_cache: RefCell::new(None),
         }
+    }
+
+    /// Adds fresh per-head Q/K LayerNorms (gamma=1, beta=0). Consumes no
+    /// rng, so every other parameter matches a plain block from the same
+    /// seed exactly.
+    pub fn with_qk_norm(mut self) -> Self {
+        self.qk_norms = (0..self.n_heads).map(|_| (LayerNorm::new(self.d_k), LayerNorm::new(self.d_k))).collect();
+        self
+    }
+
+    /// Checkpoint counterpart of `with_qk_norm`: reads the Q/K norms that
+    /// `to_flat` appends after a QK-norm block's other parameters.
+    pub fn with_qk_norm_from_flat(mut self, data: &[f32], offset: &mut usize) -> Self {
+        self.qk_norms = (0..self.n_heads)
+            .map(|_| (LayerNorm::from_flat(data, offset, self.d_k), LayerNorm::from_flat(data, offset, self.d_k)))
+            .collect();
+        self
     }
 
     /// Unbatched convenience wrapper - every existing call site (tiny_lm.rs,
@@ -481,42 +510,22 @@ impl TransformerBlock {
     /// dense-stack-then-mask version was rejected (wastes O(batch) more
     /// compute than this).
     pub fn forward_batched(&self, tape: &mut Tape, x: Var, batch_size: usize) -> TransformerBlockOut {
-        self.forward_full(tape, x, batch_size, false, false)
+        self.forward_full(tape, x, batch_size, false)
     }
 
-    /// Same as forward_batched, plus two independent opt-in switches: plain
-    /// softmax vs softmax1 (Tape::softmax1, "Attention Is Off By One"), and
-    /// whether Q/K get L2-normalized per position before the dot product
-    /// (QK-norm - `softmax1_qknorm_fix.rs` proved this eliminates softmax1's
-    /// Q/K-weight-norm runaway in a standalone block; wired in here so a
-    /// real trained model, not just that demo, can use it). A separate
-    /// most-general method rather than new parameters on forward_batched
-    /// itself, so every existing call site (forward(), forward_batched(...))
-    /// keeps working unchanged and stays on plain softmax/no QK-norm - both
-    /// are opt-in, not a default change to already-recorded experiments
-    /// elsewhere in the project.
+    /// Same as forward_batched, plus an opt-in switch for softmax1
+    /// (Tape::softmax1, "Attention Is Off By One") instead of plain softmax.
+    /// QK-norm is not a switch here: it has parameters, so it's part of the
+    /// architecture (`with_qk_norm`) and applies whenever the block has it.
+    /// A separate most-general method rather than new parameters on
+    /// forward_batched itself, so every existing call site stays on plain
+    /// softmax - not a default change to already-recorded experiments.
     ///
     /// Inherits Linear::forward's fresh-leaf-per-call caveat transitively,
     /// through every Linear/LayerNorm this composes (q/k/v/out_proj heads,
-    /// ln1, ln2, ffn1, ffn2) - calling this more than once on the same
-    /// TransformerBlock within one tape is not weight-tie-safe either.
-    /// L2-normalizes each row (position) of `x` to unit length - the QK-norm
-    /// step, moved here unchanged from `softmax1_qknorm_fix.rs` (already
-    /// proved out there against the exact known divergence) now that a real
-    /// consumer needs it inside the library rather than a standalone demo
-    /// block. A small eps before sqrt guards a theoretical all-zero row
-    /// (never observed, but matches this project's existing eps-before-
-    /// sqrt/log safety convention rather than assuming it can't happen).
-    fn l2_normalize_rows(tape: &mut Tape, x: Var) -> Var {
-        let sq = tape.mul(x, x);
-        let sum_sq = tape.sum_last_axis(sq);
-        let eps = tape.leaf(NdArray::new(vec![1e-8; tape.value(sum_sq).data.len()], tape.value(sum_sq).shape.clone()));
-        let sum_sq_eps = tape.add(sum_sq, eps);
-        let norm = tape.sqrt(sum_sq_eps);
-        tape.div(x, norm)
-    }
-
-    pub fn forward_full(&self, tape: &mut Tape, x: Var, batch_size: usize, use_softmax1: bool, use_qknorm: bool) -> TransformerBlockOut {
+    /// ln1, ln2, ffn1, ffn2, Q/K norms) - calling this more than once on the
+    /// same TransformerBlock within one tape is not weight-tie-safe either.
+    pub fn forward_full(&self, tape: &mut Tape, x: Var, batch_size: usize, use_softmax1: bool) -> TransformerBlockOut {
         let seq_len = tape.value(x).shape[0] / batch_size;
         let mask_value = {
             let mut cache = self.mask_cache.borrow_mut();
@@ -537,13 +546,17 @@ impl TransformerBlock {
         let mut v_outs = Vec::with_capacity(self.n_heads);
         let mut head_outputs = Vec::with_capacity(self.n_heads);
         let mut head_weights = Vec::with_capacity(self.n_heads);
+        let mut qk_norm_outs = Vec::with_capacity(self.qk_norms.len());
         for h in 0..self.n_heads {
             let q_out = self.q_heads[h].forward(tape, normed1);
             let k_out = self.k_heads[h].forward(tape, normed1);
             let v_out = self.v_heads[h].forward(tape, normed1);
 
-            let (q_for_scores, k_for_scores) = if use_qknorm {
-                (Self::l2_normalize_rows(tape, q_out.y), Self::l2_normalize_rows(tape, k_out.y))
+            let (q_for_scores, k_for_scores) = if let Some((q_norm, k_norm)) = self.qk_norms.get(h) {
+                let (qn, kn) = (q_norm.forward(tape, q_out.y), k_norm.forward(tape, k_out.y));
+                let ys = (qn.y, kn.y);
+                qk_norm_outs.push((qn, kn));
+                ys
             } else {
                 (q_out.y, k_out.y)
             };
@@ -569,7 +582,7 @@ impl TransformerBlock {
         let ffn2_out = self.ffn2.forward(tape, hidden);
         let y = tape.add(x1, ffn2_out.y); // residual
 
-        TransformerBlockOut { y, head_weights, ln1_out, q_outs, k_outs, v_outs, out_proj_out, ln2_out, ffn1_out, ffn2_out }
+        TransformerBlockOut { y, head_weights, ln1_out, q_outs, k_outs, v_outs, out_proj_out, ln2_out, ffn1_out, ffn2_out, qk_norm_outs }
     }
 
     pub fn apply_grad(&mut self, tape: &Tape, out: &TransformerBlockOut, opt: &Sgd) {
@@ -583,11 +596,16 @@ impl TransformerBlock {
         self.ln2.apply_grad(tape, &out.ln2_out, opt);
         self.ffn1.apply_grad(tape, &out.ffn1_out, opt);
         self.ffn2.apply_grad(tape, &out.ffn2_out, opt);
+        for ((q_norm, k_norm), (q_out, k_out)) in self.qk_norms.iter_mut().zip(&out.qk_norm_outs) {
+            q_norm.apply_grad(tape, q_out, opt);
+            k_norm.apply_grad(tape, k_out, opt);
+        }
     }
 
     /// Purely mechanical - concatenates each sub-component's own to_flat in
     /// a fixed order. No special logic needed since every leaf here is
-    /// already a plain NdArray.
+    /// already a plain NdArray. Q/K norms (if any) go last, so a plain
+    /// block's layout is unchanged and `from_flat` reads it as before.
     pub fn to_flat(&self) -> Vec<f32> {
         let mut out = self.ln1.to_flat();
         for l in &self.q_heads {
@@ -603,12 +621,17 @@ impl TransformerBlock {
         out.extend(self.ln2.to_flat());
         out.extend(self.ffn1.to_flat());
         out.extend(self.ffn2.to_flat());
+        for (q_norm, k_norm) in &self.qk_norms {
+            out.extend(q_norm.to_flat());
+            out.extend(k_norm.to_flat());
+        }
         out
     }
 
     /// Same (d_model, n_heads, d_ff) arguments as `new` - shapes aren't
     /// self-described in the file, so the caller must reconstruct with the
-    /// identical architecture that produced the checkpoint.
+    /// identical architecture that produced the checkpoint (chain
+    /// `with_qk_norm_from_flat` for a QK-norm block).
     pub fn from_flat(data: &[f32], offset: &mut usize, d_model: usize, n_heads: usize, d_ff: usize) -> Self {
         let d_k = d_model / n_heads;
         let ln1 = LayerNorm::from_flat(data, offset, d_model);
@@ -619,7 +642,7 @@ impl TransformerBlock {
         let ln2 = LayerNorm::from_flat(data, offset, d_model);
         let ffn1 = Linear::from_flat(data, offset, d_model, d_ff);
         let ffn2 = Linear::from_flat(data, offset, d_ff, d_model);
-        Self { n_heads, d_k, ln1, q_heads, k_heads, v_heads, out_proj, ln2, ffn1, ffn2, mask_cache: RefCell::new(None) }
+        Self { n_heads, d_k, ln1, q_heads, k_heads, v_heads, out_proj, ln2, ffn1, ffn2, qk_norms: Vec::new(), mask_cache: RefCell::new(None) }
     }
 }
 
@@ -717,38 +740,42 @@ mod tests {
     }
 
     /// Same shape of check as transformer_block_backward_matches_finite_difference,
-    /// with use_qknorm=true - QK-norm composes only pre-existing, already-
-    /// gradient-checked ops (mul, sum_last_axis, add, sqrt, div, same as
-    /// softmax1_qknorm_fix.rs's standalone proof), but this checks the real
-    /// wiring inside forward_full itself, not just the op composition in
-    /// isolation. Spot-checks a q_heads weight instead of out_proj/ffn1 -
-    /// the parameter closest to the new normalization, most likely to catch
-    /// a wiring bug (e.g. scores computed from the un-normalized q/k instead
-    /// of the normalized ones) that the existing plain-softmax test can't
-    /// see at all.
+    /// on a `with_qk_norm` block - QK-norm is an already-gradient-checked
+    /// LayerNorm, but this checks the real wiring inside forward_full itself.
+    /// Spot-checks a q_heads weight (a bug computing scores from the
+    /// un-normalized q/k would show here) and a K-norm gamma (the learnable
+    /// scale itself must actually reach the loss), plus the checkpoint
+    /// round trip, since the norms are appended after the plain layout.
     #[test]
     fn transformer_block_qknorm_backward_matches_finite_difference() {
         let mut rng = Rng::new(2);
         let (d_model, n_heads, d_ff, seq_len) = (8, 2, 16, 4);
-        let block = TransformerBlock::new(&mut rng, d_model, n_heads, d_ff);
+        let block = TransformerBlock::new(&mut rng, d_model, n_heads, d_ff).with_qk_norm();
+
+        let flat = block.to_flat();
+        let mut offset = 0;
+        let restored = TransformerBlock::from_flat(&flat, &mut offset, d_model, n_heads, d_ff).with_qk_norm_from_flat(&flat, &mut offset);
+        assert_eq!(offset, flat.len());
+        assert_eq!(restored.to_flat(), flat);
 
         let x_data: Vec<f32> = (0..seq_len * d_model).map(|i| ((i as f32) * 0.53).cos() * 0.5).collect();
 
         let loss_with = |block: &TransformerBlock, x_data: &[f32]| -> f32 {
             let mut tape = Tape::new();
             let x = tape.leaf(NdArray::new(x_data.to_vec(), vec![seq_len, d_model]));
-            let out = block.forward_full(&mut tape, x, 1, false, true);
+            let out = block.forward_full(&mut tape, x, 1, false);
             let loss = tape.sum(out.y);
             tape.value(loss).data[0]
         };
 
         let mut tape = Tape::new();
         let x = tape.leaf(NdArray::new(x_data.clone(), vec![seq_len, d_model]));
-        let out = block.forward_full(&mut tape, x, 1, false, true);
+        let out = block.forward_full(&mut tape, x, 1, false);
         let loss = tape.sum(out.y);
         tape.backward(loss);
         let x_grad = tape.grad(x).unwrap().clone();
         let q0_w_grad = tape.grad(out.q_outs[0].w).unwrap().clone();
+        let k1_gamma_grad = tape.grad(out.qk_norm_outs[1].1.gamma).unwrap().clone();
 
         let eps = 1e-3;
         for i in 0..x_data.len() {
@@ -777,6 +804,20 @@ mod tests {
             "q_heads[0].w[0] grad mismatch: numerical {numerical} vs analytical {}",
             q0_w_grad.data[0]
         );
+
+        let orig = block.qk_norms[1].1.gamma.data[0];
+        block.qk_norms[1].1.gamma.data[0] = orig + eps;
+        let lp = loss_with(&block, &x_data);
+        block.qk_norms[1].1.gamma.data[0] = orig - eps;
+        let lm = loss_with(&block, &x_data);
+        block.qk_norms[1].1.gamma.data[0] = orig;
+        let numerical = (lp - lm) / (2.0 * eps);
+        assert!(
+            (numerical - k1_gamma_grad.data[0]).abs() < 1e-2,
+            "k-norm[1].gamma[0] grad mismatch: numerical {numerical} vs analytical {}",
+            k1_gamma_grad.data[0]
+        );
+        assert!(k1_gamma_grad.data[0].abs() > 1e-6, "k-norm gamma gets no gradient - scale not wired into scores");
     }
 
     /// forward_batched must compute EXACTLY what running the unbatched
