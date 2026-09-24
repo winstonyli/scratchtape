@@ -99,8 +99,8 @@ against ~13 ms for option A with fusion.
   as well, since raw wgpu had DX12 ahead on launch overhead.
 - **Placement (decided 2026-09-24):** `src/gpu_step/` in the main crate,
   with cubecl as a plain dependency, not behind a feature. The cost: every
-  build compiles cubecl and a second wgpu (30, beside `gpu.rs`'s 23); a
-  cold `cargo check --all-targets` took ~4 min. The CPU runtime
+  build compiles cubecl; a cold `cargo check --all-targets` took ~4 min.
+  `gpu.rs` was moved from wgpu 23 to 30 so there's only one wgpu. The CPU runtime
   (`cubecl/cpu`) is not used, so no LLVM download.
 - **Device:** `WgpuDevice::new(WgpuDeviceKind::DiscreteGpu(0))` with
   `init_setup::<Vulkan>`. cubecl panics if there's no discrete adapter,

@@ -38,8 +38,8 @@ async fn init_context() -> GpuContext {
     // Windows, or if DX12 is missing, fall back to any backend.
     // WGPU_BACKEND=vulkan|dx12|... overrides.
     let preferred = if cfg!(windows) { wgpu::Backends::DX12 } else { wgpu::Backends::all() };
-    let backends = wgpu::util::backend_bits_from_env().unwrap_or(preferred);
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..Default::default() });
+    let backends = wgpu::Backends::from_env().unwrap_or(preferred);
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..wgpu::InstanceDescriptor::new_without_display_handle() });
     // HighPerformance, not default(): on a laptop-style iGPU + dGPU machine
     // default() picked the integrated Radeon 780M over the discrete RX 9060
     // XT - every GPU benchmark before this fix ran on the iGPU. The adapter
@@ -49,8 +49,8 @@ async fn init_context() -> GpuContext {
         .await;
     // Preferred backend unavailable: retry across all backends rather than fail.
     let adapter = match adapter {
-        Some(a) => a,
-        None => wgpu::Instance::new(wgpu::InstanceDescriptor::default())
+        Ok(a) => a,
+        Err(_) => wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle())
             .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })
             .await
             .expect("gpu_matmul: no GPU adapter found"),
@@ -58,7 +58,7 @@ async fn init_context() -> GpuContext {
     let info = adapter.get_info();
     eprintln!("gpu: using {} ({:?}, {:?})", info.name, info.device_type, info.backend);
     let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor::default(), None)
+        .request_device(&wgpu::DeviceDescriptor::default())
         .await
         .expect("gpu_matmul: failed to get GPU device");
 
@@ -169,10 +169,10 @@ pub fn gpu_matmul(a: &NdArray, b: &NdArray) -> NdArray {
     slice.map_async(wgpu::MapMode::Read, move |result| {
         tx.send(result).expect("gpu_matmul: map_async channel closed");
     });
-    device.poll(wgpu::Maintain::Wait);
+    device.poll(wgpu::PollType::wait_indefinitely()).expect("gpu_matmul: device poll failed");
     rx.recv().expect("gpu_matmul: map_async never responded").expect("gpu_matmul: buffer map failed");
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("gpu_matmul: mapped range unavailable");
     let out_data = bytes_to_f32_vec(&mapped);
     drop(mapped);
     staging_buf.unmap();

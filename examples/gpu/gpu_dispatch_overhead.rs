@@ -14,7 +14,8 @@
 // Best-of-REPS wall time: the machine is shared (see LONG_RUNS.md).
 // Backend: WGPU_BACKEND=dx12|vulkan (default dx12 on Windows, as gpu.rs).
 //
-// Result 2026-09-24, RX 9060 XT eGPU idle (2-3% util), CPU shared with a
+// Result 2026-09-24 (measured on wgpu 23; ported to wgpu 30 since, not yet
+// re-timed), RX 9060 XT eGPU idle (2-3% util), CPU shared with a
 // 17-core job, naive 8x8 WGSL kernel (ms):
 //   shape             roundtrip dx12/vk   queued dx12/vk     cpu (1 thread)
 //   (64,64)@(64,64)     0.43 / 2.51       0.011 / 0.009       0.08
@@ -44,8 +45,8 @@ fn bytes(data: &[f32]) -> Vec<u8> {
 
 fn main() {
     let preferred = if cfg!(windows) { wgpu::Backends::DX12 } else { wgpu::Backends::all() };
-    let backends = wgpu::util::backend_bits_from_env().unwrap_or(preferred);
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..Default::default() });
+    let backends = wgpu::Backends::from_env().unwrap_or(preferred);
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..wgpu::InstanceDescriptor::new_without_display_handle() });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         ..Default::default()
@@ -53,7 +54,7 @@ fn main() {
     .expect("no adapter for requested backend");
     let info = adapter.get_info();
     println!("device: {} ({:?}, {:?})", info.name, info.device_type, info.backend);
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(include_str!("../../src/matmul.wgsl").into()),
@@ -111,7 +112,7 @@ fn main() {
                 }
             }
             queue.submit(Some(enc.finish()));
-            device.poll(wgpu::Maintain::Wait);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         };
 
         // Check: one queued dispatch reproduces the CPU product.
@@ -126,8 +127,8 @@ fn main() {
         enc.copy_buffer_to_buffer(&ping[1], 0, &staging, 0, (m * k * 4) as u64);
         queue.submit(Some(enc.finish()));
         staging.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        device.poll(wgpu::Maintain::Wait);
-        let got: Vec<f32> = staging.slice(..).get_mapped_range().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let got: Vec<f32> = staging.slice(..).get_mapped_range().unwrap().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
         let want = a.matmul(&b);
         let err = got.iter().zip(&want.data).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
         assert!(err < 1e-3, "queued dispatch disagrees with CPU: max err {err}");

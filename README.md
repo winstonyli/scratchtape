@@ -17,7 +17,7 @@ notebook; this README is the map, not a replacement for it.
 ## Quick start
 
 ```bash
-cargo test --release              # 20 gradient-check / correctness tests
+cargo test --release              # 24 gradient-check / correctness tests (+1 GPU-only: -- --ignored)
 cargo build --release --examples  # build everything under examples/
 cargo run --release --example tiny_lm
 ```
@@ -50,7 +50,8 @@ transformer forward/apply_grad pair), not an engine primitive.
 | `tape.rs` | `Tape` — reverse-mode autodiff. Every op (`add`, `matmul`, `gather`, `softmax`, `softmax1`, `cross_entropy`, `batched_matmul`, `max_last_axis`, ...) is a node with a forward and backward rule, gradient-checked against finite differences. `max_last_axis` is differentiable on purpose, unlike `NdArray::max_last_axis` (kept non-differentiable, used only for softmax's shift-invariant stability trick) — added for a real OR-module in the differentiable-reasoning line below, where gradient through *which candidate wins* is the whole point. |
 | `nn.rs` | Layers built from tape ops: `Linear`, `LayerNorm`, `Embedding`, `TransformerBlock` (multi-head causal self-attention + FFN), plus `Rng` (hand-rolled xorshift, no external RNG crate). |
 | `optim.rs` | `Sgd` and `Adam`. |
-| `gpu.rs` / `matmul.wgsl` | A wgpu compute-shader matmul kernel — verified correct, but not wired into the autodiff path; see the persistent-GPU-backend note below. |
+| `gpu.rs` / `matmul.wgsl` | A wgpu compute-shader matmul kernel — verified correct, but not wired into the autodiff path; see the persistent-GPU-backend note below. On wgpu 30, the same version cubecl uses. |
+| `gpu_step/` | The device-resident training step (cubecl, Vulkan, discrete GPU only): flat parameter and gradient buffers, one-launch SGD. In progress, see [`docs/gpu_step_design.md`](docs/gpu_step_design.md). |
 
 Design stance, held consistently throughout: build the primitive
 yourself before reaching for a library, verify it against a
@@ -980,6 +981,25 @@ because raw forgetting deltas hid a floor effect.
   a GPU SGD test against `optim::Sgd` (`cargo test --lib gpu_step --
   --ignored`); both pass. The CPU model will also move to batched heads;
   how is still open (see the design note).
+  **One wgpu (2026-09-24):** `gpu.rs` and `gpu_dispatch_overhead.rs`
+  moved from wgpu 23 to 30, so the crate builds one wgpu stack instead
+  of two. The lockfile shrank by ~530 lines. wgpu 30's deeper types
+  tripped a future-incompat recursion-limit warning on `gpu.rs`'s
+  `OnceLock`, so `lib.rs` sets `recursion_limit = "256"`. All 25 lib
+  tests pass, including both GPU ones.
+  **The eGPU "hangs" are contention, and the utilization counter can't
+  show it.** Re-timing `gpu_dispatch_overhead` stalled inside
+  `device.poll` after 19–287 round trips, on DX12 and Vulkan alike. The
+  wgpu 23 build at `a37604c` stalled the same way (after 31), so the port
+  isn't the cause. Five other processes had work on the eGPU: three
+  humble-cortex `conv_pc2_isolated_*` checks, sojourn and manifold.
+  Windows' `GPU Engine … Utilization Percentage` counter reports millions
+  of percent for this eGPU, so an idle check filtered to 0–100% reads
+  "idle" while it's saturated. A usable check is to list which pids have
+  3D-engine instances on the eGPU's LUID (`0x16290` this boot) and look
+  them up, ignoring the values. The spike's earlier "apparent hang" was
+  probably this too. Re-timing the example is deferred until the eGPU is
+  actually free.
 - **Parked: report the tracel-llvm space-in-path bug upstream.** The
   bundler's `get_libs` splits `llvm-config --libs` output on whitespace,
   which breaks any Windows install path containing a space. The fix is to
