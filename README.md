@@ -878,6 +878,15 @@ because raw forgetting deltas hid a floor effect.
   features; it would add a second wgpu version and a pre-release
   dependency against this project's build-it-yourself stance. Revisit if
   kernel boilerplate becomes the bottleneck or native HIP/CUDA matters.
+  **Reopened:** cubecl also has a CPU runtime (LLVM JIT via `cubecl-llvm`,
+  SIMD, alpha), so one `#[cube]` kernel source could run on the eGPU *and*
+  a multithreaded CPU, covering the GPU port and the CPU fallback/eval at
+  once. Kernel-language-plus-runtime (not `cubecl-matmul`) keeps the
+  write-it-yourself stance. Unverified here: Windows build (bundled LLVM),
+  CPU-runtime speed and threading vs `NdArray::matmul`, and launch cost vs
+  raw wgpu's 10 µs. Decide with a timeboxed spike: port
+  `gpu_dispatch_overhead.rs` to cubecl on wgpu-DX12/Vulkan and the CPU
+  runtime.
 
 ## A note on the name
 
