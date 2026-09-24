@@ -16,6 +16,11 @@ pub struct NdArray {
 /// capacity is valid data.
 const MAX_RANK: usize = 4;
 
+/// Cumulative wall time spent inside NdArray::matmul, process-wide. Read by
+/// examples/tiny_lm/step_profile.rs to split a training step into matmul vs
+/// everything else (samply needs admin on Windows). ~20 ns per call.
+pub static MATMUL_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Row-major strides for `shape`, computed once per call site (profiling
 /// found unravel_index/ravel_index recomputing this per ELEMENT via a fresh
 /// `shape[i+1..].iter().product()` scan - O(rank) redone on every one of a
@@ -275,6 +280,13 @@ impl NdArray {
     /// 2D matmul only. Broadcasting deliberately unsupported here -
     /// batched matmul is a separate future decision (einsum-style vs explicit batch loop).
     pub fn matmul(&self, other: &Self) -> Self {
+        let t0 = std::time::Instant::now();
+        let out = self.matmul_inner(other);
+        MATMUL_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
+    fn matmul_inner(&self, other: &Self) -> Self {
         assert_eq!(self.shape.len(), 2, "matmul lhs must be 2D, got {:?}", self.shape);
         assert_eq!(other.shape.len(), 2, "matmul rhs must be 2D, got {:?}", other.shape);
         let (m, k) = (self.shape[0], self.shape[1]);

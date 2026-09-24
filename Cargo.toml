@@ -93,8 +93,17 @@ name = "training_recipe_check"
 path = "examples/tiny_lm/training_recipe_check.rs"
 
 [[example]]
+name = "step_profile"
+path = "examples/tiny_lm/step_profile.rs"
+
+[[example]]
 name = "gnn_byte_classification"
 path = "examples/tiny_lm/gnn_byte_classification.rs"
+
+# GPU backend measurements
+[[example]]
+name = "gpu_dispatch_overhead"
+path = "examples/gpu/gpu_dispatch_overhead.rs"
 
 # alternative computational/training mechanisms
 [[example]]

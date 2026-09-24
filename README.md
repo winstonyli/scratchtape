@@ -862,6 +862,22 @@ because raw forgetting deltas hid a floor effect.
   route for a from-scratch autograd tape, and ~10 TOPS vs the eGPU's
   ~25 TFLOPS FP32. Cheaper first lever for CPU runs: `matmul` is
   single-threaded on an 8-core/16-thread CPU.
+  **Measured 2026-09-24:** `gpu_dispatch_overhead.rs` records 500 chained
+  dispatches into one submit on resident buffers: **~10 µs per queued
+  dispatch** (DX12 and Vulkan alike), 40–100× less than today's per-op round
+  trip, and the naive kernel hits 750–900 GFLOP/s at training shapes (DX12
+  ≥ Vulkan throughout). `step_profile.rs` splits a batch-8 training step
+  (758 ms, CPU contended): **matmul is only 52%**, so multithreading matmul
+  caps at ~1.8×; the other half is elementwise/softmax/layernorm/transpose
+  work. Estimate for a device-resident step: ~2400 dispatches × 10 µs ≈
+  25–30 ms plus ~2 ms of compute, vs ~130 ms for a CPU with both halves
+  well parallelized, so the GPU should win ~5× at batch 8 and more with
+  fusion. Not adopting cubecl for now: the hard part (a GPU-resident tape,
+  buffer lifetimes, one encoder per step) is ours either way; humble-cortex
+  hand-wrote every kernel and got its gains from fusion, not cubecl
+  features; it would add a second wgpu version and a pre-release
+  dependency against this project's build-it-yourself stance. Revisit if
+  kernel boilerplate becomes the bottleneck or native HIP/CUDA matters.
 
 ## A note on the name
 
