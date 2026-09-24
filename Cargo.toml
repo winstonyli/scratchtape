@@ -114,6 +114,10 @@ path = "examples/tiny_lm/gnn_byte_classification.rs"
 name = "gpu_dispatch_overhead"
 path = "examples/gpu/gpu_dispatch_overhead.rs"
 
+[[example]]
+name = "gpu_priority_check"
+path = "examples/gpu/gpu_priority_check.rs"
+
 # alternative computational/training mechanisms
 [[example]]
 name = "attention_recall"
