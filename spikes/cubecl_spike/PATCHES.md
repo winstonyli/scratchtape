@@ -85,3 +85,7 @@ No version removes patch 1. Every tracel-llvm bundler through 23.1.0-3
    (`cubecl_spike cpu-sweep`), at the cost of 16 threads spinning with
    `yield_now` for up to 20 ms after every launch, which is bad on a shared
    machine. It's a source constant, not a runtime option.
+   Upstream went the other way (survey 2026-09-24, `docs/gpu_step_design.md`):
+   #1545 made idle polls yield, and the open #1658/#1566 park the client
+   and block drained workers. They report 1.3–5.3× on models, but none of
+   it is merged or tested on Windows.

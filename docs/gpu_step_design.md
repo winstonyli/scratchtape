@@ -175,14 +175,70 @@ The CPU model moves to batched heads before milestone 2, so the GPU ops'
 parity tests compare against a CPU tape with the same layout and op
 boundaries.
 
-**Two implementations, on purpose.** The CPU tape stays the readable
-reference, composed from small gradient-checked primitives. The GPU step
-uses coarse cubecl kernels checked against it. A single cubecl source for
-both was ruled out by measurement: the cubecl CPU runtime costs ~3.4 ms
-per launch (pre.3; still milliseconds on pre.4, `spikes/cubecl_spike/
-PATCHES.md`). That's ~0.5 s for even the 145-launch step, and its matmul
-lost to single-threaded `NdArray::matmul`. Revisit only if that floor
-drops ~100×.
+**Two implementations, on purpose, for now.** The CPU tape stays the
+readable reference, composed from small gradient-checked primitives. The
+GPU step uses coarse cubecl kernels checked against it.
+
+Could one cubecl source run on both? Not yet:
+- **Stock launch cost.** The cubecl CPU runtime costs ~3.4 ms per
+  launch (pre.3; still milliseconds on pre.4, `spikes/cubecl_spike/
+  PATCHES.md`). That's ~0.5 s for the 145-launch step, and its matmul
+  lost to single-threaded `NdArray::matmul`.
+- **Patched launch cost.** Our `IDLE_POLL` patch got a launch down to
+  0.05–0.4 ms, which is 7–58 ms for 145 launches. That's competitive with
+  the ~130 ms CPU step, and the patched matmul beat `NdArray`. So launch
+  cost alone doesn't rule it out. (An earlier draft of this section said
+  it did, using only the stock figure.)
+- **The blockers are elsewhere** (online survey, 2026-09-24, below):
+  - The fixes are unmerged and untested on Windows.
+  - There's no kernel cache, so every process start re-pays the JIT
+    (227 s in our smoke run).
+  - The patch keeps 16 threads spinning on a machine other sessions
+    share.
+
+Re-evaluate when #1566 or #1658 merge and #1527 is fixed.
+
+### Survey: cutting cubecl CPU launch overhead (2026-09-24)
+
+Sources: tracel-ai/cubecl and tracel-ai/burn issues and PRs.
+
+- **Upstream's diagnosis.** The pool's workers take every logical CPU
+  and starve the client thread that feeds them; queued launches also pin
+  their buffers until they run. Our `IDLE_POLL` patch worked the other
+  way, keeping workers awake. That helps our chained small launches, but
+  it's the spinning upstream is removing.
+  - **#1545** (merged 2026-08-21, in pre.3/pre.4): idle polls yield
+    instead of spinning. The author calls it a stopgap.
+  - **#1658** (open, unreviewed): the client parks while waiting, and
+    drained workers block immediately.
+    - Gains: mobilenet batch 1 goes 37 → 21 ms; an 8-thread f32 matmul
+      goes 21–32 → 18 ms on a Ryzen 5700X, and 104 → 50 ms on a Xeon.
+    - Costs: tiny all-thread launches get a few µs slower from waking
+      workers. Not measured on Windows or with more units than cores.
+  - **#1566** (open draft; a superset of #1658): runs ahead without
+    syncing, and releases a launch's buffers at enqueue. An 11-deep
+    unsynced chain cost 40 ms before, against 9.5 ms synced after every
+    op. Mobilenet batch 1 goes 38 → 7 ms (5.3×), and resnet50 batch 8
+    only 1.04×.
+- **#1527 (open):** the CPU runtime ignores the kernel cache config, so
+  every process start pays the full JIT again.
+- **#1635 (open):** the CPU runtime assumes a 512-bit load width, so
+  vector widths are wrong on AVX2.
+- **burn #4993 (open):** users report burn's cubecl CPU backend is far
+  slower than burn's non-cubecl CPU backend on real models.
+- **Not a CPU lever:** graph capture (#1505) is wgpu-only. See the GPU
+  note below.
+
+### Found along the way: graph capture for the GPU step
+
+cubecl pre.4 has wgpu graph capture (#1505, merged 2026-08-18) on the
+public client: `graph_prepare()` before a warm-up step, then
+`start_capture()` / `stop_capture() -> Graph` around a step, then replay.
+It records a whole step's launches once and replays them, which removes
+per-launch encoding and metadata uploads (#1504 caches the uniforms).
+Candidate for milestone 5 or 6, measured against plain queued launches.
+Unverified here: shapes must stay fixed between replays, and the Vulkan
+SPIR-V path may not support it.
 
 **Decisions:**
 - **Scope: full batched heads.**

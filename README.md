@@ -982,7 +982,14 @@ because raw forgetting deltas hid a floor effect.
   --ignored`); both pass. The CPU model moves to batched heads next,
   before milestone 2. The decisions (fused QKV storage, `split_heads`/
   `merge_heads` tape ops, extras via `gather`, bit-exact forward) are in
-  the design note.
+  the design note. The CPU tape stays a separate reference rather than
+  running the GPU's cubecl kernels on the CPU. A survey of cubecl's CPU
+  launch overhead (2026-09-24) found launch cost isn't the blocker: our
+  `IDLE_POLL` patch reaches 0.05–0.4 ms per launch, 7–58 ms per step.
+  The blockers are that the upstream fixes (#1566, #1658) are unmerged
+  and untested on Windows, and that there's no kernel cache (#1527), so
+  every process start re-pays a ~4 min JIT. The survey also found wgpu
+  graph capture in pre.4, a candidate for replaying a whole GPU step.
   **One wgpu (2026-09-24):** `gpu.rs` and `gpu_dispatch_overhead.rs`
   moved from wgpu 23 to 30, so the crate builds one wgpu stack instead
   of two. The lockfile shrank by ~530 lines. wgpu 30's deeper types
