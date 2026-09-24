@@ -3,7 +3,7 @@
 # runtime) well enough to build scratchtape's device-resident training step
 # on? Kept out of the main crate so its dependency tree (cubecl pre-release,
 # wgpu 30, bundled LLVM) doesn't touch scratchtape unless adopted.
-# Version pinned to humble-cortex's, which is known to build here.
+# Pinned to 0.11.0-pre.4 (see PATCHES.md for the pre.3 -> pre.4 move).
 [package]
 name = "cubecl_spike"
 version = "0.1.0"
@@ -19,15 +19,16 @@ cpu = ["cubecl/cpu"]
 vulkan = ["cubecl/vulkan"]
 
 [dependencies]
-cubecl = { version = "=0.11.0-pre.3", features = ["wgpu"] }
+cubecl = { version = "=0.11.0-pre.4", features = ["wgpu"] }
 scratchtape = { path = "../.." }
 half = "2"
+# pre.4 no longer re-exports the Runtime trait (needed for WgpuRuntime::client).
+cubecl-runtime = "=0.11.0-pre.4"
 
 [profile.release]
 opt-level = 3
 
-# Local fixes for two Windows build bugs in the pre.3 CPU runtime (see each
-# patched file's "Patched:" comment). Spike-only.
+# Local fix for the CPU runtime's Windows build: LLVM library paths with a
+# space break the bundler (PATCHES.md). Spike-only.
 [patch.crates-io]
 tracel-llvm-bundler = { path = "patches/tracel-llvm-bundler" }
-cubecl-cpu = { path = "patches/cubecl-cpu" }
