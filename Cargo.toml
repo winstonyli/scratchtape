@@ -89,6 +89,10 @@ name = "ngram_baseline"
 path = "examples/tiny_lm/ngram_baseline.rs"
 
 [[example]]
+name = "training_recipe_check"
+path = "examples/tiny_lm/training_recipe_check.rs"
+
+[[example]]
 name = "gnn_byte_classification"
 path = "examples/tiny_lm/gnn_byte_classification.rs"
 

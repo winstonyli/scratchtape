@@ -6,3 +6,4 @@ memory_tier_checkpoint_after_noreplay.txt
 memory_tier_replay.txt
 samply_profile.json*
 attention_uniformity_*.txt
+runs/
