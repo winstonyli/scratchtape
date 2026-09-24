@@ -29,8 +29,13 @@ fn context() -> &'static GpuContext {
 }
 
 async fn init_context() -> GpuContext {
-    // WGPU_BACKEND=vulkan|dx12|... restricts backends (unset = all).
-    let backends = wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all());
+    // DX12 by default: on the RX 9060 XT it had far lower per-call overhead
+    // than wgpu's default pick, Vulkan (128x128 matmul round trip 1.1 ms vs
+    // 7.8 ms; 512: 6.6 vs 30 ms; roughly even at 1024), 2026-09-23, driver
+    // 32.0.31041. Off Windows, or if DX12 is missing, fall back to any
+    // backend. WGPU_BACKEND=vulkan|dx12|... overrides.
+    let preferred = if cfg!(windows) { wgpu::Backends::DX12 } else { wgpu::Backends::all() };
+    let backends = wgpu::util::backend_bits_from_env().unwrap_or(preferred);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..Default::default() });
     // HighPerformance, not default(): on a laptop-style iGPU + dGPU machine
     // default() picked the integrated Radeon 780M over the discrete RX 9060
@@ -38,8 +43,15 @@ async fn init_context() -> GpuContext {
     // actually chosen is logged below so this can't go unnoticed again.
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })
-        .await
-        .expect("gpu_matmul: no GPU adapter found");
+        .await;
+    // Preferred backend unavailable: retry across all backends rather than fail.
+    let adapter = match adapter {
+        Some(a) => a,
+        None => wgpu::Instance::new(wgpu::InstanceDescriptor::default())
+            .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })
+            .await
+            .expect("gpu_matmul: no GPU adapter found"),
+    };
     let info = adapter.get_info();
     eprintln!("gpu: using {} ({:?}, {:?})", info.name, info.device_type, info.backend);
     let (device, queue) = adapter

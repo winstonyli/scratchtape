@@ -788,7 +788,8 @@ because raw forgetting deltas hid a floor effect.
   780M. Fixed 2026-09-23 to `HighPerformance` (RX 9060 XT), and the chosen
   adapter is now logged. New lead: wgpu on this machine defaults to
   Vulkan, but DX12 has ~7× lower per-call overhead (128×128 round trip
-  1.1 ms vs 7.8 ms; `WGPU_BACKEND=dx12`). Re-measure the branch's block
+  1.1 ms vs 7.8 ms), so `gpu.rs` now defaults to DX12 on Windows
+  (`WGPU_BACKEND` overrides). Re-measure the branch's block
   benchmark on DX12 before trusting "dispatch overhead" as a hard floor.
   Discrete-GPU matmul now: 128 → 1.1 ms (CPU 0.4 ms); 1024 → ~30 ms
   (CPU ~125 ms).
