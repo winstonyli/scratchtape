@@ -37,7 +37,8 @@
 // QK-norm's. The plain checkpoint is unchanged (a plain block's layout
 // didn't change) so it's reused.
 //
-// Result: plain+LN-QK-norm is stable and selective (KL=1.71, peak=15.8,
+// Result (softmax1 rows used the BUGGY Tape::softmax1 - see its doc comment;
+// the runaway below was that bug, not softmax1): plain+LN-QK-norm is stable and selective (KL=1.71, peak=15.8,
 // agreement 0.47) and ties plain on held-out loss (1.740 vs 1.738; train
 // 1.24 vs 1.36). softmax1+LN-QK-norm tracks the others to step 1600, then
 // jumps to ~3.0 nats and stays (unigram CE is ~3.27) with no NaN: in the
@@ -47,6 +48,7 @@
 // but softmax1's row mass depends on it, so nothing bounds it. The L2
 // variant's "no divergence" came from capping the logits, not from fixing
 // that pressure.
+//
 // Result with the fixed Tape::softmax1 (seed 1, 64000 steps), deterministic
 // held-out CE over all 371 non-overlapping 64-byte windows (same windowing
 // as ngram_baseline.rs, whose Kneser-Ney 7-gram scores 1.655):
