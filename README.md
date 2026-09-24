@@ -908,10 +908,36 @@ because raw forgetting deltas hid a floor effect.
   `--features vulkan` (its own SPIR-V compiler) reports 12 cmma configs,
   f16×16×16→f32 among them. Its default WGSL path, on DX12 or Vulkan,
   reports none. Raw wgpu 30 only has 8×8 f32 cooperative matrices. So
-  cubecl is the only route to matrix cores here. The timings are pending
-  because another session's GPU job saturated the eGPU and every launch
-  loop stalled. If cmma is much faster than 700–900 GFLOP/s at our shapes,
-  the matmul kernels could come from cubecl, not WGSL.
+  cubecl is the only route to matrix cores here. **Measured 2026-09-24**
+  (cubecl 0.11.0-pre.4, Vulkan SPIR-V, idle eGPU, best of two rounds,
+  ms per queued launch):
+
+  | shape | naive f32 | comptime-k f32 | cmma f16→f32 |
+  |---|---|---|---|
+  | (64,64)@(64,64) | 0.015 | 0.009 | 0.007 |
+  | (512,128)@(128,128) | 0.048 | 0.014 | 0.007 (2.5 TFLOP/s) |
+  | (512,256)@(256,256) | 0.117 | 0.057 | 0.012 (5.6) |
+  | (2048,128)@(128,128) | 0.109 | 0.060 | 0.012 (5.8) |
+  | (2048,512)@(512,512) | 1.24 | 0.51 | 0.09–0.28 (up to 12) |
+
+  Matrix cores are 5–14× faster than the naive kernel. At step-sized
+  shapes they reach the ~7–12 µs launch floor, so the matmul share of a
+  GPU step all but disappears. The f16 error is at most 1.2e-4 against
+  the f32 CPU product. Making k a compile-time constant alone gives the
+  naive kernel 2–3×. A fresh output buffer per launch costs nothing
+  measurable, because cubecl pools its memory.
+  Caveats:
+  - The naive kernel is a weak baseline. A tiled f32 WGSL kernel would
+    close part of the gap.
+  - Inputs were converted to f16 ahead of time. A real step also needs
+    cast kernels, or f16 copies kept alongside the f32 weights.
+  - f16 matmul inputs in training need a precision check: gradient
+    check tolerances, and perhaps loss scaling.
+  - The largest shape varied 3× between rounds.
+  **This reopens the decision.** cubecl matched raw wgpu on launch cost,
+  and it's the only route to matrix cores. So the GPU step is better
+  built in cubecl on Vulkan SPIR-V than in raw WGSL. The owner hasn't
+  decided yet.
 - **Parked: report the tracel-llvm space-in-path bug upstream.** The
   bundler's `get_libs` splits `llvm-config --libs` output on whitespace,
   which breaks any Windows install path containing a space. The fix is to

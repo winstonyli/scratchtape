@@ -56,7 +56,17 @@
 // with selfplay-burn sharing the eGPU were floor-bound (~0.8 ms per launch
 // for every kernel, against 0.01-0.1 ms idle), so they say nothing
 // about cmma speed.
-// Timings pending: another session's long GPU job (humble-cortex) saturated
+// Idle eGPU (12:30, after the other jobs exited), two rounds, ms per queued
+// launch [cmma GFLOP/s]; round 1 / round 2:
+//   (64,64)       naive 0.015/0.016  comptime 0.009/0.009  fresh 0.015/0.015  cmma 0.010/0.007
+//   (512,128)     0.048/0.053        0.015/0.014           0.050/0.052        0.008/0.007 [2120/2456]
+//   (512,256)     0.117/0.123        0.057/0.067           0.119/0.125        0.012/0.013 [5625/5301]
+//   (2048,128)    0.110/0.109        0.068/0.060           0.110/0.110        0.012/0.012 [5809/5756]
+//   (2048,512)    1.251/1.239        0.507/0.508           1.250/1.257        0.089/0.277 [12041/3878]
+// cmma is 5-14x faster than naive and sits at the launch floor for step
+// shapes. comptime k gives 2-3x on its own. Fresh allocation is free
+// (pooled).
+// Earlier: another session's long GPU job (humble-cortex) saturated
 // the eGPU, and every launch loop - even plain `bench` - stalled
 // indefinitely at ~0 CPU. It looked like a comptime-kernel hang until
 // `bench` stalled too. On a shared eGPU a stall is contention first,
