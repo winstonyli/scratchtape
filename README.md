@@ -378,6 +378,30 @@ checkpoint on the same windows is next. Either way, this model isn't
 clearly beating a 1998-era count model, and every mechanism comparison
 here is happening below that bar.
 
+**Rerun with the fixed softmax1, scored deterministically.**
+`attention_uniformity_check.rs` now reports held-out CE over all 371
+non-overlapping 64-byte windows, the same windowing as the n-gram. Seed
+1, 64000 steps, all variants stable:
+
+| Model | Held-out (nats/byte) |
+|---|---|
+| Kneser-Ney 7-gram | **1.655** |
+| softmax1 | 1.803 |
+| sink logit (learnable phantom key) | 1.818 |
+| plain + output gate (Qwen G1) | 1.821 |
+| softmax1 + LN QK-norm | 1.824 |
+| plain softmax | 1.852 |
+| plain + LN QK-norm | 1.856 |
+
+Every abstention mechanism beats plain by 0.03–0.05 nats, the order
+Wang 2026 reports at 10M params. softmax1 alone is best, and QK-norm adds
+nothing once softmax1 is correct. The gates never go sparse (mean
+0.39–0.46), matching Rizwan et al.'s 1M-param observation. The training
+log's 20-window evals ran optimistic by 0.1+ nats (plain logged 1.738).
+The headline stands: every transformer here trails the count model by
+0.15–0.20 nats, so training (not attention variants) is the bottleneck.
+One seed; seed-to-seed spread on this metric is unmeasured.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data

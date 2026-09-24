@@ -47,6 +47,17 @@
 // but softmax1's row mass depends on it, so nothing bounds it. The L2
 // variant's "no divergence" came from capping the logits, not from fixing
 // that pressure.
+// Result with the fixed Tape::softmax1 (seed 1, 64000 steps), deterministic
+// held-out CE over all 371 non-overlapping 64-byte windows (same windowing
+// as ngram_baseline.rs, whose Kneser-Ney 7-gram scores 1.655):
+//   softmax1 1.803 | sink logit 1.818 | plain+gate 1.821 |
+//   softmax1+LN-QK-norm 1.824 | plain 1.852 | plain+LN-QK-norm 1.856
+// All train without divergence. Every abstention mechanism beats plain by
+// 0.03-0.05 nats (same order as Wang 2026's ~0.02 at 10M params); QK-norm
+// adds nothing. Gates never go sparse (mean 0.39-0.46 per block, cf.
+// Rizwan et al. 2026 at 1M params). Every transformer is 0.15-0.20 nats
+// behind the count model. The training log's 20-window evals ran 0.1+
+// nats optimistic (e.g. plain logged 1.738). One seed.
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::{Tape, Var};
@@ -128,6 +139,22 @@ fn eval_loss(
         total += tape.value(loss).data[0];
     }
     total / 20.0
+}
+
+/// Deterministic held-out CE: every non-overlapping 64-byte window, the
+/// same windowing ngram_baseline.rs scores, so the two are directly
+/// comparable (the training log's eval_loss is a noisy 20-window sample).
+fn full_held_out_ce(m: &Model, held_out: &[usize], softmax1: bool) -> f32 {
+    let starts: Vec<usize> = (0..held_out.len() - SEQ_LEN).step_by(SEQ_LEN).collect();
+    let mut total = 0.0;
+    for &s in &starts {
+        let mut tape = Tape::new();
+        let input = &held_out[s..s + SEQ_LEN];
+        let (logits, _) = forward(&mut tape, &m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj, input, softmax1);
+        let loss = tape.cross_entropy(logits, &held_out[s + 1..s + SEQ_LEN + 1]);
+        total += tape.value(loss).data[0];
+    }
+    total / starts.len() as f32
 }
 
 /// Mirrors train_with_diagnostics (seed 1), minus generation. Also returns
@@ -404,6 +431,7 @@ fn main() {
                     let noise_floor = grad_accum[by_accum[distinct.len() / 5]];
                     let filtered: Vec<usize> = distinct.iter().copied().filter(|&b| grad_accum[b] >= noise_floor).collect();
                     log.push(format!("{} of {} bytes pass the noise filter", filtered.len(), distinct.len()));
+                    log.push(format!("full held-out CE (all {SEQ_LEN}-byte windows): {:.4}", full_held_out_ce(&model, held_out, v.softmax1)));
                     let analysis = analyze(name, &model, train_set, &filtered, v);
                     (log, analysis)
                 })
