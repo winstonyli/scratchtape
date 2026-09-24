@@ -44,8 +44,21 @@
 // units (~1.6-2x faster than NdArray even with a naive, CPU-unfriendly loop
 // order). That's a per-op launch policy plus a forked constant that burns
 // idle CPU, for roughly what std::thread on NdArray gives directly.
+//
+// Extras (`cubecl_spike wgpu-vulkan extras`, 2026-09-24): comptime-k
+// matmul, fresh output per launch, matrix cores.
+// Matrix cores: vulkaninfo shows VK_KHR_cooperative_matrix on the RX 9060 XT
+// (and the 780M). cubecl reports cmma only when built `--features vulkan`
+// (its own SPIR-V compiler): 12 configs, f16x16x16->f32 included. The
+// default WGSL path (DX12 or Vulkan) reports 0.
+// Timings pending: another session's long GPU job (humble-cortex) saturated
+// the eGPU, and every launch loop - even plain `bench` - stalled
+// indefinitely at ~0 CPU. It looked like a comptime-kernel hang until
+// `bench` stalled too. On a shared eGPU a stall is contention first,
+// not a bug.
 use cubecl::prelude::*;
 use cubecl::server::Handle;
+use half::f16;
 use scratchtape::nn::Rng;
 use scratchtape::tensor::NdArray;
 use std::time::Instant;
@@ -145,6 +158,118 @@ fn sweep<R: Runtime>(client: ComputeClient<R>) {
     }
 }
 
+/// k as a comptime constant: the loop bound is baked into the compiled
+/// kernel (one compile per distinct k), so it can be fully unrolled.
+#[cube(launch)]
+fn k_matmul_ct(a: &[f32], b: &[f32], out: &mut [f32], m: u32, n: u32, #[comptime] k: u32) {
+    let row = ABSOLUTE_POS_Y;
+    let col = ABSOLUTE_POS_X;
+    if row < m && col < n {
+        let mut sum = 0.0f32;
+        #[unroll]
+        for p in 0..k {
+            sum += a[(row * k + p) as usize] * b[(p * n + col) as usize];
+        }
+        out[(row * n + col) as usize] = sum;
+    }
+}
+
+/// Matrix-core matmul: out[M,N] (f32) = a[M,K] @ b[K,N] (f16, row-major).
+/// One plane per cube computes one 16x16 output tile, stepping K by 16.
+#[cube(launch)]
+fn k_matmul_cmma(a: &[f16], b: &[f16], out: &mut [f32], #[comptime] k: u32, #[comptime] n: u32) {
+    let row0 = CUBE_POS_Y * 16;
+    let col0 = CUBE_POS_X * 16;
+    let c = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0);
+    #[unroll]
+    for kk in 0..k / 16 {
+        let a_off = (row0 * k + kk * 16) as usize;
+        let b_off = (kk * 16 * n + col0) as usize;
+        let at = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &a[a_off..a.len()], k);
+        let bt = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &b[b_off..b.len()], n);
+        cmma::execute(&at, &bt, &c, &c);
+    }
+    let o_off = (row0 * n + col0) as usize;
+    let len = out.len();
+    cmma::store(&mut out[o_off..len], &c, n, cmma::MatrixLayout::RowMajor);
+}
+
+/// Extra measurements beyond `bench`: comptime specialization, per-launch
+/// fresh output allocation (what a GPU-resident tape does per op), and
+/// matrix cores where the runtime reports them.
+fn extras<R: Runtime>(client: ComputeClient<R>) {
+    let sync = |c: &ComputeClient<R>| cubecl::future::block_on(c.sync()).unwrap();
+    let f16_cfg = cubecl::features::MmaConfig {
+        a_type: cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16),
+        b_type: cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16),
+        cd_type: cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F32),
+        m: 16,
+        k: 16,
+        n: 16,
+    };
+    let cmma_ok = client.features().matmul.cmma.contains(&f16_cfg);
+    let plane = client.properties().hardware.plane_size_max;
+    println!("cmma f16x16x16->f32 supported: {cmma_ok}; plane size max {plane}; all cmma configs: {}", client.features().matmul.cmma.len());
+    println!("shape | runtime-k ms | comptime-k ms | fresh-alloc ms (runtime k) | cmma ms [GFLOP/s]");
+    let mut rng = Rng::new(7);
+    for &(m, k) in &[(64usize, 64usize), (512, 128), (512, 256), (2048, 128), (2048, 512)] {
+        let n = k;
+        let a = rand(&mut rng, m, k);
+        let b = rand(&mut rng, k, n);
+        let a_h = client.create_from_slice(f32::as_bytes(&a.data));
+        let b_h = client.create_from_slice(f32::as_bytes(&b.data));
+        let o_h = client.empty(m * n * 4);
+        let dim = CubeDim::new_2d(8, 8);
+        let count = CubeCount::Static((n as u32).div_ceil(8), (m as u32).div_ceil(8), 1);
+        let rt = best(&mut || {
+            for _ in 0..N {
+                k_matmul::launch::<R>(&client, count.clone(), dim, buf(&a_h, m * k), buf(&b_h, k * n), buf(&o_h, m * n), m as u32, k as u32, n as u32);
+            }
+            sync(&client);
+        }) / N as f64;
+        k_matmul_ct::launch::<R>(&client, count.clone(), dim, buf(&a_h, m * k), buf(&b_h, k * n), buf(&o_h, m * n), m as u32, n as u32, k as u32);
+        let got = f32::from_bytes(&client.read_one(o_h.clone()).unwrap())[..m * n].to_vec();
+        let want = a.matmul(&b);
+        let err = got.iter().zip(&want.data).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+        assert!(err < 1e-3, "comptime matmul wrong: {err}");
+        let ct = best(&mut || {
+            for _ in 0..N {
+                k_matmul_ct::launch::<R>(&client, count.clone(), dim, buf(&a_h, m * k), buf(&b_h, k * n), buf(&o_h, m * n), m as u32, n as u32, k as u32);
+            }
+            sync(&client);
+        }) / N as f64;
+        // A tape allocates every op's output; handles drop back to the pool.
+        let fresh = best(&mut || {
+            let mut keep = Vec::with_capacity(N);
+            for _ in 0..N {
+                let o = client.empty(m * n * 4);
+                k_matmul::launch::<R>(&client, count.clone(), dim, buf(&a_h, m * k), buf(&b_h, k * n), buf(&o, m * n), m as u32, k as u32, n as u32);
+                keep.push(o);
+            }
+            sync(&client);
+        }) / N as f64;
+        let cm = if cmma_ok {
+            let a16: Vec<f16> = a.data.iter().map(|&x| f16::from_f32(x)).collect();
+            let b16: Vec<f16> = b.data.iter().map(|&x| f16::from_f32(x)).collect();
+            let a16_h = client.create_from_slice(f16::as_bytes(&a16));
+            let b16_h = client.create_from_slice(f16::as_bytes(&b16));
+            let cc = CubeCount::Static((n / 16) as u32, (m / 16) as u32, 1);
+            let cd = CubeDim::new_1d(plane);
+            let launch = || unsafe {
+                k_matmul_cmma::launch::<R>(&client, cc.clone(), cd, BufferArg::from_raw_parts(a16_h.clone(), m * k), BufferArg::from_raw_parts(b16_h.clone(), k * n), BufferArg::from_raw_parts(o_h.clone(), m * n), k as u32, n as u32)
+            };
+            launch();
+            let got = f32::from_bytes(&client.read_one(o_h.clone()).unwrap())[..m * n].to_vec();
+            let err = got.iter().zip(&want.data).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+            let t = best(&mut || { for _ in 0..N { launch(); } sync(&client); }) / N as f64;
+            format!("{:.4} [{:.0}] (f16 max err {err:.1e})", t * 1e3, 2.0 * (m * k * n) as f64 / t / 1e9)
+        } else {
+            "n/a".into()
+        };
+        println!("({m},{k})@({k},{n}) | {:.4} | {:.4} | {:.4} | {cm}", rt * 1e3, ct * 1e3, fresh * 1e3);
+    }
+}
+
 fn buf<R: Runtime>(h: &Handle, len: usize) -> BufferArg<R> {
     unsafe { BufferArg::from_raw_parts(h.clone(), len) }
 }
@@ -179,10 +304,10 @@ fn bench<R: Runtime>(client: ComputeClient<R>) {
         let err = got.iter().zip(&want.data).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
         assert!(err < 1e-3, "cubecl matmul disagrees with CPU: max err {err}");
 
-        let queued = best(&mut || { for i in 0..N { launch(i); } sync(&client); }) / N as f64;
+        let queued = best(&mut || { for _ in 0..N { launch(i); } sync(&client); }) / N as f64;
         let len = m * k;
         let ew = best(&mut || {
-            for i in 0..N {
+            for _ in 0..N {
                 k_elementwise::launch::<R>(&client, CubeCount::Static((len as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), buf(&ping[i % 2], len), buf(&ping[1 - i % 2], len), len as u32);
             }
             sync(&client);
@@ -208,7 +333,11 @@ fn main() {
             };
             let info = setup.adapter.get_info();
             println!("runtime {which}: {} ({:?}, {:?})", info.name, setup.backend, info.device_type);
-            bench::<WgpuRuntime>(WgpuRuntime::client(&device));
+            if std::env::args().nth(2).as_deref() == Some("extras") {
+                extras::<WgpuRuntime>(WgpuRuntime::client(&device));
+            } else {
+                bench::<WgpuRuntime>(WgpuRuntime::client(&device));
+            }
         }
         #[cfg(feature = "cpu")]
         "cpu" => {

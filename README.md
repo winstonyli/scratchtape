@@ -903,7 +903,15 @@ because raw forgetting deltas hid a floor effect.
   forked crate, 16 threads spinning between launches, and a per-op launch
   policy, which gains little over threading `NdArray`. Decision: raw wgpu for the GPU step,
   reusing the unmerged branch's WGSL kernels. The CPU path stays
-  `NdArray` + `std::thread`.
+  `NdArray` + `std::thread`. **Matrix cores, the one open question:** the
+  RX 9060 XT exposes `VK_KHR_cooperative_matrix`, and cubecl built with
+  `--features vulkan` (its own SPIR-V compiler) reports 12 cmma configs,
+  f16×16×16→f32 among them. Its default WGSL path, on DX12 or Vulkan,
+  reports none. Raw wgpu 30 only has 8×8 f32 cooperative matrices. So
+  cubecl is the only route to matrix cores here. The timings are pending
+  because another session's GPU job saturated the eGPU and every launch
+  loop stalled. If cmma is much faster than 700–900 GFLOP/s at our shapes,
+  the matmul kernels could come from cubecl, not WGSL.
 
 ## A note on the name
 

@@ -309,6 +309,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "c2rust-bitfields"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46dc7d2bffa0d0b3d47eb2dc69973466858281446c2ac9f6d8a10e92ab1017df"
+dependencies = [
+ "c2rust-bitfields-derive",
+]
+
+[[package]]
+name = "c2rust-bitfields-derive"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebe1117afa5937ce280034e31fa1e84ed1824a252f75380327eed438535333f8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -745,6 +765,7 @@ dependencies = [
  "num",
  "num-traits",
  "pliron",
+ "pliron-spirv",
  "portable-atomic",
  "rustc_apfloat",
  "serde",
@@ -858,6 +879,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cubecl-spirv"
+version = "0.11.0-pre.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4763912d17cbdd93c63b7e0d5450ffa1881bbcfbba4576adbb94a23854cccaf"
+dependencies = [
+ "bitflags 2.13.2",
+ "cubecl-common",
+ "cubecl-core",
+ "cubecl-environment",
+ "cubecl-ir",
+ "cubecl-opt",
+ "cubecl-runtime",
+ "half",
+ "hashbrown 0.17.1",
+ "itertools",
+ "paste",
+ "pliron",
+ "pliron-spirv",
+ "sanitize-filename",
+ "serde",
+ "tracel-rspirv",
+]
+
+[[package]]
 name = "cubecl-std"
 version = "0.11.0-pre.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -881,6 +926,7 @@ version = "0.11.0-pre.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68a70096df8a1a1a327ffcc3327bbc4a9b2ba461c25e0e7863806721f8601664"
 dependencies = [
+ "ash",
  "bytemuck",
  "cfg-if",
  "cfg_aliases 0.2.2",
@@ -891,6 +937,7 @@ dependencies = [
  "cubecl-ir",
  "cubecl-opt",
  "cubecl-runtime",
+ "cubecl-spirv",
  "derive-new",
  "derive_more",
  "half",
@@ -900,6 +947,7 @@ dependencies = [
  "pliron",
  "sanitize-filename",
  "thiserror 2.0.20",
+ "tracel-ash",
  "wasm-bindgen-futures",
  "wgpu 30.0.1",
 ]
@@ -920,6 +968,7 @@ name = "cubecl_spike"
 version = "0.1.0"
 dependencies = [
  "cubecl",
+ "half",
  "scratchtape",
 ]
 
@@ -2675,6 +2724,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pliron-spirv"
+version = "0.14.1+sdk-1.4.357.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2919774bd35911798e824286a15c2c3c6fedbfd56d06a33e071dc1af5d5e7030"
+dependencies = [
+ "derive-new",
+ "derive_more",
+ "itertools",
+ "pliron",
+ "thiserror 2.0.20",
+ "tracel-rspirv",
+]
+
+[[package]]
 name = "pollster"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3347,6 +3410,17 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"
+version = "1.0.109"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
@@ -3610,6 +3684,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
+name = "tracel-ash"
+version = "0.39.5+sdk1.4.357"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9802d90b2e66f00a395a3acf337ddd49dd1e90cb3287fc31a4148f875d7be7c5"
+dependencies = [
+ "ash",
+ "c2rust-bitfields",
+]
+
+[[package]]
 name = "tracel-llvm-bundler"
 version = "22.1.4-6"
 dependencies = [
@@ -3626,6 +3710,18 @@ dependencies = [
  "sha2",
  "tar",
  "walkdir",
+]
+
+[[package]]
+name = "tracel-rspirv"
+version = "0.14.1+sdk-1.4.357.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1f062140c2875c072de7ab05019970906105a9a2c971af922b8d16bd3b5cbea"
+dependencies = [
+ "bitflags 2.13.2",
+ "pliron",
+ "rustc-hash 2.1.3",
+ "serde",
 ]
 
 [[package]]
