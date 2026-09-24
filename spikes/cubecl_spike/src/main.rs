@@ -411,6 +411,80 @@ fn bench(client: Client) {
     }
 }
 
+/// Single-source check (2026-09-24): JIT cost per kernel, tiled-matmul
+/// correctness, and a step-shaped chain of 144 launches (72 x tiled matmul
+/// (512,128)@(128,128) then elementwise), one sync, against the same chain
+/// on NdArray. `tiled` picks the shared-memory kernel (GPU shape); the CPU
+/// runtime gets the barrier-free naive one, because it runs a barrier
+/// kernel's cube as one spinning OS thread per unit: 256 threads on <=16
+/// cores never finished a single tiled launch in 12 min (2026-09-24).
+fn step(client: Client, tiled: bool) {
+    let sync = |c: &Client| cubecl::future::block_on(c.sync()).unwrap();
+    let (m, k) = (512usize, 128usize);
+    let mut rng = Rng::new(11);
+    let x = rand(&mut rng, m, k);
+    let w = rand(&mut rng, k, k);
+    // A fresh ping-pong pair starting at x (the CPU runtime's Bytes-based write is awkward).
+    let fresh = || [client.create_from_slice(f32::as_bytes(&x.data)), client.empty(m * k * 4)];
+    let w_h = client.create_from_slice(f32::as_bytes(&w.data));
+    let tcount = CubeCount::Static((k / 64) as u32, (m / 64) as u32, 1);
+    let tdim = CubeDim::new_2d(16, 16);
+    let ecount = CubeCount::Static(((m * k) as u32).div_ceil(256), 1, 1);
+    let ncount = CubeCount::Static((k as u32).div_ceil(8), (m as u32).div_ceil(8), 1);
+    let mm = |p: &[Handle; 2], src: usize| {
+        if tiled {
+            k_matmul_tiled::launch(&client, tcount.clone(), tdim, buf(&p[src], m * k), buf(&w_h, k * k), buf(&p[1 - src], m * k), k as u32, k as u32)
+        } else {
+            k_matmul::launch(&client, ncount.clone(), CubeDim::new_2d(8, 8), buf(&p[src], m * k), buf(&w_h, k * k), buf(&p[1 - src], m * k), m as u32, k as u32, k as u32)
+        }
+    };
+    let mm_name = if tiled { "tiled matmul" } else { "naive matmul" };
+    let ew = |p: &[Handle; 2], src: usize| k_elementwise::launch(&client, ecount.clone(), CubeDim::new_1d(256), buf(&p[src], m * k), buf(&p[1 - src], m * k), (m * k) as u32);
+
+    // JIT: the first launch of a kernel compiles it; the second doesn't.
+    let scratch = fresh();
+    for (name, f) in [(mm_name, &mm as &dyn Fn(&[Handle; 2], usize)), ("elementwise", &ew)] {
+        let t = Instant::now();
+        f(&scratch, 0);
+        sync(&client);
+        let first = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        f(&scratch, 0);
+        sync(&client);
+        println!("jit {name}: first launch {:.1} ms, second {:.3} ms", first * 1e3, t.elapsed().as_secs_f64() * 1e3);
+    }
+
+    // Correctness: one tiled matmul from x.
+    let ping = fresh();
+    mm(&ping, 0);
+    let got = f32::from_bytes(&client.read_one(ping[1].clone()).unwrap())[..m * k].to_vec();
+    let want = x.matmul(&w);
+    let err = got.iter().zip(&want.data).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+    assert!(err < 1e-3, "{mm_name} wrong on this runtime: max err {err}");
+    println!("{mm_name} correct (max err {err:.2e})");
+
+    // The chain, and its NdArray twin. Each pair returns to ping[0].
+    let pairs = 72;
+    let ping = fresh();
+    let chain = || { for _ in 0..pairs { mm(&ping, 0); ew(&ping, 1); } sync(&client); };
+    chain();
+    let got = f32::from_bytes(&client.read_one(ping[0].clone()).unwrap())[..m * k].to_vec();
+    let nd_chain = || {
+        let mut v = x.clone();
+        for _ in 0..pairs {
+            v = v.matmul(&w);
+            v.data.iter_mut().for_each(|e| *e = (*e * 0.5 + 0.1).max(0.0));
+        }
+        v
+    };
+    let want = nd_chain();
+    let err = got.iter().zip(&want.data).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+    assert!(err < 1e-3, "chain disagrees with NdArray: max err {err}");
+    let dev = best(&mut || chain());
+    let nd = best(&mut || { std::hint::black_box(nd_chain()); });
+    println!("chain of {} launches, one sync: {:.2} ms ({:.1} us/launch); NdArray single-thread {:.2} ms; max err {err:.2e}", 2 * pairs, dev * 1e3, dev / (2 * pairs) as f64 * 1e6, nd * 1e3);
+}
+
 fn main() {
     let which = std::env::args().nth(1).unwrap_or_else(|| "wgpu-dx12".into());
     let t0 = Instant::now();
@@ -427,6 +501,8 @@ fn main() {
             println!("runtime {which}: {} ({:?}, {:?})", info.name, setup.backend, info.device_type);
             if std::env::args().nth(2).as_deref() == Some("extras") {
                 extras(<WgpuRuntime>::client(&device));
+            } else if std::env::args().nth(2).as_deref() == Some("step") {
+                step(<WgpuRuntime>::client(&device), true);
             } else {
                 bench(<WgpuRuntime>::client(&device));
             }
@@ -436,6 +512,12 @@ fn main() {
             use cubecl::cpu::{CpuDevice, CpuRuntime};
             println!("runtime cpu ({} logical cores)", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
             bench(CpuRuntime::client(&CpuDevice));
+        }
+        #[cfg(feature = "cpu")]
+        "cpu-step" => {
+            use cubecl::cpu::{CpuDevice, CpuRuntime};
+            println!("runtime cpu ({} logical cores)", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
+            step(CpuRuntime::client(&CpuDevice), false);
         }
         #[cfg(feature = "cpu")]
         "cpu-sweep" => {

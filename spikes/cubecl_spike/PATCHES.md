@@ -33,6 +33,35 @@ looks like contention more than a pre.4 change (`IDLE_POLL` is unchanged;
 the rest of the scheduler wasn't diffed). Either way, per-launch cost stays in milliseconds, against
 ~10 us on the GPU, so the CPU runtime verdict stands.
 
+## Single-source experiment variants (2026-09-24)
+
+`cubecl_spike cpu-step` was run against three `cubecl-cpu` builds. Results
+and verdict: `docs/gpu_step_design.md`, "Experiment: one kernel source
+on the CPU runtime". Two of the builds are extra vendored copies, not
+wired into `Cargo.toml`. To recreate them:
+
+- **`patches/cubecl-cpu-1658`**
+  1. Extract `cubecl-cpu-0.11.0-pre.4.crate`, then delete
+     `.cargo_vcs_info.json` and `.cargo-ok`.
+  2. Apply tracel-ai/cubecl#1658, branch `perf/cpu-park-client-wait`,
+     head `623a69377b`: `gh pr diff 1658 -R tracel-ai/cubecl > pr.diff`,
+     then `patch -p3 < pr.diff` inside the copy. It applies cleanly and
+     adds `completion_counter.rs`.
+- **`patches/cubecl-cpu-idlepoll`**: the same pre.4 copy, with
+  `IDLE_POLL` in `src/compute/threadpool/scheduler/dispatcher.rs` set
+  to `from_micros(20_000)`.
+
+Build one variant at a time; stock takes no `--config`:
+
+```
+cargo build --release --features cpu --config 'patch.crates-io.cubecl-cpu.path="patches/cubecl-cpu-1658"'
+```
+
+Copy the exe after each build. The `--config` patch rewrites
+`Cargo.lock`, so restore it afterwards. Confirm which variant an exe
+contains with `grep -c -a cubecl-cpu-1658 <exe>`: its source paths are
+embedded.
+
 ## Moving from pre.3 to pre.4 (2026-09-24)
 
 - A fresh resolve works now: pliron 0.18 has no version skew, so the

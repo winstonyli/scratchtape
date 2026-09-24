@@ -983,13 +983,19 @@ because raw forgetting deltas hid a floor effect.
   before milestone 2. The decisions (fused QKV storage, `split_heads`/
   `merge_heads` tape ops, extras via `gather`, bit-exact forward) are in
   the design note. The CPU tape stays a separate reference rather than
-  running the GPU's cubecl kernels on the CPU. A survey of cubecl's CPU
-  launch overhead (2026-09-24) found launch cost isn't the blocker: our
-  `IDLE_POLL` patch reaches 0.05–0.4 ms per launch, 7–58 ms per step.
-  The blockers are that the upstream fixes (#1566, #1658) are unmerged
-  and untested on Windows, and that there's no kernel cache (#1527), so
-  every process start re-pays a ~4 min JIT. The survey also found wgpu
-  graph capture in pre.4, a candidate for replaying a whole GPU step.
+  running the GPU's cubecl kernels on the CPU. A single cubecl source for
+  both was tested and ruled out (2026-09-24, `cubecl_spike cpu-step`):
+  - The GPU's tiled matmul never finishes on cubecl's CPU runtime, which
+    runs one spinning OS thread per unit at each barrier.
+  - The barrier-free kernel runs a step-shaped 144-launch chain in
+    157–165 ms on 12 cores, against 59–67 ms for single-threaded
+    `NdArray`.
+  - Launch cost isn't the limit: the `IDLE_POLL` patch doesn't change
+    the chain time. Upstream #1658 makes it 4.6× slower on Windows. JIT
+    is ≤0.2 s per kernel.
+
+  A survey of cubecl's CPU launch overhead also found wgpu graph capture
+  in pre.4, a candidate for replaying a whole GPU step.
   **One wgpu (2026-09-24):** `gpu.rs` and `gpu_dispatch_overhead.rs`
   moved from wgpu 23 to 30, so the crate builds one wgpu stack instead
   of two. The lockfile shrank by ~530 lines. wgpu 30's deeper types

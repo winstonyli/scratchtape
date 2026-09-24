@@ -4,8 +4,9 @@ Goal: run one tiny_lm training step (batch 8, `d_model` 128, 8 heads,
 `seq_len` 64, 4 blocks, `d_ff` 256, vocab 256, SGD, cross-entropy)
 entirely on the RX 9060 XT eGPU. It must match the CPU tape's losses and
 gradients, and be faster than the CPU step. Status: **milestone 1 done
-(2026-09-24)**. Next: move the CPU model to batched heads (section
-below), then milestone 2 (kernels).
+(2026-09-24)**. A single cubecl source for CPU and GPU was tested and
+ruled out the same day (experiment below). Next: move the CPU model to
+batched heads (section below), then milestone 2 (kernels).
 
 ## What the evidence says
 
@@ -179,24 +180,129 @@ boundaries.
 readable reference, composed from small gradient-checked primitives. The
 GPU step uses coarse cubecl kernels checked against it.
 
-Could one cubecl source run on both? Not yet:
-- **Stock launch cost.** The cubecl CPU runtime costs ~3.4 ms per
-  launch (pre.3; still milliseconds on pre.4, `spikes/cubecl_spike/
-  PATCHES.md`). That's ~0.5 s for the 145-launch step, and its matmul
-  lost to single-threaded `NdArray::matmul`.
-- **Patched launch cost.** Our `IDLE_POLL` patch got a launch down to
-  0.05–0.4 ms, which is 7–58 ms for 145 launches. That's competitive with
-  the ~130 ms CPU step, and the patched matmul beat `NdArray`. So launch
-  cost alone doesn't rule it out. (An earlier draft of this section said
-  it did, using only the stock figure.)
-- **The blockers are elsewhere** (online survey, 2026-09-24, below):
-  - The fixes are unmerged and untested on Windows.
-  - There's no kernel cache, so every process start re-pays the JIT
-    (227 s in our smoke run).
-  - The patch keeps 16 threads spinning on a machine other sessions
-    share.
+Could one cubecl source run on both? **No, measured 2026-09-24**
+(experiment below). Launch cost turned out not to be the limit:
+- The GPU's tiled matmul can't run on the CPU runtime at all. It uses
+  `sync_cube` barriers, and the CPU runtime runs a barrier kernel's cube
+  as one spinning OS thread per unit.
+- The barrier-free naive kernel runs, but a step-shaped chain is 2.7×
+  slower than single-threaded `NdArray`, with or without the launch
+  patches.
+- So a CPU-worthy cubecl kernel would have to be a different kernel
+  from the GPU one. That is two implementations again, only both in
+  cubecl.
 
-Re-evaluate when #1566 or #1658 merge and #1527 is fixed.
+Superseded reasoning, kept for the record: an earlier version of this
+section argued from launch cost alone. First it said stock launch cost
+ruled a single source out; then it said the `IDLE_POLL` patch's
+0.05–0.4 ms launches kept it open. It also cited a 227 s JIT, which was
+the whole smoke run; the JIT itself is ≤0.2 s per kernel.
+
+Re-evaluate only if a CPU-shaped cubecl kernel (vectorized `Line<f32>`
+rows, no barriers) gets near `NdArray`. See "Next" in the experiment.
+
+**Decisions:**
+- **Scope: full batched heads.**
+  - `TransformerBlock` stores one `qkv: Linear` `[D, 3D]` in today's
+    fused column order (`part·D + h·d_k + j`), replacing
+    `q_heads`/`k_heads`/`v_heads`.
+  - New tape ops `split_heads` (`[B·T, H·d_k]` → `[B·H·T, d_k]`) and
+    `merge_heads` (its inverse). Both are permutations, so each backward
+    is the inverse permutation; both are gradient-checked.
+  - Attention is one `batched_matmul` over B·H, with the mask built for
+    B·H.
+  - `TransformerBlockOut` gets one `qkv_out` in place of
+    `q_outs`/`k_outs`/`v_outs`. `head_weights` becomes one
+    `[B·H·T, T]` Var, with a helper returning head h's `[B·T, T]` slice.
+- **Extras: ported with `gather`.**
+  - Attention gates fuse into one `[D, D]` Linear, applied after
+    `merge_heads`.
+  - Per-head qk-norm gamma/beta (`[H, d_k]` tables) and sink logits
+    (`[H, 1]`) are broadcast to rows with the existing `gather`, using a
+    row-to-head index.
+- **Checkpoints: switch, no legacy reader.** Same flat length, fused
+  order. No checkpoints are tracked in git.
+- **Init: unchanged draws.** Draw each head's Q, K and V in today's RNG
+  order, then pack them, so a given seed gives identical parameters.
+- **Acceptance:**
+  - The forward is bit-identical to the old per-head path. That's
+    achievable because `NdArray::matmul` accumulates each output element
+    over k in the same order at any width. The reference outputs are
+    captured before the switch.
+  - Gradients match to 1e-5 relative. They can't be bit-exact: dX now
+    sums 3D columns in one dot product instead of adding 24 per-head
+    partial sums.
+  - A short `training_recipe_check` loss curve tracks the old one.
+  - `step_profile` records the CPU step time before and after.
+- **Blast radius:**
+  - 6 examples read `head_weights[h]`; they switch to the helper.
+  - 4 memory_tier examples iterate `q_outs`/`k_outs`/`v_outs` leaves;
+    that becomes one leaf.
+  - `softmax1_divergence_diagnosis` reads per-head Q/K weight norms;
+    those become column blocks of `qkv.w`.
+  - `softmax1_qknorm_fix` has its own block copy and is unaffected.
+  - `to_fused_flat`/`from_fused_flat` become `to_flat`/`from_flat`.
+
+### Experiment: one kernel source on the CPU runtime (2026-09-24)
+
+`cubecl_spike cpu-step` runs a step-shaped chain:
+- 144 launches, alternating matmul (512,128)@(128,128) and elementwise;
+- one sync, best of 5;
+- next to the same chain on `NdArray`.
+
+It also times each kernel's first launch (the JIT) against its second,
+and checks results against `NdArray` (max error ≤ 5e-8).
+
+Setup:
+- Three `cubecl-cpu` builds, recreated per `spikes/cubecl_spike/PATCHES.md`:
+  stock pre.4; #1658 applied; `IDLE_POLL` = 20 ms.
+- Runs were pinned to 12 of 16 cores (`start /affinity FFF`) at
+  BelowNormal, on an idle machine.
+
+| variant | chain (ms) | vs NdArray 1 thread | JIT, first launch (mm / ew) | second launch + sync (mm / ew) |
+|---|---|---|---|---|
+| stock | 165 | 2.6× slower (64) | 44 / 21 ms | 24 / 15 ms |
+| #1658 | 769 | 11× slower (67) | 93 / 188 ms | 101 / 91 ms |
+| `IDLE_POLL` | 157 | 2.7× slower (59) | 46 / 24 ms | 1.1 / 0.46 ms |
+
+Queued launch floor (`cubecl_spike cpu`, same setup), in ms per naive
+matmul dispatch; `NdArray` is single-threaded:
+
+| shape | stock | #1658 | `IDLE_POLL` | NdArray |
+|---|---|---|---|---|
+| 64 | 5.13 | 1.11 | 0.43 | 0.04–0.07 |
+| 512x128 | 3.83 | 3.71 | 2.89 | 0.74–0.86 |
+| 512x256 | 9.57 | 11.3 | 7.22 | 2.3–3.2 |
+| 2048x128 | 7.92 | 7.49 | 8.54 | 3.5 |
+
+What it shows:
+- **Kill criterion met.** The chain had to come in clearly under
+  ~130 ms. The best variant took 157 ms, and one thread of `NdArray`
+  took 59 ms.
+- **In a queued chain the kernel is the bottleneck, not the launch.**
+  - `IDLE_POLL` only speeds up the sync round trip: 1.1 ms against 24 ms
+    stock. Its chain matches stock.
+  - The naive kernel reaches ~5–9 GFLOP/s on 12 cores, against ~20 on
+    one core for `NdArray`, whose ikj loop vectorizes. The naive kernel
+    walks `b` by column, one scalar unit per output element.
+- **#1658 is a regression on Windows:** a 4.6× slower chain, and every
+  sync costs ~0.1 s. Its gains were measured on Linux; it wakes and
+  blocks workers per launch.
+- **Barrier kernels are unusable on the CPU runtime.**
+  - The tiled matmul uses 16×16 = 256 units per cube, with a barrier per
+    k-step. It never finished one launch in 12 minutes: 258 threads, ~10
+    cores spinning, 7,200 CPU-seconds.
+  - By design, the CPU runtime (`threadpool/mod.rs`) grows its pool to
+    one worker per unit and spins at `sync_cube`.
+  - Any GPU kernel that uses shared memory and barriers therefore needs
+    a separate CPU kernel.
+- **JIT is not a blocker:** ≤0.2 s per kernel. #1527's missing cache
+  would cost seconds per process start, not minutes.
+
+Next, if anyone reopens this: write a CPU-shaped cubecl matmul, where
+each unit owns output rows and runs an ikj loop over `Line<f32>`, with
+no barriers. See whether it approaches `NdArray` there. Even if it does,
+it's a second kernel, and single source was the point.
 
 ### Survey: cutting cubecl CPU launch overhead (2026-09-24)
 
@@ -240,8 +346,9 @@ Sources: tracel-ai/cubecl and tracel-ai/burn issues and PRs.
     persistence (#1677).
   - Windows CI is still off (#104).
 
-**Git dependency or local patch?** The user leans toward a single source
-(2026-09-24), so the question is how to get upstream's CPU fixes before
+**Git dependency or local patch?** (Moot since the experiment below: the
+local patches were enough to test, and single source failed.) The user
+leaned toward a single source (2026-09-24), so the question is how to get upstream's CPU fixes before
 they're released.
 - **A git dependency is reasonable for a pre-release**, but not for
   this:
@@ -269,45 +376,3 @@ per-launch encoding and metadata uploads (#1504 caches the uniforms).
 Candidate for milestone 5 or 6, measured against plain queued launches.
 Unverified here: shapes must stay fixed between replays, and the Vulkan
 SPIR-V path may not support it.
-
-**Decisions:**
-- **Scope: full batched heads.**
-  - `TransformerBlock` stores one `qkv: Linear` `[D, 3D]` in today's
-    fused column order (`part·D + h·d_k + j`), replacing
-    `q_heads`/`k_heads`/`v_heads`.
-  - New tape ops `split_heads` (`[B·T, H·d_k]` → `[B·H·T, d_k]`) and
-    `merge_heads` (its inverse). Both are permutations, so each backward
-    is the inverse permutation; both are gradient-checked.
-  - Attention is one `batched_matmul` over B·H, with the mask built for
-    B·H.
-  - `TransformerBlockOut` gets one `qkv_out` in place of
-    `q_outs`/`k_outs`/`v_outs`. `head_weights` becomes one
-    `[B·H·T, T]` Var, with a helper returning head h's `[B·T, T]` slice.
-- **Extras: ported with `gather`.**
-  - Attention gates fuse into one `[D, D]` Linear, applied after
-    `merge_heads`.
-  - Per-head qk-norm gamma/beta (`[H, d_k]` tables) and sink logits
-    (`[H, 1]`) are broadcast to rows with the existing `gather`, using a
-    row-to-head index.
-- **Checkpoints: switch, no legacy reader.** Same flat length, fused
-  order. No checkpoints are tracked in git.
-- **Init: unchanged draws.** Draw each head's Q, K and V in today's RNG
-  order, then pack them, so a given seed gives identical parameters.
-- **Acceptance:**
-  - The forward is bit-identical to the old per-head path. That's
-    achievable because `NdArray::matmul` accumulates each output element
-    over k in the same order at any width. The reference outputs are
-    captured before the switch.
-  - Gradients match to 1e-5 relative. They can't be bit-exact: dX now
-    sums 3D columns in one dot product instead of adding 24 per-head
-    partial sums.
-  - A short `training_recipe_check` loss curve tracks the old one.
-  - `step_profile` records the CPU step time before and after.
-- **Blast radius:**
-  - 6 examples read `head_weights[h]`; they switch to the helper.
-  - 4 memory_tier examples iterate `q_outs`/`k_outs`/`v_outs` leaves;
-    that becomes one leaf.
-  - `softmax1_divergence_diagnosis` reads per-head Q/K weight norms;
-    those become column blocks of `qkv.w`.
-  - `softmax1_qknorm_fix` has its own block copy and is unaffected.
-  - `to_fused_flat`/`from_fused_flat` become `to_flat`/`from_flat`.
