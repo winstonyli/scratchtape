@@ -744,6 +744,57 @@ impl TransformerBlock {
         let ffn2 = Linear::from_flat(data, offset, d_ff, d_model);
         Self { n_heads, d_k, ln1, q_heads, k_heads, v_heads, out_proj, ln2, ffn1, ffn2, qk_norms: Vec::new(), attn_gates: Vec::new(), sink_logits: Vec::new(), mask_cache: RefCell::new(None) }
     }
+
+    /// `to_flat` with every head's Q, K and V fused into one [D, 3D] Linear
+    /// (weights, then bias), the layout `gpu_step` uses: column
+    /// `part * D + h * d_k + j` is column j of head h's Q (part 0), K (1) or
+    /// V (2). Plain blocks only.
+    pub fn to_fused_flat(&self) -> Vec<f32> {
+        assert!(self.qk_norms.is_empty() && self.attn_gates.is_empty() && self.sink_logits.is_empty(), "fused layout covers plain blocks only");
+        let (d, d_k) = (self.n_heads * self.d_k, self.d_k);
+        let mut w = vec![0.0; d * 3 * d];
+        let mut b = vec![0.0; 3 * d];
+        for (part, heads) in [&self.q_heads, &self.k_heads, &self.v_heads].into_iter().enumerate() {
+            for (h, l) in heads.iter().enumerate() {
+                let c0 = part * d + h * d_k;
+                for r in 0..d {
+                    w[r * 3 * d + c0..][..d_k].copy_from_slice(&l.w.data[r * d_k..][..d_k]);
+                }
+                b[c0..c0 + d_k].copy_from_slice(&l.b.data);
+            }
+        }
+        let mut out = self.ln1.to_flat();
+        out.extend(w);
+        out.extend(b);
+        out.extend(self.out_proj.to_flat());
+        out.extend(self.ln2.to_flat());
+        out.extend(self.ffn1.to_flat());
+        out.extend(self.ffn2.to_flat());
+        out
+    }
+
+    /// Inverse of `to_fused_flat`.
+    pub fn from_fused_flat(data: &[f32], offset: &mut usize, d_model: usize, n_heads: usize, d_ff: usize) -> Self {
+        let (d, d_k) = (d_model, d_model / n_heads);
+        let ln1 = LayerNorm::from_flat(data, offset, d);
+        let qkv = Linear::from_flat(data, offset, d, 3 * d);
+        let split = |part: usize| -> Vec<Linear> {
+            (0..n_heads)
+                .map(|h| {
+                    let c0 = part * d + h * d_k;
+                    let w = (0..d).flat_map(|r| qkv.w.data[r * 3 * d + c0..][..d_k].iter().copied()).collect();
+                    let b = qkv.b.data[c0..c0 + d_k].to_vec();
+                    Linear::from_parts(NdArray::new(w, vec![d, d_k]), NdArray::new(b, vec![d_k]))
+                })
+                .collect()
+        };
+        let (q_heads, k_heads, v_heads) = (split(0), split(1), split(2));
+        let out_proj = Linear::from_flat(data, offset, d, d);
+        let ln2 = LayerNorm::from_flat(data, offset, d);
+        let ffn1 = Linear::from_flat(data, offset, d, d_ff);
+        let ffn2 = Linear::from_flat(data, offset, d_ff, d);
+        Self { n_heads, d_k, ln1, q_heads, k_heads, v_heads, out_proj, ln2, ffn1, ffn2, qk_norms: Vec::new(), attn_gates: Vec::new(), sink_logits: Vec::new(), mask_cache: RefCell::new(None) }
+    }
 }
 
 #[cfg(test)]
@@ -1073,5 +1124,37 @@ mod tests {
 
         assert_eq!(layer_a.w.data, layer_b.w.data);
         assert_eq!(layer_a.b.data, layer_b.b.data);
+    }
+
+    /// The fused layout is a pure relabelling: it round-trips exactly, and
+    /// x @ W_qkv + b_qkv reproduces every head's own Q/K/V projection in the
+    /// documented column slot.
+    #[test]
+    fn fused_qkv_layout_round_trips_and_matches_per_head_projections() {
+        let (d_model, n_heads, d_ff, n) = (16, 4, 24, 5);
+        let mut rng = Rng::new(7);
+        let block = TransformerBlock::new(&mut rng, d_model, n_heads, d_ff);
+        let fused = block.to_fused_flat();
+        assert_eq!(fused.len(), block.to_flat().len());
+        let back = TransformerBlock::from_fused_flat(&fused, &mut 0, d_model, n_heads, d_ff);
+        assert_eq!(back.to_flat(), block.to_flat());
+
+        let x = NdArray::new((0..n * d_model).map(|_| rng.next_gaussian()).collect(), vec![n, d_model]);
+        let qkv = Linear::from_flat(&fused, &mut (2 * d_model), d_model, 3 * d_model);
+        let y = x.matmul(&qkv.w);
+        let d_k = d_model / n_heads;
+        for (part, heads) in [&block.q_heads, &block.k_heads, &block.v_heads].into_iter().enumerate() {
+            for (h, l) in heads.iter().enumerate() {
+                let yh = x.matmul(&l.w);
+                for r in 0..n {
+                    for j in 0..d_k {
+                        let c = part * d_model + h * d_k + j;
+                        let fused_v = y.data[r * 3 * d_model + c] + qkv.b.data[c];
+                        let head_v = yh.data[r * d_k + j] + l.b.data[j];
+                        assert!((fused_v - head_v).abs() < 1e-5, "part {part} head {h} ({r},{j}): {fused_v} vs {head_v}");
+                    }
+                }
+            }
+        }
     }
 }

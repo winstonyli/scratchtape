@@ -13,6 +13,14 @@ edition = "2024"
 # blocking executor (not a full runtime like tokio) to drive them.
 wgpu = "23"
 pollster = "0.4"
+# gpu_step (docs/gpu_step_design.md): the device-resident training step.
+# cubecl writes kernels in a Rust DSL and compiles them to SPIR-V for Vulkan,
+# the only route to the eGPU's matrix cores; chosen over raw wgpu after
+# spikes/cubecl_spike. Pre-release, so pinned exactly. It brings wgpu 30
+# alongside gpu.rs's wgpu 23. cubecl-runtime: pre.4 no longer re-exports the
+# Runtime trait.
+cubecl = { version = "=0.11.0-pre.4", features = ["wgpu", "vulkan"] }
+cubecl-runtime = "=0.11.0-pre.4"
 
 [dev-dependencies]
 criterion = "0.5"

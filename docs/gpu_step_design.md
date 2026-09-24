@@ -3,8 +3,8 @@
 Goal: run one tiny_lm training step (batch 8, `d_model` 128, 8 heads,
 `seq_len` 64, 4 blocks, `d_ff` 256, vocab 256, SGD, cross-entropy)
 entirely on the RX 9060 XT eGPU. It must match the CPU tape's losses and
-gradients, and be faster than the CPU step. Status: **design, nothing
-built yet.**
+gradients, and be faster than the CPU step. Status: **milestone 1 done
+(2026-09-24)**; milestone 2 (kernels) next.
 
 ## What the evidence says
 
@@ -97,17 +97,36 @@ against ~13 ms for option A with fusion.
   the only route to matrix cores. The adapter is picked by name (discrete
   RX 9060 XT) and logged at startup. The full step is timed once on DX12
   as well, since raw wgpu had DX12 ahead on launch overhead.
-- **Placement:** the code goes in `src/gpu_step/` behind a `gpu` cargo
-  feature, so the default build stays free of the pre-release dependency.
-  The CPU runtime (`cubecl/cpu`) is not used.
+- **Placement (decided 2026-09-24):** `src/gpu_step/` in the main crate,
+  with cubecl as a plain dependency, not behind a feature. The cost: every
+  build compiles cubecl and a second wgpu (30, beside `gpu.rs`'s 23); a
+  cold `cargo check --all-targets` took ~4 min. The CPU runtime
+  (`cubecl/cpu`) is not used, so no LLVM download.
+- **Device:** `WgpuDevice::new(WgpuDeviceKind::DiscreteGpu(0))` with
+  `init_setup::<Vulkan>`. cubecl panics if there's no discrete adapter,
+  and its `CUBECL_WGPU_DEFAULT_DEVICE` override doesn't apply to this
+  kind, so there's no silent fallback. The adapter is logged once:
+  `AMD Radeon RX 9060 XT (DiscreteGpu, Vulkan, driver 26.8.1 (LLPC))`.
+- **Lockfile gotcha:** adding cubecl to an existing lock resolved
+  `gpu-allocator 0.28` against the already-locked `windows 0.58`, and
+  `wgpu-hal 30` failed to compile (D3D12 trait mismatches). Fix:
+  `cargo update -p gpu-allocator@0.28.0`, which moves it to `windows 0.62`.
 
 ## Milestones and checks
 
 Each milestone leaves a runnable check behind.
 
-1. **Scaffolding.** Feature flag, device selection and logging, the flat
-   parameter and gradient buffers, and pack/unpack against the CPU model.
-   The SGD kernel is checked against `optim::Sgd`.
+1. **Scaffolding. Done.** Device selection and logging, the flat
+   parameter and gradient buffers (`DeviceParams`), and one-launch SGD
+   and gradient zeroing.
+   - `TransformerBlock::to_fused_flat` / `from_fused_flat` convert to and
+     from the fused-QKV layout; `gpu_step::pack` flattens a whole model.
+     A whole-model unpack waits for milestone 5, the first thing that
+     needs one.
+   - Checks: `fused_qkv_layout_round_trips_and_matches_per_head_projections`
+     (CPU, runs by default) and `device_sgd_matches_optim_sgd` (GPU,
+     `cargo test --lib gpu_step -- --ignored`, since it needs the
+     discrete GPU).
 2. **Kernels one by one.** Each forward is compared with the CPU tape's
    composed ops on the same inputs. Each backward is checked two ways:
    against CPU gradients, and by finite differences through the GPU
@@ -147,8 +166,11 @@ other examples. The ops table leaves room for them later.
 
 ## Open questions
 
-- Should `gpu_step` live in the main crate behind a feature (the current
-  plan), or in a separate crate like the spike?
-- Should `nn.rs` move to batched heads on the CPU too? GPU parity doesn't
-  need it, because pack/unpack bridges the layouts. It would speed up the
-  CPU step and let the census's "heads batched" row become the real tape.
+- **The CPU model will move to batched heads too** (agreed 2026-09-24;
+  how is still to be discussed). GPU parity doesn't need it, because
+  pack/unpack bridges the layouts. It would speed up the CPU step and
+  let the census's "heads batched" row become the real tape. To settle:
+  whether `nn.rs` stores the fused `[D, 3D]` QKV directly (making
+  `to_fused_flat` the identity), what happens to the checkpoint format
+  and the per-head extras (qk-norm, gates, sinks), and whether the tape
+  gains a batched-matmul-over-heads op or reshapes.

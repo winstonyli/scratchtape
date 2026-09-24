@@ -971,6 +971,15 @@ because raw forgetting deltas hid a floor effect.
   The design has six milestones with parity checks against the CPU tape,
   and a kill criterion: stop if the step isn't clearly faster than a
   well-threaded CPU step.
+  **Milestone 1 done:** `src/gpu_step/` sits in the main crate, with
+  cubecl as a plain dependency rather than a feature. It selects the
+  discrete GPU on Vulkan and logs it, with no fallback. It keeps the
+  parameters and gradients in flat device buffers, packed with fused QKV
+  by `TransformerBlock::to_fused_flat`, and runs SGD and gradient zeroing
+  as one launch each. The checks are a CPU test of the fused layout and
+  a GPU SGD test against `optim::Sgd` (`cargo test --lib gpu_step --
+  --ignored`); both pass. The CPU model will also move to batched heads;
+  how is still open (see the design note).
 - **Parked: report the tracel-llvm space-in-path bug upstream.** The
   bundler's `get_libs` splits `llvm-config --libs` output on whitespace,
   which breaks any Windows install path containing a space. The fix is to
