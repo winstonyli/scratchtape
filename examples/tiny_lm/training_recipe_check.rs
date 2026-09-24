@@ -17,6 +17,18 @@
 // Same architecture and init stream as tiny_lm_corpus.rs (seed 1), so
 // batch=1 lr=0.3 reproduces attention_uniformity_check.rs's plain (1.852)
 // and softmax1 (1.803) checkpoints' recipe.
+//
+// Results, round 1: batch size at lr 0.3, 64000 windows (2026-09-24;
+// 4 concurrent runs at BelowNormal on a CPU shared with other jobs,
+// ~4.5-5.5 h each). Final train-probe / held-out:
+//   plain_b8     8000 steps  1.390 / 1.858   (batch 1: 1.852)
+//   softmax1_b8  8000 steps  1.375 / 1.846   (batch 1: 1.803)
+//   plain_b32    2000 steps  1.806 / 2.128
+//   softmax1_b32 2000 steps  1.813 / 2.115
+// Batch 8 ties batch 1 with 8x fewer steps; batch 32 at unscaled lr is
+// under-stepped. softmax1's edge over plain shrinks to ~0.012 under
+// batching. At batch 8 the train/held-out gap is 0.47 and still
+// widening: overfitting, not optimization, is what's limiting.
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::{Tape, Var};

@@ -402,6 +402,32 @@ The headline stands: every transformer here trails the count model by
 0.15–0.20 nats, so training (not attention variants) is the bottleneck.
 One seed; seed-to-seed spread on this metric is unmeasured.
 
+**Minibatching doesn't close the gap.** `training_recipe_check.rs` varies
+the recipe one factor at a time at a fixed data budget (64000 windows,
+so batch changes step count, not data), seed 1, SGD lr 0.3, same
+deterministic eval. Train-probe is the first 371 windows of train, for a
+like-for-like overfitting gap:
+
+| Recipe | Steps | Train-probe | Held-out |
+|---|---|---|---|
+| plain, batch 1 | 64000 | — | 1.852 |
+| plain, batch 8 | 8000 | 1.390 | 1.858 |
+| plain, batch 32 | 2000 | 1.806 | 2.128 |
+| softmax1, batch 1 | 64000 | — | 1.803 |
+| softmax1, batch 8 | 8000 | 1.375 | 1.846 |
+| softmax1, batch 32 | 2000 | 1.813 | 2.115 |
+
+Batch 8 matches batch 1 in 8× fewer updates (a throughput win once
+matmul is multi-threaded, nothing more). Batch 32 at unscaled lr is
+under-stepped, 0.27 behind at equal data and still falling steeply.
+softmax1's lead over plain shrinks from 0.05 (batch 1) to 0.012–0.013
+under batching, so the attention-variant ranking above is within
+recipe/seed noise until seed spread is measured. The limiting factor is
+overfitting: at batch 8 the train/held-out gap is 0.47 and was still
+widening at the end, while held-out gains had slowed to 0.03 per 8000
+windows. Regularization (weight decay, dropout) is the next lever, ahead
+of the optimizer.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data
