@@ -826,7 +826,16 @@ because raw forgetting deltas hid a floor effect.
   inconclusive at 2048+ (GPU shared with other jobs at the time). Re-measure the branch's block
   benchmark on DX12 before trusting "dispatch overhead" as a hard floor.
   Discrete-GPU matmul now: 128 → 1.1 ms (CPU 0.4 ms); 1024 → ~30 ms
-  (CPU ~125 ms).
+  (CPU ~125 ms). The RX 9060 XT is an **eGPU over USB4** (host: Ryzen 7
+  7840U laptop), so every host↔device copy crosses a ~4-lane PCIe
+  tunnel: part of the per-call floor is the link, not wgpu. A GPU path
+  that pays off here must keep weights and activations resident on the
+  device and read back only the loss, not round-trip per op as
+  `gpu.rs::matmul` and the unmerged branch do. The laptop's XDNA NPU was
+  ruled out: inference-only toolchain (Ryzen AI / ONNX, quantized), no
+  route for a from-scratch autograd tape, and ~10 TOPS vs the eGPU's
+  ~25 TFLOPS FP32. Cheaper first lever for CPU runs: `matmul` is
+  single-threaded on an 8-core/16-thread CPU.
 
 ## A note on the name
 
