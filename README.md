@@ -820,7 +820,10 @@ because raw forgetting deltas hid a floor effect.
   adapter is now logged. New lead: wgpu on this machine defaults to
   Vulkan, but DX12 has ~7× lower per-call overhead (128×128 round trip
   1.1 ms vs 7.8 ms), so `gpu.rs` now defaults to DX12 on Windows
-  (`WGPU_BACKEND` overrides). Re-measure the branch's block
+  (`WGPU_BACKEND` overrides). That holds for this project's short,
+  overhead-bound dispatches only: humble-cortex found Vulkan 1.4–1.6×
+  faster for long compute-bound kernels, and a size sweep here was
+  inconclusive at 2048+ (GPU shared with other jobs at the time). Re-measure the branch's block
   benchmark on DX12 before trusting "dispatch overhead" as a hard floor.
   Discrete-GPU matmul now: 128 → 1.1 ms (CPU 0.4 ms); 1024 → ~30 ms
   (CPU ~125 ms).

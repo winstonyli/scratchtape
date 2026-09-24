@@ -32,8 +32,11 @@ async fn init_context() -> GpuContext {
     // DX12 by default: on the RX 9060 XT it had far lower per-call overhead
     // than wgpu's default pick, Vulkan (128x128 matmul round trip 1.1 ms vs
     // 7.8 ms; 512: 6.6 vs 30 ms; roughly even at 1024), 2026-09-23, driver
-    // 32.0.31041. Off Windows, or if DX12 is missing, fall back to any
-    // backend. WGPU_BACKEND=vulkan|dx12|... overrides.
+    // 32.0.31041. That's this project's regime: many short, overhead-bound
+    // dispatches. For long compute-bound kernels Vulkan wins instead
+    // (humble-cortex: 1.4-1.6x), so re-measure if the workload grows. Off
+    // Windows, or if DX12 is missing, fall back to any backend.
+    // WGPU_BACKEND=vulkan|dx12|... overrides.
     let preferred = if cfg!(windows) { wgpu::Backends::DX12 } else { wgpu::Backends::all() };
     let backends = wgpu::util::backend_bits_from_env().unwrap_or(preferred);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..Default::default() });
