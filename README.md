@@ -912,6 +912,12 @@ because raw forgetting deltas hid a floor effect.
   because another session's GPU job saturated the eGPU and every launch
   loop stalled. If cmma is much faster than 700–900 GFLOP/s at our shapes,
   the matmul kernels could come from cubecl, not WGSL.
+- **Parked: report the tracel-llvm space-in-path bug upstream.** The
+  bundler's `get_libs` splits `llvm-config --libs` output on whitespace,
+  which breaks any Windows install path containing a space. The fix is to
+  use `--libnames` (`spikes/cubecl_spike/PATCHES.md`). Every version
+  through 23.1.0-3 has the bug. It's parked, not dropped: reporting it
+  posts publicly, so it waits on the owner's go-ahead.
 
 ## A note on the name
 

@@ -12,8 +12,26 @@
    through 23.1.0-3 still has this bug.
 
 Only the CPU runtime compiles the bundler. The `wgpu` and `vulkan` builds
-never touch it. The pre.4 bundler wants its own LLVM 23 download, and that
-has not been fetched yet. The 22.1.4-6 build that pre.3 used did work.
+never touch it. The build script downloads its own LLVM
+(`tracel-llvm-23.1.0-3`, 0.66 GB unpacked) into `%LOCALAPPDATA%\tracel`.
+With this one patch, `--features cpu,vulkan` builds in 6 minutes. The
+unused 22.1.4-6 copy (pre.3's) was deleted.
+
+pre.4 CPU smoke run (`cubecl_spike cpu`, stock `IDLE_POLL`, BelowNormal
+priority on a CPU shared with other jobs, 227 s including JIT), ms per
+queued launch:
+
+| shape | matmul pre.4 | matmul pre.3 | elementwise pre.4 | elementwise pre.3 |
+|---|---|---|---|---|
+| 64 | 17.2 | 3.43 | 0.20 | 3.38 |
+| 512x128 | 1.72 | 5.14 | 0.42 | 4.94 |
+| 512x256 | 6.13 | 14.6 | 0.50 | 5.42 |
+| 2048x128 | 12.8 | 9.48 | 16.4 | 5.85 |
+
+The runtime works. The numbers swing 0.1-10x in both directions, which
+looks like contention more than a pre.4 change (`IDLE_POLL` is unchanged;
+the rest of the scheduler wasn't diffed). Either way, per-launch cost stays in milliseconds, against
+~10 us on the GPU, so the CPU runtime verdict stands.
 
 ## Moving from pre.3 to pre.4 (2026-09-24)
 
