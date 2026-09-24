@@ -979,8 +979,10 @@ because raw forgetting deltas hid a floor effect.
   by `TransformerBlock::to_fused_flat`, and runs SGD and gradient zeroing
   as one launch each. The checks are a CPU test of the fused layout and
   a GPU SGD test against `optim::Sgd` (`cargo test --lib gpu_step --
-  --ignored`); both pass. The CPU model will also move to batched heads;
-  how is still open (see the design note).
+  --ignored`); both pass. The CPU model moves to batched heads next,
+  before milestone 2. The decisions (fused QKV storage, `split_heads`/
+  `merge_heads` tape ops, extras via `gather`, bit-exact forward) are in
+  the design note.
   **One wgpu (2026-09-24):** `gpu.rs` and `gpu_dispatch_overhead.rs`
   moved from wgpu 23 to 30, so the crate builds one wgpu stack instead
   of two. The lockfile shrank by ~530 lines. wgpu 30's deeper types

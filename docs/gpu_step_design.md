@@ -4,7 +4,8 @@ Goal: run one tiny_lm training step (batch 8, `d_model` 128, 8 heads,
 `seq_len` 64, 4 blocks, `d_ff` 256, vocab 256, SGD, cross-entropy)
 entirely on the RX 9060 XT eGPU. It must match the CPU tape's losses and
 gradients, and be faster than the CPU step. Status: **milestone 1 done
-(2026-09-24)**; milestone 2 (kernels) next.
+(2026-09-24)**. Next: move the CPU model to batched heads (section
+below), then milestone 2 (kernels).
 
 ## What the evidence says
 
@@ -166,11 +167,61 @@ other examples. The ops table leaves room for them later.
 
 ## Open questions
 
-- **The CPU model will move to batched heads too** (agreed 2026-09-24;
-  how is still to be discussed). GPU parity doesn't need it, because
-  pack/unpack bridges the layouts. It would speed up the CPU step and
-  let the census's "heads batched" row become the real tape. To settle:
-  whether `nn.rs` stores the fused `[D, 3D]` QKV directly (making
-  `to_fused_flat` the identity), what happens to the checkpoint format
-  and the per-head extras (qk-norm, gates, sinks), and whether the tape
-  gains a batched-matmul-over-heads op or reshapes.
+- None open. The CPU batched-heads question is settled below.
+
+## CPU model: batched heads (decided 2026-09-24)
+
+The CPU model moves to batched heads before milestone 2, so the GPU ops'
+parity tests compare against a CPU tape with the same layout and op
+boundaries.
+
+**Two implementations, on purpose.** The CPU tape stays the readable
+reference, composed from small gradient-checked primitives. The GPU step
+uses coarse cubecl kernels checked against it. A single cubecl source for
+both was ruled out by measurement: the cubecl CPU runtime costs ~3.4 ms
+per launch (pre.3; still milliseconds on pre.4, `spikes/cubecl_spike/
+PATCHES.md`). That's ~0.5 s for even the 145-launch step, and its matmul
+lost to single-threaded `NdArray::matmul`. Revisit only if that floor
+drops ~100×.
+
+**Decisions:**
+- **Scope: full batched heads.**
+  - `TransformerBlock` stores one `qkv: Linear` `[D, 3D]` in today's
+    fused column order (`part·D + h·d_k + j`), replacing
+    `q_heads`/`k_heads`/`v_heads`.
+  - New tape ops `split_heads` (`[B·T, H·d_k]` → `[B·H·T, d_k]`) and
+    `merge_heads` (its inverse). Both are permutations, so each backward
+    is the inverse permutation; both are gradient-checked.
+  - Attention is one `batched_matmul` over B·H, with the mask built for
+    B·H.
+  - `TransformerBlockOut` gets one `qkv_out` in place of
+    `q_outs`/`k_outs`/`v_outs`. `head_weights` becomes one
+    `[B·H·T, T]` Var, with a helper returning head h's `[B·T, T]` slice.
+- **Extras: ported with `gather`.**
+  - Attention gates fuse into one `[D, D]` Linear, applied after
+    `merge_heads`.
+  - Per-head qk-norm gamma/beta (`[H, d_k]` tables) and sink logits
+    (`[H, 1]`) are broadcast to rows with the existing `gather`, using a
+    row-to-head index.
+- **Checkpoints: switch, no legacy reader.** Same flat length, fused
+  order. No checkpoints are tracked in git.
+- **Init: unchanged draws.** Draw each head's Q, K and V in today's RNG
+  order, then pack them, so a given seed gives identical parameters.
+- **Acceptance:**
+  - The forward is bit-identical to the old per-head path. That's
+    achievable because `NdArray::matmul` accumulates each output element
+    over k in the same order at any width. The reference outputs are
+    captured before the switch.
+  - Gradients match to 1e-5 relative. They can't be bit-exact: dX now
+    sums 3D columns in one dot product instead of adding 24 per-head
+    partial sums.
+  - A short `training_recipe_check` loss curve tracks the old one.
+  - `step_profile` records the CPU step time before and after.
+- **Blast radius:**
+  - 6 examples read `head_weights[h]`; they switch to the helper.
+  - 4 memory_tier examples iterate `q_outs`/`k_outs`/`v_outs` leaves;
+    that becomes one leaf.
+  - `softmax1_divergence_diagnosis` reads per-head Q/K weight norms;
+    those become column blocks of `qkv.w`.
+  - `softmax1_qknorm_fix` has its own block copy and is unaffected.
+  - `to_fused_flat`/`from_fused_flat` become `to_flat`/`from_flat`.
