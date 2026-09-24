@@ -963,6 +963,14 @@ because raw forgetting deltas hid a floor effect.
   fuse elementwise chains for another 2×. The census model counts one
   launch per gradient sent and per broadcast reduce, and treats an
   elementwise chain as a single kernel. Kernel time comes on top.
+  **Design:** [`docs/gpu_step_design.md`](docs/gpu_step_design.md). It
+  uses a small device tape of coarse, layer-level ops (fused QKV,
+  attention batched over batch×heads, matmuls with bias, ReLU or residual
+  folded in, fused softmax+cross-entropy), about 145 launches per step.
+  Parameters live in one flat buffer, so the update is a single launch.
+  The design has six milestones with parity checks against the CPU tape,
+  and a kill criterion: stop if the step isn't clearly faster than a
+  well-threaded CPU step.
 - **Parked: report the tracel-llvm space-in-path bug upstream.** The
   bundler's `get_libs` splits `llvm-config --libs` output on whitespace,
   which breaks any Windows install path containing a space. The fix is to
