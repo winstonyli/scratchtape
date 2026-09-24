@@ -51,6 +51,11 @@
 // (and the 780M). cubecl reports cmma only when built `--features vulkan`
 // (its own SPIR-V compiler): 12 configs, f16x16x16->f32 included. The
 // default WGSL path (DX12 or Vulkan) reports 0.
+// Correctness (pre.4, SPIR-V): k_matmul_cmma matches the f32 CPU product to
+// f16 precision (max err 3e-5 to 8e-5) at all four shapes that ran. Timings
+// with selfplay-burn sharing the eGPU were floor-bound (~0.8 ms per launch
+// for every kernel, against 0.01-0.1 ms idle), so they say nothing
+// about cmma speed.
 // Timings pending: another session's long GPU job (humble-cortex) saturated
 // the eGPU, and every launch loop - even plain `bench` - stalled
 // indefinitely at ~0 CPU. It looked like a comptime-kernel hang until
