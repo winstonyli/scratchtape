@@ -886,7 +886,16 @@ because raw forgetting deltas hid a floor effect.
   CPU-runtime speed and threading vs `NdArray::matmul`, and launch cost vs
   raw wgpu's 10 µs. Decide with a timeboxed spike: port
   `gpu_dispatch_overhead.rs` to cubecl on wgpu-DX12/Vulkan and the CPU
-  runtime.
+  runtime. **Spike result** (`spikes/cubecl_spike/`, 0.11.0-pre.3): GPU
+  parity with raw wgpu (~10 µs per queued launch, 620–900 GFLOP/s), but
+  the CPU runtime has a ~3.4 ms floor per launch, even for a trivial
+  elementwise kernel, and its matmul is slower than single-threaded
+  `NdArray::matmul`. A ~2400-launch step would take ~8 s, so the
+  one-source-for-both premise fails at this granularity for now. It also
+  needed a lockfile pin (pliron version skew) and two local patches for
+  Windows build bugs (`PATCHES.md`). Decision: raw wgpu for the GPU step,
+  reusing the unmerged branch's WGSL kernels. The CPU path stays
+  `NdArray` + `std::thread`.
 
 ## A note on the name
 

@@ -1,0 +1,29 @@
+# Timeboxed spike (2026-09-24): can one cubecl kernel source serve both the
+# eGPU (wgpu DX12/Vulkan) and a multithreaded CPU (cubecl's LLVM-JIT CPU
+# runtime) well enough to build scratchtape's device-resident training step
+# on? Kept out of the main crate so its dependency tree (cubecl pre-release,
+# wgpu 30, bundled LLVM) doesn't touch scratchtape unless adopted.
+# Version pinned to humble-cortex's, which is known to build here.
+[package]
+name = "cubecl_spike"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[features]
+# The CPU runtime's build script downloads a prebuilt LLVM (~77 MB).
+cpu = ["cubecl/cpu"]
+
+[dependencies]
+cubecl = { version = "=0.11.0-pre.3", features = ["wgpu"] }
+scratchtape = { path = "../.." }
+
+[profile.release]
+opt-level = 3
+
+# Local fixes for two Windows build bugs in the pre.3 CPU runtime (see each
+# patched file's "Patched:" comment). Spike-only.
+[patch.crates-io]
+tracel-llvm-bundler = { path = "patches/tracel-llvm-bundler" }
+cubecl-cpu = { path = "patches/cubecl-cpu" }
