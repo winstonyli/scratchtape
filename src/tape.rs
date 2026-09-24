@@ -135,6 +135,38 @@ impl Tape {
         self.nodes.len()
     }
 
+    /// Every node as (op name, parent indices, output element count), in
+    /// tape order - enough to count what a step would launch on a device
+    /// and which elementwise chains could fuse (step_profile's census).
+    pub fn ops(&self) -> Vec<(&'static str, Vec<usize>, usize)> {
+        self.nodes
+            .iter()
+            .map(|n| {
+                let (name, parents) = match &n.op {
+                    OpKind::Leaf => ("Leaf", vec![]),
+                    OpKind::Add(a, b) => ("Add", vec![*a, *b]),
+                    OpKind::Sub(a, b) => ("Sub", vec![*a, *b]),
+                    OpKind::Mul(a, b) => ("Mul", vec![*a, *b]),
+                    OpKind::MatMul(a, b) => ("MatMul", vec![*a, *b]),
+                    OpKind::BatchedMatMul(a, b, _, _) => ("BatchedMatMul", vec![*a, *b]),
+                    OpKind::Relu(a) => ("Relu", vec![*a]),
+                    OpKind::Sum(a) => ("Sum", vec![*a]),
+                    OpKind::Scale(a, _) => ("Scale", vec![*a]),
+                    OpKind::Transpose(a) => ("Transpose", vec![*a]),
+                    OpKind::Exp(a) => ("Exp", vec![*a]),
+                    OpKind::SumLastAxis(a) => ("SumLastAxis", vec![*a]),
+                    OpKind::MaxLastAxis(a) => ("MaxLastAxis", vec![*a]),
+                    OpKind::Div(a, b) => ("Div", vec![*a, *b]),
+                    OpKind::Concat(v) => ("Concat", v.clone()),
+                    OpKind::Gather(a, _) => ("Gather", vec![*a]),
+                    OpKind::Sqrt(a) => ("Sqrt", vec![*a]),
+                    OpKind::Log(a) => ("Log", vec![*a]),
+                };
+                (name, parents, n.value.data.len())
+            })
+            .collect()
+    }
+
     pub fn leaf(&mut self, value: NdArray) -> Var {
         self.nodes.push(Node { value, grad: None, op: OpKind::Leaf });
         Var { idx: self.nodes.len() - 1 }

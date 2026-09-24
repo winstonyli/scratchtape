@@ -947,7 +947,22 @@ because raw forgetting deltas hid a floor effect.
   sit near the ~10 µs launch floor, so the margin matters less than
   dispatch count. Still, cubecl gives compile-time specialization and a
   matrix-core option that raw WGSL can't, so it's the better base for
-  the GPU step. The owner hasn't decided yet.
+  the GPU step. **Decided 2026-09-24: cubecl on Vulkan SPIR-V**, tiled
+  f32 matmul by default, matrix cores kept as an option.
+  **Launch count is the lever.** The `step_profile 8 1 census` example
+  counts what a device-resident step would launch:
+
+  | layout | unfused | elementwise-fused | ms at ~10 µs/launch |
+  |---|---|---|---|
+  | 8 heads as separate ops (today) | 2372 | 1281 | 23.7 / 12.8 |
+  | heads batched into one op | 776 | 385 | 7.8 / 3.9 |
+
+  The current tape runs each attention head as its own ops: 173 matmuls,
+  against 33 with the heads batched, and the softmax ops repeat per head
+  too. So the GPU step should batch heads from the start, a 3× cut, and
+  fuse elementwise chains for another 2×. The census model counts one
+  launch per gradient sent and per broadcast reduce, and treats an
+  elementwise chain as a single kernel. Kernel time comes on top.
 - **Parked: report the tracel-llvm space-in-path bug upstream.** The
   bundler's `get_libs` splits `llvm-config --libs` output on whitespace,
   which breaks any Windows install path containing a space. The fix is to
