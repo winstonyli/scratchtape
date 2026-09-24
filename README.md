@@ -1021,6 +1021,13 @@ because raw forgetting deltas hid a floor effect.
   use `--libnames` (`spikes/cubecl_spike/PATCHES.md`). Every version
   through 23.1.0-3 has the bug. It's parked, not dropped: reporting it
   posts publicly, so it waits on the owner's go-ahead.
+  **GPU priority doesn't fix eGPU contention (2026-09-24, `gpu_priority_check.rs`).**
+  Windows has a per-process GPU priority, separate from CPU priority and
+  settable from outside (`D3DKMTSetProcessSchedulingPriorityClass`).
+  With another session's job on the eGPU, dropping a heavy load to Idle
+  GPU priority left a small probe's p95 at ~0.5–0.64 s, the same as at
+  Normal. The stalls look like the third job's unpreempted packets, so
+  turn-taking is the fix (GPU leases, drafted for LONG_RUNS.md).
 
 ## A note on the name
 
