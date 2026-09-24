@@ -893,7 +893,15 @@ because raw forgetting deltas hid a floor effect.
   `NdArray::matmul`. A ~2400-launch step would take ~8 s, so the
   one-source-for-both premise fails at this granularity for now. It also
   needed a lockfile pin (pliron version skew) and two local patches for
-  Windows build bugs (`PATCHES.md`). Decision: raw wgpu for the GPU step,
+  Windows build bugs (`PATCHES.md`). **Tuning:** no runtime speed options.
+  The CPU threadpool runs one task per unit of a cube, so units-per-cube is
+  the parallelism and launch shape is the only lever. At 1 unit a launch
+  costs ~1 µs but runs single-threaded. With several units, the handoff
+  between threads costs 1–5 ms because idle workers park after 200 µs.
+  Patching that constant to 20 ms cut it to 0.05–0.4 ms, and a 64-unit
+  matmul then beat `NdArray::matmul` (0.81 vs 1.3–1.6 ms). The cost is a
+  forked crate, 16 threads spinning between launches, and a per-op launch
+  policy, which gains little over threading `NdArray`. Decision: raw wgpu for the GPU step,
   reusing the unmerged branch's WGSL kernels. The CPU path stays
   `NdArray` + `std::thread`.
 
