@@ -926,18 +926,28 @@ because raw forgetting deltas hid a floor effect.
   the f32 CPU product. Making k a compile-time constant alone gives the
   naive kernel 2–3×. A fresh output buffer per launch costs nothing
   measurable, because cubecl pools its memory.
+  **A fairer f32 baseline closes most of the gap.** The tiled f32 kernel
+  (`k_matmul_tiled`: a 64×64 tile per group, 4×4 per thread, staged
+  through shared memory) runs at 0.97–4.7 TFLOP/s. That's 1.1–5.5×
+  faster than the naive kernel. Matrix cores keep a **2–3× edge** over it
+  (for example 0.017 vs 0.008 ms at (512,128)@(128,128), and 0.23 vs
+  0.10 ms at (2048,512)@(512,512)). These are best of two rounds with
+  another GPU job sharing the eGPU. The tiled kernel is simple, with no
+  vector loads and no double buffering, so 2–3× is an upper bound on
+  what matrix cores add.
   Caveats:
-  - The naive kernel is a weak baseline. A tiled f32 WGSL kernel would
-    close part of the gap.
   - Inputs were converted to f16 ahead of time. A real step also needs
     cast kernels, or f16 copies kept alongside the f32 weights.
   - f16 matmul inputs in training need a precision check: gradient
     check tolerances, and perhaps loss scaling.
   - The largest shape varied 3× between rounds.
   **This reopens the decision.** cubecl matched raw wgpu on launch cost,
-  and it's the only route to matrix cores. So the GPU step is better
-  built in cubecl on Vulkan SPIR-V than in raw WGSL. The owner hasn't
-  decided yet.
+  and it's the only route to matrix cores. Matrix cores' real margin is
+  2–3× over a decent f32 kernel, not 5–14×. At step shapes both kernels
+  sit near the ~10 µs launch floor, so the margin matters less than
+  dispatch count. Still, cubecl gives compile-time specialization and a
+  matrix-core option that raw WGSL can't, so it's the better base for
+  the GPU step. The owner hasn't decided yet.
 - **Parked: report the tracel-llvm space-in-path bug upstream.** The
   bundler's `get_libs` splits `llvm-config --libs` output on whitespace,
   which breaks any Windows install path containing a space. The fix is to

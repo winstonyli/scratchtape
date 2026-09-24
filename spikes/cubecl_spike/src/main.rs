@@ -66,6 +66,19 @@
 // cmma is 5-14x faster than naive and sits at the launch floor for step
 // shapes. comptime k gives 2-3x on its own. Fresh allocation is free
 // (pooled).
+// Tiled f32 baseline (k_matmul_tiled: 64x64 tile per cube, 4x4 per unit,
+// shared-memory slabs). Correct to 1e-3 at every shape. The eGPU was
+// shared with selfplay-burn-head, so these are best of two rounds, ms
+// [GFLOP/s]:
+//   (64,64)       tiled 0.014 [39]     cmma 0.009 [62]
+//   (512,128)     0.017 [970]          0.008 [2079]
+//   (512,256)     0.055 [1211]         0.026 [2563]
+//   (2048,128)    0.034 [1978]         0.011 [6259]
+//   (2048,512)    0.226 [4748]         0.100 [10789]
+// Tiled f32 is 1.1-5.5x faster than naive. cmma keeps a 2-3x edge over
+// it, so most of the naive-vs-cmma gap was memory layout, not matrix
+// cores. The tiled kernel is simple (no vector loads, no double
+// buffering), so 2-3x is an upper bound on what cmma adds.
 // Earlier: another session's long GPU job (humble-cortex) saturated
 // the eGPU, and every launch loop - even plain `bench` - stalled
 // indefinitely at ~0 CPU. It looked like a comptime-kernel hang until
@@ -191,6 +204,55 @@ fn k_matmul_ct(a: &[f32], b: &[f32], out: &mut [f32], m: u32, n: u32, #[comptime
     }
 }
 
+/// Tiled f32 matmul, the fair non-matrix-core baseline: each 16x16 cube
+/// computes a 64x64 output tile, each unit a 4x4 block held in registers,
+/// with A and B staged through shared memory in 64x16 / 16x64 slabs.
+/// Needs m % 64 == 0, n % 64 == 0, k % 16 == 0.
+#[cube(launch)]
+fn k_matmul_tiled(a: &[f32], b: &[f32], out: &mut [f32], #[comptime] k: u32, #[comptime] n: u32) {
+    let tx = UNIT_POS_X;
+    let ty = UNIT_POS_Y;
+    let tid = ty * 16 + tx;
+    let row0 = CUBE_POS_Y * 64;
+    let col0 = CUBE_POS_X * 64;
+    let mut a_s = Shared::<[f32]>::new_slice(1024usize);
+    let mut b_s = Shared::<[f32]>::new_slice(1024usize);
+    let mut acc = Array::<f32>::new(16usize);
+    let mut bv = Array::<f32>::new(4usize);
+    for kk in 0..k / 16 {
+        #[unroll]
+        for i in 0..4u32 {
+            let e = tid + 256 * i;
+            a_s[e as usize] = a[((row0 + e / 16) * k + kk * 16 + e % 16) as usize];
+            b_s[e as usize] = b[((kk * 16 + e / 64) * n + col0 + e % 64) as usize];
+        }
+        sync_cube();
+        #[unroll]
+        for p in 0..16u32 {
+            #[unroll]
+            for j in 0..4u32 {
+                bv[j as usize] = b_s[(p * 64 + tx * 4 + j) as usize];
+            }
+            #[unroll]
+            for i in 0..4u32 {
+                let av = a_s[((ty * 4 + i) * 16 + p) as usize];
+                #[unroll]
+                for j in 0..4u32 {
+                    acc[(i * 4 + j) as usize] += av * bv[j as usize];
+                }
+            }
+        }
+        sync_cube();
+    }
+    #[unroll]
+    for i in 0..4u32 {
+        #[unroll]
+        for j in 0..4u32 {
+            out[((row0 + ty * 4 + i) * n + col0 + tx * 4 + j) as usize] = acc[(i * 4 + j) as usize];
+        }
+    }
+}
+
 /// Matrix-core matmul: out[M,N] (f32) = a[M,K] @ b[K,N] (f16, row-major).
 /// One plane per cube computes one 16x16 output tile, stepping K by 16.
 #[cube(launch)]
@@ -227,7 +289,7 @@ fn extras(client: Client) {
     let cmma_ok = client.features().matmul.cmma.contains(&f16_cfg);
     let plane = client.properties().hardware.plane_size_max;
     println!("cmma f16x16x16->f32 supported: {cmma_ok}; plane size max {plane}; all cmma configs: {}", client.features().matmul.cmma.len());
-    println!("shape | runtime-k ms | comptime-k ms | fresh-alloc ms (runtime k) | cmma ms [GFLOP/s]");
+    println!("shape | runtime-k ms | comptime-k ms | tiled ms [GFLOP/s] | fresh-alloc ms (runtime k) | cmma ms [GFLOP/s]");
     let mut rng = Rng::new(7);
     for &(m, k) in &[(64usize, 64usize), (512, 128), (512, 256), (2048, 128), (2048, 512)] {
         let n = k;
@@ -252,6 +314,19 @@ fn extras(client: Client) {
         let ct = best(&mut || {
             for _ in 0..N {
                 k_matmul_ct::launch(&client, count.clone(), dim, buf(&a_h, m * k), buf(&b_h, k * n), buf(&o_h, m * n), m as u32, n as u32, k as u32);
+            }
+            sync(&client);
+        }) / N as f64;
+        let tcount = CubeCount::Static((n / 64) as u32, (m / 64) as u32, 1);
+        let tdim = CubeDim::new_2d(16, 16);
+        let o_t = client.empty(m * n * 4);
+        k_matmul_tiled::launch(&client, tcount.clone(), tdim, buf(&a_h, m * k), buf(&b_h, k * n), buf(&o_t, m * n), k as u32, n as u32);
+        let got = f32::from_bytes(&client.read_one(o_t.clone()).unwrap())[..m * n].to_vec();
+        let err = got.iter().zip(&want.data).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+        assert!(err < 1e-3, "tiled matmul wrong: {err}");
+        let tiled = best(&mut || {
+            for _ in 0..N {
+                k_matmul_tiled::launch(&client, tcount.clone(), tdim, buf(&a_h, m * k), buf(&b_h, k * n), buf(&o_t, m * n), k as u32, n as u32);
             }
             sync(&client);
         }) / N as f64;
@@ -283,7 +358,7 @@ fn extras(client: Client) {
         } else {
             "n/a".into()
         };
-        println!("({m},{k})@({k},{n}) | {:.4} | {:.4} | {:.4} | {cm}", rt * 1e3, ct * 1e3, fresh * 1e3);
+        println!("({m},{k})@({k},{n}) | {:.4} | {:.4} | {:.4} [{:.0}] | {:.4} | {cm}", rt * 1e3, ct * 1e3, tiled * 1e3, 2.0 * (m * k * n) as f64 / tiled / 1e9, fresh * 1e3);
     }
 }
 
