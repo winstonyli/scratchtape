@@ -29,11 +29,19 @@ fn context() -> &'static GpuContext {
 }
 
 async fn init_context() -> GpuContext {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+    // WGPU_BACKEND=vulkan|dx12|... restricts backends (unset = all).
+    let backends = wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..Default::default() });
+    // HighPerformance, not default(): on a laptop-style iGPU + dGPU machine
+    // default() picked the integrated Radeon 780M over the discrete RX 9060
+    // XT - every GPU benchmark before this fix ran on the iGPU. The adapter
+    // actually chosen is logged below so this can't go unnoticed again.
     let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })
         .await
         .expect("gpu_matmul: no GPU adapter found");
+    let info = adapter.get_info();
+    eprintln!("gpu: using {} ({:?}, {:?})", info.name, info.device_type, info.backend);
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor::default(), None)
         .await

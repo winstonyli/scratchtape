@@ -780,7 +780,18 @@ because raw forgetting deltas hid a floor effect.
 - **A persistent, on-device GPU training backend** — the current GPU
   kernel is correct but pays a full host round-trip per call, which is
   why it doesn't win at this model's scale. Scoped as its own
-  multi-day project, not a small addition.
+  multi-day project, not a small addition. The full-block GPU
+  investigation lives unmerged on `claude/vigilant-shtern-780c88` (every
+  op as a gradient-checked kernel; GPU lost 1.5–4× on the real block,
+  bottlenecked by per-dispatch overhead). `main`'s `gpu.rs` meanwhile kept
+  `RequestAdapterOptions::default()`, which picked the integrated Radeon
+  780M. Fixed 2026-09-23 to `HighPerformance` (RX 9060 XT), and the chosen
+  adapter is now logged. New lead: wgpu on this machine defaults to
+  Vulkan, but DX12 has ~7× lower per-call overhead (128×128 round trip
+  1.1 ms vs 7.8 ms; `WGPU_BACKEND=dx12`). Re-measure the branch's block
+  benchmark on DX12 before trusting "dispatch overhead" as a hard floor.
+  Discrete-GPU matmul now: 128 → 1.1 ms (CPU 0.4 ms); 1024 → ~30 ms
+  (CPU ~125 ms).
 
 ## A note on the name
 
