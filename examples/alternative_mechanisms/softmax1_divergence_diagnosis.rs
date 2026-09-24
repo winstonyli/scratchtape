@@ -1,3 +1,15 @@
+// RETRACTED 2026-09-23: everything below diagnosed a bug, not softmax1.
+// Tape::softmax1 (from 20e5038) subtracted the row max but kept the
+// literal +1, computing exp(x)/(sum exp(x) + exp(max x)); its detached-
+// max gradient didn't match that function, pushing row-shifting
+// parameters with no effect on the loss (see Tape::softmax1's doc
+// comment). The "row-sum -> 0.51" signature below is that bug's phantom
+// key sitting at the row max. Rerun with the fixed op, same seeds and
+// settings: all 2000 steps, no NaN; block0 Q+K norm flat at ~90.24 (was
+// 90.4 -> 124 -> inf by step 775), Q+K grad ~1.5-2.4 (plain softmax's
+// range), scores within ~+/-15, row sums 0.77-0.98. The original text
+// is kept below as the record of what was believed and why.
+//
 // Actually diagnoses the softmax1-in-a-real-transformer divergence
 // ([d54c8f2] "Try softmax1 against the attention-frequency-sink
 // finding: diverges regardless of lr, parked") instead of resting on

@@ -107,6 +107,13 @@ a full 2000-step run with zero divergence, Q/K weight norm and gradient
 both staying flat the whole time, against the same setup's step-775 NaN
 without it.
 
+*(Retracted 2026-09-23: this divergence was a `Tape::softmax1` bug; see
+the correction further down. Rerun with the fixed op, the diagnosis
+completes all 2000 steps with no NaN and no QK-norm. Block0's Q+K
+norm stays flat at ~90.24, its gradient stays in plain softmax's range,
+and scores stay within ~±15. softmax1 itself was never unstable here;
+QK-norm "fixed" a bug.)*
+
 That proof lived entirely in a standalone reimplementation, not the real
 `TransformerBlock` any actual model uses. Closed the loop: QK-norm is
 now a `use_qknorm` flag on `TransformerBlock::forward_full` itself
@@ -332,9 +339,9 @@ That forward pass ignores a uniform shift of the row; the gradient,
 taken with the max detached, doesn't. So any parameter that shifts a
 whole row (a key bias, a K-norm β) received a steady gradient that
 changed nothing in the loss, and drifted without bound: exactly the
-~2e8 K-norm bias and ~1e9 gains above, and very likely the "Q/K-weight-
-norm runaway" behind softmax1's original step-775 NaN
-(`softmax1_divergence_diagnosis.rs`). The paragraph above explains it
+~2e8 K-norm bias and ~1e9 gains above, and the "Q/K-weight-norm runaway" behind softmax1's original step-775 NaN
+(`softmax1_divergence_diagnosis.rs`; confirmed by rerun: the fixed op
+never diverges). The paragraph above explains it
 as softmax1 legitimately rewarding shifts; that's wrong for the code
 that ran. Fixed: shift by max(max x, 0) and use exp(−m) for the phantom
 term — exactly softmax over [x, 0], where detaching the shift is valid.
