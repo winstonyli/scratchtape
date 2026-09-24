@@ -228,6 +228,36 @@ Sources: tracel-ai/cubecl and tracel-ai/burn issues and PRs.
   slower than burn's non-cubecl CPU backend on real models.
 - **Not a CPU lever:** graph capture (#1505) is wgpu-only. See the GPU
   note below.
+- **Branch status, checked again the same day.**
+  - #1658 lives in `tracel-ai/cubecl`: mergeable, CI green, unreviewed.
+    It only touches 5 files, all in `cubecl-cpu`. Its head has diverged
+    from pre.4 (4 commits ahead, 22 behind).
+  - #1661 (the load-width fix for #1635): mergeable and green, but it
+    spans 10 files across 9 crates.
+  - #1566: a draft that conflicts with main.
+  - Nothing on main since pre.4 touches CPU launch cost or #1527. The
+    big changes are an adaptive memory pool (#1685) and turso
+    persistence (#1677).
+  - Windows CI is still off (#104).
+
+**Git dependency or local patch?** The user leans toward a single source
+(2026-09-24), so the question is how to get upstream's CPU fixes before
+they're released.
+- **A git dependency is reasonable for a pre-release**, but not for
+  this:
+  - `cubecl` and `cubecl-runtime` must move to the same `rev` together.
+  - Pinning #1658's head means a tree 22 commits behind pre.4, with API
+    drift in both directions.
+  - Combining #1658 with #1661 needs a merge branch we'd maintain,
+    which is a fork.
+  - PR branches get deleted after merging.
+- **A local patch fits better.** Keep pre.4 from crates.io and apply
+  #1658's 5-file `cubecl-cpu` diff as
+  `[patch.crates-io] cubecl-cpu = { path = ... }`, the same mechanism
+  as the existing bundler patch.
+- **Switch to a git dependency** when a needed fix spans crates (like
+  #1661), or to track main between pre-releases once the single-source
+  path is adopted.
 
 ### Found along the way: graph capture for the GPU step
 
