@@ -402,7 +402,9 @@ nothing once softmax1 is correct. The gates never go sparse (mean
 log's 20-window evals ran optimistic by 0.1+ nats (plain logged 1.738).
 The headline stands: every transformer here trails the count model by
 0.15–0.20 nats, so training (not attention variants) is the bottleneck.
-One seed; seed-to-seed spread on this metric is unmeasured.
+One seed. At batch 8 the seed-to-seed spread is ~0.01 (5 seeds, below);
+if batch 1's is similar, these 0.03–0.05 gaps are 3–5 sd, but batch 1
+itself hasn't been run on several seeds.
 
 **Minibatching doesn't close the gap.** `training_recipe_check.rs` varies
 the recipe one factor at a time at a fixed data budget (64000 windows,
@@ -425,8 +427,7 @@ Batch 8 matches batch 1 in 8× fewer updates (a throughput win once
 matmul is multi-threaded, nothing more). Batch 32 at unscaled lr is
 under-stepped, 0.27 behind at equal data and still falling steeply.
 softmax1's lead over plain shrinks from 0.05 (batch 1) to 0.012–0.013
-under batching, so the attention-variant ranking above is within
-recipe/seed noise until seed spread is measured. The limiting factor is
+under batching, and over 5 seeds it vanishes (below). The limiting factor is
 overfitting: at batch 8 the train/held-out gap is 0.47 and was still
 widening at the end, while held-out gains had slowed to 0.03 per 8000
 windows. Regularization (weight decay, dropout) is the next lever, ahead
@@ -438,8 +439,18 @@ device too (~0.3 s each, checked against the CPU at the end). Batch 8 ends at pl
 1.860 (train-probe / held-out). The GPU and CPU runs are chaotic twins
 (milestone 5 below), so their gap measures seed-level noise: 0.001
 held-out for plain, 0.014 for softmax1, which trails plain on the GPU.
-That noise is as big as softmax1's batch-8 lead, so the lead is unresolved.
-Several seeds per condition now cost minutes, not days.
+That noise is as big as softmax1's batch-8 lead, so 5 seeds each were
+run (`... gpu <seed>`, seeds 1–5, ~20–40 s each). Held-out CE:
+
+| batch 8 | mean ± sd over 5 seeds | per seed (1–5) |
+|---|---|---|
+| plain | 1.8521 ± 0.0108 | 1.8573 1.8448 1.8652 1.8555 1.8379 |
+| softmax1 | 1.8481 ± 0.0091 | 1.8603 1.8553 1.8405 1.8403 1.8443 |
+
+Paired by seed (same init and batches), plain − softmax1 = 0.004, 95% CI
+[−0.015, 0.023]: **at batch 8 softmax1 makes no detectable difference.**
+Train-probe CE is also level (1.372 vs 1.376). The seed spread, ~0.01, is
+the yardstick for any recipe change here.
 
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention

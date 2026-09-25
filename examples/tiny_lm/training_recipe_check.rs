@@ -8,7 +8,7 @@
 //
 // One condition per process (crash-isolated, launchable at low priority,
 // per LONG_RUNS.md):
-//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu]
+//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed]
 // `windows` is the total training budget in 64-byte windows (default
 // 64000, tiny_lm_corpus.rs's), so batch size changes steps, not data:
 // steps = windows / batch. Progress streams to stdout as it happens; the
@@ -27,6 +27,8 @@
 // and pauses at evaluations while another job holds an exclusive one. WGPU_BACKEND=dx12 as gpu_step::client. The GPU run is not the CPU
 // run bit for bit: about once a step a ReLU input lands within rounding
 // of 0 and the two disagree (docs/gpu_step_design.md, milestone 5).
+//
+// `seed` (default 1) drives both the init and the batch order.
 //
 // Same architecture and init stream as tiny_lm_corpus.rs (seed 1), so
 // batch=1 lr=0.3 reproduces attention_uniformity_check.rs's plain (1.852)
@@ -57,7 +59,11 @@
 // above), and their gap is itself a measure of seed-level noise: 0.001
 // held-out for plain but 0.014 for softmax1, with softmax1 behind plain
 // on the GPU. So round 1's ~0.012 softmax1 edge at batch 8 is within
-// that noise; resolving it needs several runs per condition.
+// that noise. Seeds 1-5 (2026-09-25), held-out mean +- sd:
+//   plain     1.8521 +- 0.0108   (1.8573 1.8448 1.8652 1.8555 1.8379)
+//   softmax1  1.8481 +- 0.0091   (1.8603 1.8553 1.8405 1.8403 1.8443)
+// Paired by seed, plain - softmax1 = 0.004, 95% CI [-0.015, 0.023]: no
+// detectable difference at batch 8.
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, pack, read_f32};
@@ -139,7 +145,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> f32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu]");
+    assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed]");
     let name = &args[1];
     let softmax1 = args[2] == "1";
     let batch: usize = args[3].parse().unwrap();
@@ -151,6 +157,8 @@ fn main() {
         Some("gpu") => true,
         Some(other) => panic!("device must be cpu or gpu, not {other}"),
     };
+    let seed: u64 = args.get(8).map(|s| s.parse().unwrap()).unwrap_or(1);
+    assert!(seed != 0, "seed 0 is xorshift's fixed point");
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
 
@@ -160,7 +168,7 @@ fn main() {
     // A fixed 371-window slice of train, for a like-for-like overfitting gap.
     let train_probe = &train[..held_out.len()];
 
-    let mut rng = Rng::new(1);
+    let mut rng = Rng::new(seed);
     let mut m = Model {
         token_emb: Embedding::new(&mut rng, VOCAB, D_MODEL),
         pos_emb: Embedding::new(&mut rng, SEQ_LEN, D_MODEL),
@@ -171,7 +179,7 @@ fn main() {
     let opt = Sgd { lr };
 
     // Resume: header "<config> | <step> <rng state>", then the parameters.
-    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows}");
+    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed}");
     let resume_path = format!("runs/{name}.resume");
     let mut first = 0;
     if let Ok(text) = std::fs::read_to_string(&resume_path) {
