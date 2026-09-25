@@ -102,6 +102,10 @@
 //   batch 32, lr 0.48  1.8175 +- 0.0155   (paired 0.007, CI [-0.016, 0.030])
 // No divergence up to lr 0.96 (worse CE). softmax1 at batch 8, SGD lr 1.2
 // + warmup: 1.8263 vs plain 1.8187 (its batch-1 lead doesn't survive).
+// Long runs, batch 32 + momentum, seeds 1-3, held-out final (best):
+// none 256k windows 2.163 (1.809 at ~64-88k, then memorizes); dropout 0.1
+// + wd 2e-4 256k 1.743 (1.711); dropout 0.3 + wd 2e-4 1M 1.686 (1.663);
+// dropout 0.4 + wd 2e-4 1M 1.677 (1.670). The 7-gram is 1.655.
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, pack, read_f32, upload_f32};

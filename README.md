@@ -493,7 +493,8 @@ attention output and FFN hidden layer) is worse at every rate, and worse
 the higher the rate. It does narrow the train/held-out gap (0.49 → 0.40
 at 0.05), but by slowing the fit to the training set more than it helps
 held-out: in 8000 steps the model hasn't fit enough for dropout's noise to
-pay. A longer run is where it could; untested.
+pay. In longer runs it does, and is the biggest gain found (below,
+"Long runs").
 
 **At batch 1, softmax1 does beat plain** (`... <softmax1> 1 0.3 64000
 600 gpu <seed>`, seeds 1–5, 64000 steps, ~2 min each uncontended,
@@ -579,6 +580,38 @@ softmax1 under the tuned batch-8 SGD recipe (lr 1.2 + warmup, seeds
 1–5): 1.8263 ± 0.0115 vs plain's 1.8187, paired plain − softmax1 =
 −0.008, 95% CI [−0.020, 0.004]. Its batch-1 lead (0.021 at lr 0.3)
 doesn't survive tuning the lr (tuned on plain).
+
+**Long runs: dropout closes most of the gap to the 7-gram**
+(`... 32 0.48 <windows> 600 gpu <seed> <wd> all <dropout> 6400 0.9`,
+2026-09-25). With batch 32 + momentum a run costs ~5.6 ms per 32
+windows, so a million windows (~150 passes over the ~214 KB of training
+text) takes ~3 minutes. More steps alone don't help: without dropout,
+held-out bottoms out at 64–88k windows (1.809, ~20 passes) and climbs to
+2.16 by 256k while train-probe falls to 0.82, pure memorization. Weight
+decay only delays it. Dropout (on each block's attention output and FFN
+hidden layer) does what it didn't at 64k windows. Held-out CE, mean of
+seeds 1–3 (best = the lowest of the run's evaluations, chosen on
+held-out, so slightly optimistic; final is honest):
+
+| regularization | windows | best | final | final train-probe |
+|---|---|---|---|---|
+| none | 256k | 1.8088 | 2.1628 | 0.82 |
+| wd 2e-4 | 256k | 1.8082 | 2.0827 | 0.86 |
+| wd 1e-3 | 256k | 1.7864 | 1.8561 | 1.05 |
+| dropout 0.1 | 256k | 1.7156 | 1.7530 | 0.99 |
+| dropout 0.1 + wd 2e-4 | 256k | 1.7112 | 1.7430 | 1.02 |
+| dropout 0.2 + wd 2e-4 | 512k | 1.6851 | 1.7052 | 1.02 |
+| dropout 0.3 + wd 2e-4 | 512k | 1.6803 | 1.6918 | 1.11 |
+| dropout 0.3 + wd 2e-4 | 1M | 1.6633 | 1.6864 | 1.04 |
+| dropout 0.4 + wd 2e-4 | 1M | 1.6702 | 1.6769 | 1.12 |
+| Kneser-Ney 7-gram | — | 1.655 | | |
+
+Dropout 0.1's best beats no regularization by 0.093 on every seed (95%
+CI [0.049, 0.137]). The gap to the 7-gram falls from 0.15 to 0.02
+(final) or 0.008 (best), but it isn't crossed: 512k → 1M windows gains
+only ~0.005–0.02, a plateau. The final value sits 0.01–0.02 above the
+run's best, the noise of a constant lr, so an lr decay at the end is the
+next lever.
 
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
