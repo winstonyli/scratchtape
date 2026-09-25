@@ -402,9 +402,8 @@ nothing once softmax1 is correct. The gates never go sparse (mean
 log's 20-window evals ran optimistic by 0.1+ nats (plain logged 1.738).
 The headline stands: every transformer here trails the count model by
 0.15–0.20 nats, so training (not attention variants) is the bottleneck.
-One seed. At batch 8 the seed-to-seed spread is ~0.01 (5 seeds, below);
-if batch 1's is similar, these 0.03–0.05 gaps are 3–5 sd, but batch 1
-itself hasn't been run on several seeds.
+One seed. Over 5 seeds at batch 1 (below), softmax1's lead over plain
+holds but is 0.021, not 0.049: this plain run was an unlucky draw.
 
 **Minibatching doesn't close the gap.** `training_recipe_check.rs` varies
 the recipe one factor at a time at a fixed data budget (64000 windows,
@@ -423,11 +422,11 @@ bit-identically (checked by killing and resuming a short run).
 | softmax1, batch 8 | 8000 | 1.375 | 1.846 |
 | softmax1, batch 32 | 2000 | 1.813 | 2.115 |
 
-Batch 8 matches batch 1 in 8× fewer updates (a throughput win once
-matmul is multi-threaded, nothing more). Batch 32 at unscaled lr is
+On seed 1, batch 8 matched batch 1 in 8× fewer updates; over 5 seeds it
+doesn't (below: batch 1 is 0.03–0.04 better). Batch 32 at unscaled lr is
 under-stepped, 0.27 behind at equal data and still falling steeply.
-softmax1's lead over plain shrinks from 0.05 (batch 1) to 0.012–0.013
-under batching, and over 5 seeds it vanishes (below). The limiting factor is
+softmax1's lead over plain shrinks from 0.021 (batch 1, 5 seeds) to
+nothing detectable at batch 8 (5 seeds, below). The limiting factor is
 overfitting: at batch 8 the train/held-out gap is 0.47 and was still
 widening at the end, while held-out gains had slowed to 0.03 per 8000
 windows. Regularization (weight decay, dropout) is the next lever, ahead
@@ -495,6 +494,32 @@ the higher the rate. It does narrow the train/held-out gap (0.49 → 0.40
 at 0.05), but by slowing the fit to the training set more than it helps
 held-out: in 8000 steps the model hasn't fit enough for dropout's noise to
 pay. A longer run is where it could; untested.
+
+**At batch 1, softmax1 does beat plain** (`... <softmax1> 1 0.3 64000
+600 gpu <seed>`, seeds 1–5, 64000 steps, ~2 min each uncontended,
+2026-09-25). Held-out CE:
+
+| batch 1 | mean ± sd over 5 seeds | per seed (1–5) | train-probe |
+|---|---|---|---|
+| plain | 1.8247 ± 0.0138 | 1.8072 1.8227 1.8174 1.8332 1.8429 | 1.333 |
+| softmax1 | 1.8037 ± 0.0089 | 1.7989 1.8050 1.7923 1.8062 1.8162 | 1.271 |
+
+Paired by seed, plain − softmax1 = **0.021**, 95% CI [0.011, 0.031],
+positive on all 5 seeds. That's under half the single-seed 0.049 above:
+the CPU references came from `attention_uniformity_check.rs`, which also
+draws its eval windows from the training RNG, so its batch order differs
+from this example's after step 1600, and its seed-1 plain (1.852) sits
+~2 sd above this plain mean while its softmax1 (1.803) is typical. softmax1
+also fits the training set better (0.06 lower train-probe), so at batch 1
+it's an optimization gain, not a regularizer.
+
+Batch 1 beats batch 8 at equal data, paired by seed: plain by 0.027 (95%
+CI [−0.001, 0.055], 4 of 5 seeds) and softmax1 by 0.044 ([0.028, 0.061],
+5 of 5). The 8× more updates are worth more to softmax1, which is why its
+lead vanishes at batch 8. Batch-1 softmax1 (1.804) also beats batch 8 with
+the best weight decay (1.833). So the cheapest known improvement here is
+more steps, not regularization, and the gap to the 7-gram (1.655) is
+still 0.15.
 
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention

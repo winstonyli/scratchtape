@@ -38,7 +38,8 @@
 //
 // Same architecture and init stream as tiny_lm_corpus.rs (seed 1), so
 // batch=1 lr=0.3 reproduces attention_uniformity_check.rs's plain (1.852)
-// and softmax1 (1.803) checkpoints' recipe.
+// and softmax1 (1.803) checkpoints' recipe, though not their batch order
+// (that example also draws eval windows from the training rng).
 //
 // Results, round 1: batch size at lr 0.3, 64000 windows (2026-09-24;
 // 4 concurrent runs at BelowNormal on a CPU shared with other jobs,
@@ -78,6 +79,12 @@
 // all 2e-4: 1.8381): weights-only 2e-4 1.8412, 5e-4 1.8508, 1e-3 1.8766,
 // 2e-3 1.9567, so exempting LayerNorm and biases allows no larger rate;
 // dropout 0.05 1.8683, 0.1 1.9034, 0.2 1.9817, worse at every rate.
+//
+// Batch 1, 64000 steps, held-out over seeds 1-5 (GPU):
+//   plain     1.8247 +- 0.0138   (1.8072 1.8227 1.8174 1.8332 1.8429)
+//   softmax1  1.8037 +- 0.0089   (1.7989 1.8050 1.7923 1.8062 1.8162)
+// Paired, plain - softmax1 = 0.021, 95% CI [0.011, 0.031], 5 of 5 seeds.
+// Batch 1 beats batch 8 by 0.027 (plain) and 0.044 (softmax1).
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, pack, read_f32, upload_f32};
