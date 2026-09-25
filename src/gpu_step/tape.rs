@@ -10,6 +10,9 @@
 //!   passes its gradient through by aliasing the buffer: in reverse order
 //!   every consumer of that buffer has already run, so later accumulation
 //!   into it can't corrupt anything still needed.
+//! - Fused models (`DeviceParams::upload_models`): every node holds K
+//!   models' rows, model m's the m-th slice. Linear runs as a K-batch
+//!   matmul over the models' weights; ops without parameters don't care.
 use super::matmul::{Epilogue, MatRef, matmul};
 use super::rows::{LnOut, col_sum, layer_norm, layer_norm_backward, softmax, softmax_backward};
 use super::tokens::{CeOut, cross_entropy, cross_entropy_backward, embed, embed_backward, upload_ids};
@@ -80,6 +83,14 @@ impl<'p> DeviceTape<'p> {
         &self.nodes[v.0].value
     }
 
+    /// A cross_entropy node's per-row losses ([rows], every model's).
+    pub fn row_losses(&self, loss: DVar) -> &Handle {
+        match &self.nodes[loss.0].op {
+            Op::CrossEntropy { fwd, .. } => &fwd.row_loss,
+            _ => panic!("row_losses of a non-cross_entropy node"),
+        }
+    }
+
     /// Number of recorded ops.
     pub fn len(&self) -> usize {
         self.nodes.len()
@@ -103,27 +114,28 @@ impl<'p> DeviceTape<'p> {
     pub fn embed(&mut self, ids: &[usize], d: usize, t: usize, vocab: usize, tok_off: usize, pos_off: usize) -> DVar {
         let rows = ids.len();
         let ids = upload_ids(ids);
-        let y = embed(&ids, rows, d, t, &self.params.params, tok_off, pos_off);
+        let y = embed(&ids, rows, d, t, &self.params.params, tok_off, pos_off, self.params.models);
         self.push(y, rows, d, Op::Embed { ids, t, vocab, tok_off, pos_off })
     }
 
     /// LayerNorm with gamma/beta at `off` (`LayerNorm::to_flat` order).
     pub fn layer_norm(&mut self, x: DVar, off: usize) -> DVar {
         let (rows, d) = self.shape(x);
-        let fwd = layer_norm(self.value(x), rows, d, &self.params.params, off, LN_EPS);
+        let fwd = layer_norm(self.value(x), rows, d, &self.params.params, off, LN_EPS, self.params.models);
         let y = fwd.y.clone();
         self.push(y, rows, d, Op::LayerNorm { x: x.0, fwd, off })
     }
 
     /// act(x @ W + b) (+ residual), W [inp, out] at `w_off` and b after it
-    /// (`Linear::to_flat` order). One launch.
+    /// (`Linear::to_flat` order). One launch; fused models are its batch.
     pub fn linear(&mut self, x: DVar, w_off: usize, out: usize, relu: bool, residual: Option<DVar>) -> DVar {
         let (rows, inp) = self.shape(x);
         let y = client().empty(rows * out * 4);
-        let p = &self.params.params;
-        let epi = Epilogue { bias: Some((p, w_off + inp * out)), relu, residual: residual.map(|r| (self.value(r), 0)), ..Default::default() };
-        let w = MatRef { off: w_off, stride: 0, trans: false, ..MatRef::new(p) };
-        matmul(MatRef::new(self.value(x)), w, MatRef::new(&y), 1, rows, inp, out, epi);
+        let (p, m) = (&self.params.params, self.params.models);
+        let rpm = rows / m.k;
+        let epi = Epilogue { bias: Some((p, w_off + inp * out)), bias_stride: m.stride, relu, residual: residual.map(|r| (self.value(r), 0)), ..Default::default() };
+        let w = MatRef { off: w_off, stride: m.stride, trans: false, ..MatRef::new(p) };
+        matmul(MatRef { stride: rpm * inp, ..MatRef::new(self.value(x)) }, w, MatRef { stride: rpm * out, ..MatRef::new(&y) }, m.k, rpm, inp, out, epi);
         self.push(y, rows, out, Op::Linear { x: x.0, inp, w_off, relu, residual: residual.map(|r| r.0) })
     }
 
@@ -167,13 +179,14 @@ impl<'p> DeviceTape<'p> {
         self.push(y, rows, n, Op::Softmax { x: x.0, scale })
     }
 
-    /// Mean cross-entropy; the value is one f32.
+    /// Mean cross-entropy; the value is one f32 per model.
     pub fn cross_entropy(&mut self, logits: DVar, targets: &[usize]) -> DVar {
         let (rows, vocab) = self.shape(logits);
         let targets = upload_ids(targets);
-        let fwd = cross_entropy(self.value(logits), &targets, rows, vocab);
+        let k = self.params.models.k;
+        let fwd = cross_entropy(self.value(logits), &targets, rows, vocab, k);
         let loss = fwd.loss.clone();
-        self.push(loss, 1, 1, Op::CrossEntropy { logits: logits.0, targets, fwd, vocab })
+        self.push(loss, 1, k, Op::CrossEntropy { logits: logits.0, targets, fwd, vocab })
     }
 
     /// Where a gradient for node v goes: its existing buffer (accumulate),
@@ -222,6 +235,7 @@ impl<'p> DeviceTape<'p> {
         assert!(matches!(self.nodes[loss.0].op, Op::CrossEntropy { .. }), "backward starts at a cross_entropy node");
         let grads = self.params.grads.clone();
         let p = self.params.params.clone();
+        let m = self.params.models;
         for i in (0..=loss.0).rev() {
             let (op, rows, cols) = (self.nodes[i].op.clone(), self.nodes[i].rows, self.nodes[i].cols);
             let dy = match (&op, &self.nodes[i].grad) {
@@ -232,15 +246,15 @@ impl<'p> DeviceTape<'p> {
             match op {
                 Op::CrossEntropy { logits, targets, fwd, vocab } => {
                     let r = self.nodes[logits].rows;
-                    let dl = cross_entropy_backward(&self.nodes[logits].value, &targets, &fwd, r, vocab);
+                    let dl = cross_entropy_backward(&self.nodes[logits].value, &targets, &fwd, r, vocab, m.k);
                     self.add_grad(logits, dl);
                 }
                 Op::Embed { ids, t, vocab, tok_off, pos_off } => {
-                    embed_backward(&dy.unwrap(), &ids, rows, cols, t, vocab, &grads, tok_off, pos_off);
+                    embed_backward(&dy.unwrap(), &ids, rows, cols, t, vocab, &grads, tok_off, pos_off, m);
                 }
                 Op::LayerNorm { x, fwd, off } => {
                     let (dx, acc) = self.grad_slot(x, true);
-                    layer_norm_backward(&dy.unwrap(), &self.nodes[x].value, &fwd, rows, cols, &p, &grads, off, &dx, acc);
+                    layer_norm_backward(&dy.unwrap(), &self.nodes[x].value, &fwd, rows, cols, &p, &grads, off, &dx, acc, m);
                 }
                 Op::Linear { x, inp, w_off, relu, residual } => {
                     let mut dz = dy.unwrap();
@@ -253,12 +267,14 @@ impl<'p> DeviceTape<'p> {
                     }
                     let out = cols;
                     let xv = self.nodes[x].value.clone();
-                    // dW += xᵀ dz, db += colsum(dz)
-                    matmul(MatRef { off: 0, stride: 0, trans: true, ..MatRef::new(&xv) }, MatRef::new(&dz), MatRef { off: w_off, stride: 0, trans: false, ..MatRef::new(&grads) }, 1, inp, rows, out, Epilogue { accumulate: true, ..Default::default() });
-                    col_sum(&dz, rows, out, &grads, w_off + inp * out);
-                    // dx (+)= dz Wᵀ
+                    // Per model (the matmuls' batch): dW += xᵀ dz, db +=
+                    // colsum(dz), dx (+)= dz Wᵀ
+                    let rpm = rows / m.k;
+                    let (xs, dzs) = (MatRef { stride: rpm * inp, ..MatRef::new(&xv) }, MatRef { stride: rpm * out, ..MatRef::new(&dz) });
+                    matmul(MatRef { trans: true, ..xs }, dzs, MatRef { off: w_off, stride: m.stride, ..MatRef::new(&grads) }, m.k, inp, rpm, out, Epilogue { accumulate: true, ..Default::default() });
+                    col_sum(&dz, rows, out, &grads, w_off + inp * out, m);
                     let (dx, acc) = self.grad_slot(x, true);
-                    matmul(MatRef::new(&dz), MatRef { off: w_off, stride: 0, trans: true, ..MatRef::new(&p) }, MatRef::new(&dx), 1, rows, out, inp, Epilogue { accumulate: acc, ..Default::default() });
+                    matmul(dzs, MatRef { off: w_off, stride: m.stride, trans: true, ..MatRef::new(&p) }, MatRef { stride: rpm * inp, ..MatRef::new(&dx) }, m.k, rpm, out, inp, Epilogue { accumulate: acc, ..Default::default() });
                     if let Some(r) = residual {
                         self.add_grad(r, dz);
                     }
@@ -672,6 +688,67 @@ mod tests {
             eprintln!("{what}: {} device ops; worst gradient {:.1e} ({})", dt.len(), worst.0, worst.1);
         }
         true
+    }
+
+    /// Needs the discrete GPU. Horizontal fusion: K models, each its own
+    /// init and batch, trained in the same launches, against each trained
+    /// alone. The forward uses the same tiles per model, so step 0's
+    /// losses must match exactly; gradients may differ by the order
+    /// split-k sums in (single models only), so parameters get 1e-5. The
+    /// small ragged config runs three SGD steps. The real one runs the
+    /// training shape, K 4 × batch 32, whose 65536 attention rows fold the
+    /// row kernels' grid into y, for one step only: its step 1 hit a ReLU
+    /// tie (model 3: 12499 parameters off by up to 1.2e-4, all at or
+    /// upstream of block 1's FFN1 unit 130), as device_training_tracks_cpu_over_steps
+    /// describes.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn fused_models_match_separate() {
+        let small = Config { vocab: 21, d: 16, heads: 4, d_ff: 24, t: 6, n_blocks: 2, softmax1: false };
+        let real = Config { vocab: 256, d: 128, heads: 8, d_ff: 256, t: 64, n_blocks: 4, softmax1: false };
+        for (cfg, k, batch, steps) in [(small, 3, 3, 3), (real, 4, 32, 1)] {
+            let flats: Vec<Vec<f32>> = (0..k as u64)
+                .map(|s| {
+                    let mut rng = Rng::new(40 + s);
+                    let tok = Embedding::new(&mut rng, cfg.vocab, cfg.d);
+                    let pos = Embedding::new(&mut rng, cfg.t, cfg.d);
+                    let blocks: Vec<_> = (0..cfg.n_blocks).map(|_| TransformerBlock::new(&mut rng, cfg.d, cfg.heads, cfg.d_ff)).collect();
+                    pack(&tok, &pos, &blocks, &LayerNorm::new(cfg.d), &Linear::new(&mut rng, cfg.d, cfg.vocab))
+                })
+                .collect();
+            let alone: Vec<DeviceParams> = flats.iter().map(|f| DeviceParams::upload(f)).collect();
+            let fused = DeviceParams::upload_models(&flats.concat(), k);
+            let mut rng = Rng::new(7);
+            let rows = batch * cfg.t;
+            for step in 0..steps {
+                let mut ids = || (0..k * rows).map(|_| (rng.next_gaussian().abs() * 1e4) as usize % cfg.vocab).collect::<Vec<_>>();
+                let (ids, targets) = (ids(), ids());
+                fused.zero_grads();
+                let mut dt = DeviceTape::new(&fused);
+                let (_, _, l) = model_forward(&mut dt, &cfg, &ids, &targets, k * batch);
+                dt.backward(l);
+                fused.sgd(0.3);
+                let fused_loss = read(dt.value(l));
+                let fused_params = fused.read(&fused.params);
+                for (m, dev) in alone.iter().enumerate() {
+                    let slice = |v: &[usize]| v[m * rows..(m + 1) * rows].to_vec();
+                    dev.zero_grads();
+                    let mut dt = DeviceTape::new(dev);
+                    let (_, _, l) = model_forward(&mut dt, &cfg, &slice(&ids), &slice(&targets), batch);
+                    dt.backward(l);
+                    dev.sgd(0.3);
+                    let what = format!("{cfg:?} step {step} model {m}");
+                    let loss = read(dt.value(l))[0];
+                    // Step 0's forward shares every input bit for bit.
+                    if step == 0 {
+                        assert_eq!(fused_loss[m], loss, "{what}: loss");
+                    }
+                    assert!((fused_loss[m] - loss).abs() <= 1e-5 * loss, "{what}: loss {} vs {loss}", fused_loss[m]);
+                    let e = rel_err(&fused_params[m * cfg.len()..(m + 1) * cfg.len()], &dev.read(&dev.params));
+                    assert!(e < 1e-5, "{what}: parameters off by {e}");
+                }
+            }
+        }
     }
 
     /// Needs the discrete GPU. Milestone 5 at unit scale: several SGD

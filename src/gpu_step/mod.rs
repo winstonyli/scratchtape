@@ -196,21 +196,44 @@ pub fn pack(token_emb: &Embedding, pos_emb: &Embedding, blocks: &[TransformerBlo
     out
 }
 
+/// K same-shape models trained in the same launches (horizontal fusion,
+/// HFTA): model m's parameters and gradients sit at m·stride in the flat
+/// buffers, and its rows are the m-th of K equal slices of every
+/// activation. Kernels that read parameters by row, or reduce rows into a
+/// parameter gradient, take one; the rest see K models' rows as one batch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Models {
+    pub k: usize,
+    pub stride: usize,
+}
+
+impl Models {
+    pub const ONE: Self = Self { k: 1, stride: 0 };
+}
+
 /// Parameters and their gradients, resident on the device as two flat
 /// buffers with matching offsets.
 pub struct DeviceParams {
     pub params: Handle,
     pub grads: Handle,
     pub len: usize,
+    pub models: Models,
 }
 
 impl DeviceParams {
     /// Uploads `flat` (from `pack`); gradients start at zero.
     pub fn upload(flat: &[f32]) -> Self {
+        Self::upload_models(flat, 1)
+    }
+
+    /// Uploads K models' `pack`s, concatenated, for fused training (see
+    /// `Models`); gradients start at zero.
+    pub fn upload_models(flat: &[f32], k: usize) -> Self {
+        assert!(k >= 1 && flat.len().is_multiple_of(k), "{} parameters don't split into {k} models", flat.len());
         let c = client();
         let params = c.create_from_slice(f32::as_bytes(flat));
         let grads = c.create_from_slice(f32::as_bytes(&vec![0.0f32; flat.len()]));
-        Self { params, grads, len: flat.len() }
+        Self { params, grads, len: flat.len(), models: Models { k, stride: flat.len() / k } }
     }
 
     /// One launch: p -= lr * g over every parameter.
@@ -304,8 +327,8 @@ fn upload(v: &[f32]) -> Handle {
     client().create_from_slice(f32::as_bytes(v))
 }
 
-#[cfg(test)]
-fn read(h: &Handle) -> Vec<f32> {
+/// A whole buffer, blocking (crosses USB4; not per step).
+pub fn read(h: &Handle) -> Vec<f32> {
     f32::from_bytes(&client().read_one(h.clone()).unwrap()).to_vec()
 }
 

@@ -59,12 +59,13 @@ impl<'a> MatRef<'a> {
 }
 
 /// What to do with each output element after the dot product, in this
-/// order: + bias[col], ReLU, zero it where `mask` (same layout as out) is
+/// order: + bias[col] (matrix z's bias `bias_stride`·z further on), ReLU, zero it where `mask` (same layout as out) is
 /// not positive (ReLU's backward, given ReLU's output), + residual (same
 /// layout as out), + the value already in out.
 #[derive(Clone, Copy, Default)]
 pub struct Epilogue<'a> {
     pub bias: Option<(&'a Handle, usize)>,
+    pub bias_stride: usize,
     pub relu: bool,
     pub mask: Option<(&'a Handle, usize)>,
     pub residual: Option<(&'a Handle, usize)>,
@@ -137,6 +138,7 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
         oi,
         ldo,
         u(bias_off),
+        u(epi.bias_stride),
         u(mask_off),
         u(res_off),
         a.trans,
@@ -228,6 +230,7 @@ fn k_matmul(
     o_inner: u32,
     ldo: u32,
     bias_off: u32,
+    bias_stride: u32,
     mask_off: u32,
     res_off: u32,
     #[comptime] trans_a: bool,
@@ -328,7 +331,7 @@ fn k_matmul(
             if gm < m && gn < n {
                 let mut v = acc[(i * 4 + j) as usize];
                 if has_bias {
-                    v += bias[(bias_off + gn) as usize];
+                    v += bias[(bias_off + zb * bias_stride + gn) as usize];
                 }
                 if relu {
                     if v < 0.0 {
@@ -362,7 +365,7 @@ mod tests {
 
     /// Plain-loop reference for one case, same argument meaning as `matmul`.
     #[allow(clippy::too_many_arguments)]
-    fn reference(a: &[f32], ar: (usize, usize, bool), b: &[f32], br: (usize, usize, bool), out: &mut [f32], or: (usize, usize), batch: usize, m: usize, k: usize, n: usize, bias: Option<&[f32]>, relu: bool, mask: Option<&[f32]>, res: Option<&[f32]>, accumulate: bool) {
+    fn reference(a: &[f32], ar: (usize, usize, bool), b: &[f32], br: (usize, usize, bool), out: &mut [f32], or: (usize, usize), batch: usize, m: usize, k: usize, n: usize, bias: Option<(&[f32], usize)>, relu: bool, mask: Option<&[f32]>, res: Option<&[f32]>, accumulate: bool) {
         for z in 0..batch {
             for i in 0..m {
                 for j in 0..n {
@@ -372,8 +375,8 @@ mod tests {
                         let y = b[br.0 + z * br.1 + if br.2 { j * k + p } else { p * n + j }];
                         s += x * y;
                     }
-                    if let Some(bias) = bias {
-                        s += bias[j];
+                    if let Some((bias, stride)) = bias {
+                        s += bias[z * stride + j];
                     }
                     if relu {
                         s = s.max(0.0);
@@ -431,15 +434,17 @@ mod tests {
             let (sa, sb, so) = (m * k + 1, if batch > 1 { k * n + 2 } else { 0 }, m * n + 3);
             let a = gauss(a_off + batch * sa);
             let b = gauss(b_off + batch.max(1) * sb.max(k * n));
-            let bias = gauss(bias_off + n);
+            // A bias per batch matrix (fused models' Linear) when batched.
+            let bias_stride = if batch > 1 { n + 1 } else { 0 };
+            let bias = gauss(bias_off + batch * (n + 1));
             let res = gauss(r_off + batch * so);
             let mask = gauss(m_off + batch * so); // about half positive
             let out0 = gauss(o_off + batch * so);
             let mut want = out0.clone();
-            reference(&a, (a_off, sa, ta), &b, (b_off, sb, tb), &mut want, (o_off, so), batch, m, k, n, has_bias.then_some(&bias[bias_off..]), relu, has_mask.then_some(&mask[m_off..]), has_res.then_some(&res[r_off..]), acc);
+            reference(&a, (a_off, sa, ta), &b, (b_off, sb, tb), &mut want, (o_off, so), batch, m, k, n, has_bias.then_some((&bias[bias_off..], bias_stride)), relu, has_mask.then_some(&mask[m_off..]), has_res.then_some(&res[r_off..]), acc);
 
             let (ah, bh, bias_h, mask_h, res_h, oh) = (upload(&a), upload(&b), upload(&bias), upload(&mask), upload(&res), upload(&out0));
-            let epi = Epilogue { bias: has_bias.then_some((&bias_h, bias_off)), relu, mask: has_mask.then_some((&mask_h, m_off)), residual: has_res.then_some((&res_h, r_off)), accumulate: acc };
+            let epi = Epilogue { bias: has_bias.then_some((&bias_h, bias_off)), bias_stride, relu, mask: has_mask.then_some((&mask_h, m_off)), residual: has_res.then_some((&res_h, r_off)), accumulate: acc };
             matmul(MatRef { off: a_off, stride: sa, trans: ta, ..MatRef::new(&ah) }, MatRef { off: b_off, stride: sb, trans: tb, ..MatRef::new(&bh) }, MatRef { off: o_off, stride: so, trans: false, ..MatRef::new(&oh) }, batch, m, k, n, epi);
             let got = read(&oh);
             let scale = want.iter().fold(0.0f32, |s, v| s.max(v.abs()));
