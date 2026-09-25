@@ -39,8 +39,8 @@
 // the first k = warmup_windows / batch steps, so warmup covers the same
 // data at any batch size (Goyal et al. 2017, for large-batch lr scaling).
 // `momentum` (default 0, GPU only) is heavy-ball momentum mu: v = mu*v + g,
-// p -= lr*v, so the effective lr is lr / (1 - mu). The velocity isn't
-// checkpointed, so a momentum run refuses to resume.
+// p -= lr*v, so the effective lr is lr / (1 - mu). Its velocity is
+// checkpointed too (a third line, in gpu_step's pack order).
 //
 // Same architecture and init stream as tiny_lm_corpus.rs (seed 1), so
 // batch=1 lr=0.3 reproduces attention_uniformity_check.rs's plain (1.852)
@@ -228,15 +228,19 @@ fn main() {
         output_proj: Linear::new(&mut rng, D_MODEL, VOCAB),
     };
 
-    // Resume: header "<config> | <step> <rng state>", then the parameters.
+    // Resume: header "<config> | <step> <rng state>", then the parameters,
+    // then (momentum runs) the velocity.
     let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed} wd={weight_decay} decay_all={decay_all} dropout={dropout} warmup={warmup_windows} momentum={momentum}");
     let resume_path = format!("runs/{name}.resume");
     let mut first = 0;
+    let mut resumed_velocity = None;
     if let Ok(text) = std::fs::read_to_string(&resume_path) {
-        let (header, params) = text.split_once('\n').unwrap();
+        let mut lines = text.split('\n');
+        let (header, params) = (lines.next().unwrap(), lines.next().unwrap());
         let (saved, at) = header.split_once(" | ").unwrap();
         assert_eq!(saved, config, "{resume_path} is from a different config");
-        assert!(momentum == 0.0, "{resume_path}: momentum runs can't resume (the velocity isn't saved)");
+        resumed_velocity = lines.next().map(|v| v.split_whitespace().map(|x| x.parse::<f32>().unwrap()).collect::<Vec<_>>());
+        assert_eq!(resumed_velocity.is_some(), momentum > 0.0, "{resume_path}: velocity line must match momentum");
         let (step, state) = at.split_once(' ').unwrap();
         first = step.parse().unwrap();
         rng = Rng::new(state.parse().unwrap());
@@ -255,7 +259,7 @@ fn main() {
         let mask = if decay_all { vec![1.0; cfg.len()] } else { cfg.decay_mask() };
         upload_f32(&mask)
     });
-    let velocity = (momentum > 0.0).then(|| upload_f32(&vec![0.0; cfg.len()]));
+    let velocity = (momentum > 0.0).then(|| upload_f32(&resumed_velocity.unwrap_or_else(|| vec![0.0; cfg.len()])));
     let sync = |m: &mut Model| {
         if let Some(dev) = &dev {
             let (token_emb, pos_emb, blocks, final_ln, output_proj) = reconstruct(&dev.read(&dev.params), VOCAB, D_MODEL, SEQ_LEN, N_BLOCKS, N_HEADS, D_FF);
@@ -287,7 +291,12 @@ fn main() {
             let flat = flatten_all(&m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj);
             let params = flat.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
             let tmp = format!("{resume_path}.tmp");
-            std::fs::write(&tmp, format!("{config} | {step} {}\n{params}", rng.state())).unwrap();
+            let mut text = format!("{config} | {step} {}\n{params}", rng.state());
+            if let (Some(dev), Some(v)) = (&dev, &velocity) {
+                text += "\n";
+                text += &dev.read(v).iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+            }
+            std::fs::write(&tmp, text).unwrap();
             std::fs::rename(&tmp, &resume_path).unwrap();
             last_save = Instant::now();
         }
