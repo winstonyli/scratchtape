@@ -1043,8 +1043,14 @@ because raw forgetting deltas hid a floor effect.
     not launch overhead. Matmul takes 3.0 ms. The row-wise kernels
     (LayerNorm, the bias column sums, softmax) take 5.7 ms: they run one
     serial unit per row, so 512 rows fill 2 cubes and every load is
-    uncoalesced. Parallelizing those reductions is the next speedup,
-    worth ~2×.
+    uncoalesced.
+  - **Row reductions parallelized (2026-09-24).** One cube per row (or
+    per 16 columns) with a fixed-order shared-memory tree: the step went
+    from 9.4 to **4.6 ms best**, and the row kernels from 5.7 to 0.43 ms.
+    Results stay deterministic.
+  - **Matmul per shape.** The weight-gradient matmuls (Xᵀ·dY, k = 512)
+    now take ~44% of the step: their small outputs make only 4–12 cubes
+    of 64×64 on 32 compute units. Split-k is the next fix.
   Details: `docs/gpu_step_design.md`, milestone 5.
   The CPU tape stays a separate reference rather than
   running the GPU's cubecl kernels on the CPU. A single cubecl source for

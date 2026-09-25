@@ -56,7 +56,12 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
     let (res_h, res_off) = epi.residual.unwrap_or((dummy, 0));
     let count = CubeCount::Static((n as u32).div_ceil(64), (m as u32).div_ceil(64), batch as u32);
     let u = |x: usize| x as u32;
-    super::count_launch();
+    super::count_launch_as(|| {
+        let t = |x: bool| if x { "T" } else { "N" };
+        let ops = [(epi.bias.is_some(), " +bias"), (epi.relu, " relu"), (epi.mask.is_some(), " mask"), (epi.residual.is_some(), " +res"), (epi.accumulate, " +=")];
+        let epi: String = ops.iter().filter(|o| o.0).map(|o| o.1).collect();
+        format!("{batch}x[{m}x{k}]{}·[{k}x{n}]{}{epi}", t(a.trans), t(b.trans))
+    });
     k_matmul::launch(
         client(),
         count,

@@ -390,14 +390,29 @@ mod tests {
     /// and so must every parameter tensor's gradient, each against its own
     /// scale (milestone 4). Small ragged shapes first, then the real
     /// tiny_lm step (batch 8, d 128, 8 heads, T 64, 4 blocks).
+    ///
+    /// At real size about one FFN pre-activation a step lands within
+    /// rounding of 0, and the two tapes' ReLUs can disagree on it; that
+    /// flips one hidden unit's whole gradient (milestone 5). So each config
+    /// takes the first seed from 12 whose ReLUs agree everywhere, and every
+    /// disagreement on the seeds it skips must be such a tie.
     #[test]
     #[ignore = "needs the discrete GPU"]
     fn device_step_matches_cpu_tape() {
         let small = Config { vocab: 21, d: 16, heads: 4, d_ff: 24, t: 6, n_blocks: 2, softmax1: false };
         let real = Config { vocab: 256, d: 128, heads: 8, d_ff: 256, t: 64, n_blocks: 4, softmax1: false };
         for (cfg, batch) in [(small, 3), (Config { softmax1: true, ..small }, 3), (real, 8), (Config { softmax1: true, ..real }, 8)] {
-            let what = format!("{cfg:?} batch {batch}");
-            let mut rng = Rng::new(12);
+            let seed = (12..20).find(|&seed| step_case(cfg, batch, seed));
+            assert!(seed.is_some(), "{cfg:?}: no seed in 12..20 without a ReLU tie");
+        }
+    }
+
+    /// One step_case of device_step_matches_cpu_tape. False (having checked
+    /// the forward) if the ReLUs disagree anywhere.
+    fn step_case(cfg: Config, batch: usize, seed: u64) -> bool {
+        {
+            let what = format!("{cfg:?} batch {batch} seed {seed}");
+            let mut rng = Rng::new(seed);
             let tok = Embedding::new(&mut rng, cfg.vocab, cfg.d);
             let pos = Embedding::new(&mut rng, cfg.t, cfg.d);
             let blocks: Vec<_> = (0..cfg.n_blocks).map(|_| TransformerBlock::new(&mut rng, cfg.d, cfg.heads, cfg.d_ff)).collect();
@@ -440,6 +455,24 @@ mod tests {
             let (gl, cl) = (read(dt.value(dloss))[0], tape.value(loss).data[0]);
             assert!((gl - cl).abs() <= 1e-4 * cl.abs(), "{what}: loss {gl} vs {cl}");
 
+            // ReLU ties: the GPU's FFN hidden (post-ReLU) against the CPU's
+            // pre-activation, block by block
+            let relus = (0..dt.nodes.len()).filter(|&n| matches!(dt.nodes[n].op, Op::Linear { relu: true, .. }));
+            let mut ties = 0;
+            for (n, o) in relus.zip(&bouts) {
+                let (h, z) = (read(&dt.nodes[n].value), &tape.value(o.ffn1_out.y).data);
+                for (hv, zv) in h.iter().zip(z) {
+                    if (*hv > 0.0) != (*zv > 0.0) {
+                        assert!(zv.abs() < 1e-5, "{what}: ReLUs disagree on pre-activation {zv}, not a rounding tie");
+                        ties += 1;
+                    }
+                }
+            }
+            if ties > 0 {
+                eprintln!("{what}: {ties} ReLU tie(s); next seed");
+                return false;
+            }
+
             dt.backward(dloss);
             let g = dev.read(&dev.grads);
             let mut want: Vec<(String, Var)> = vec![("token table".into(), to.table), ("position table".into(), po.table)];
@@ -463,6 +496,7 @@ mod tests {
             assert_eq!(off, g.len(), "{what}: gradient layout");
             eprintln!("{what}: {} device ops; worst gradient {:.1e} ({})", dt.len(), worst.0, worst.1);
         }
+        true
     }
 
     /// Needs the discrete GPU. Milestone 5 at unit scale: several SGD

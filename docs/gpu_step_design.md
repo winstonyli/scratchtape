@@ -10,8 +10,9 @@ batched heads the same day (section below). **Milestone 2 (kernels)
 done the same day, and so were milestones 3 and 4 (forward and gradient
 parity with the CPU tape).** **Milestone 5 done the same day: the
 device step trains like the CPU tape and takes ~9.5 ms on an idle eGPU,
-~14× under the kill criterion.** Next: parallel row reductions (62% of the
-step; see milestone 5), then milestone 6 (optional).
+~14× under the kill criterion.** Parallel row reductions then halved it
+to ~4.6 ms (milestone 5, "Row reductions"). Next: split-k for the
+weight-gradient matmuls (44% of the step), then milestone 6 (optional).
 
 ## What the evidence says
 
@@ -311,10 +312,70 @@ Each milestone leaves a runnable check behind.
        (38 µs).
      This is the caveat left open in milestone 2 ("Milestone 5 decides
      whether it matters"): it does.
-     Fix, not yet done: a cube per row (or per group of columns) with a
-     fixed-order shared-memory tree reduction. That keeps results
-     deterministic and should bring the row kernels to about matmul's
-     per-launch cost (~40 µs or less), giving a step of ~4 ms.
+     Fix: a cube per row (or per group of columns) with a fixed-order
+     shared-memory tree reduction, which keeps results deterministic.
+   - **Row reductions (done 2026-09-24).** `rows.rs` now runs:
+     - one 64-unit cube per row for LayerNorm forward, LayerNorm dx and
+       both softmaxes, each unit striding the row by 64 (coalesced), then
+       a 6-level shared-memory tree (`row_reduce`);
+     - 16 columns × 16 lanes per cube for the column sums (bias grads,
+       gamma/beta), each lane striding rows by 16, then a 4-level tree
+       across lanes (`lane_reduce`).
+     The summation order is fixed, so runs stay bit-reproducible, but it
+     differs from the CPU's serial order. Mutation check: dropping the
+     last tree level fails every row test.
+
+     Results, idle eGPU: a step takes **4.62–4.67 ms best** (5.8 ms
+     median) for both plain and softmax1, down from 9.4–9.6 ms. Summed
+     kernel time is 3.47 ms, of which the row kernels are now 0.43 ms
+     (was 5.7). Launch count is unchanged (175).
+
+     Gotchas:
+     - **cubecl SPIR-V validation** ("Expected operand type cube.ptr, but
+       found cube.index") came from the first version of the tree helpers.
+       What compiled: u32 indices cast `as usize` at each access, literal
+       shared sizes (`64usize`), `#[unroll]` comptime loops instead of a
+       `while` over usize, and helpers that take a value and allocate
+       their own `Shared` rather than receiving one. The exact trigger
+       wasn't bisected.
+     - **The one-step parity test hit a ReLU tie.** The new reduction
+       order moved one FFN pre-activation (of ~524k at real size) to
+       within rounding of 0 on seed 12, flipping a hidden unit's gradient.
+       `device_step_matches_cpu_tape` now compares the post-ReLU hidden
+       values first, requires every disagreement to be a tie (|z| < 1e-5),
+       and moves to the next seed if there is one. Plain real size uses
+       seed 13 (worst gradient error 8.1e-6); the rest pass at seed 12.
+   - **Matmul per shape** (`gpu_train_check 0 41 profile`; the profiler
+     tags each matmul launch with batch, shape, transposes and epilogue).
+     Matmul is now ~3.0–3.4 ms of the step. The idle run's top lines were
+     lost; the table is from a run where another job joined near the end
+     (total 4.26 ms), so read the ranking, not the absolute values:
+
+     | shape (out = a·b) | role | launches | µs each | cubes |
+     |---|---|---|---|---|
+     | [128×512]ᵀ·[512×256], += | dW, FFN1 / output proj | 5 | 108 | 8 |
+     | [128×512]ᵀ·[512×384], += | dW, QKV | 4 | 115 | 12 |
+     | [128×512]ᵀ·[512×128], += | dW, attn out | 4 | 114 | 4 |
+     | [256×512]ᵀ·[512×128], += | dW, FFN2 | 4 | 110 | 8 |
+     | [512×384]·[384×128]ᵀ | dX, QKV | 4 | 59 | 16 |
+     | [512×256]·[256×128]ᵀ | dX, FFN1 / output proj | 5 | 40 | 16 |
+     | [512×128]·[128×256 or 128]ᵀ | dX, FFN2 / attn out | 8 | 22 | 16 |
+     | 64×[64×64]·[64×16] (two), 64×[64×16]·[16×64]ᵀ | attention, per head | 24 | 9–20 | 64 |
+     | forward Linears | | 17 | 26–49 | 16–48 |
+
+     **The thin shapes that starve are the weight gradients, not the
+     attention matmuls.** Each is Xᵀ·dY with k = 512 (the batch's rows)
+     and a 128–256 × 128–384 output, so 64×64 tiles give only 4–12 cubes
+     for 32 compute units, and each cube walks all 512 of k serially. The
+     four dW shapes take ~1.9 ms, 44% of the step. The per-head attention
+     matmuls do fill 64 cubes but use a quarter of each 64×64 tile
+     (n = 16); they total ~0.4 ms.
+
+     Next fix: split-k for the dW matmuls. Partition k = 512 into s
+     slices across the grid's z, write partials to scratch, then sum them
+     in a fixed order into the gradient (keeps determinism; one extra
+     launch per dW). s = 4–8 gives 16–96 cubes. Smaller tiles (32×32) are
+     the alternative but shorten each cube's reuse; measure both.
    - **Negative result: a sync-after-every-launch profiler didn't work.**
      Its step ran at ~70–100 ms. The ~0.5 ms round trip charged to each
      launch swamped the kernels, so it couldn't rank them. Device

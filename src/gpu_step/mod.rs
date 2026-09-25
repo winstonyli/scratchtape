@@ -27,13 +27,19 @@ pub static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
 #[track_caller]
 fn count_launch() {
-    LAUNCHES.fetch_add(1, Ordering::Relaxed);
-    if let Some(p) = PROFILE.get() {
-        p.lock().unwrap().mark(Some(std::panic::Location::caller()));
-    }
+    count_launch_as(String::new);
 }
 
-type Site = &'static std::panic::Location<'static>;
+/// `count_launch` with a tag appended to the profiler's site key (say, a
+/// matmul's shape); `tag` only runs while profiling.
+#[track_caller]
+fn count_launch_as(tag: impl FnOnce() -> String) {
+    LAUNCHES.fetch_add(1, Ordering::Relaxed);
+    if let Some(p) = PROFILE.get() {
+        let at = std::panic::Location::caller();
+        p.lock().unwrap().mark(Some(format!("{}:{} {}", at.file(), at.line(), tag())));
+    }
+}
 
 /// Per-launch-site GPU time from device timestamps, for finding slow
 /// kernels. Each launch runs in its own profile window (no host sync; the
@@ -45,12 +51,12 @@ static PROFILE: OnceLock<std::sync::Mutex<Profile>> = OnceLock::new();
 
 #[derive(Default)]
 struct Profile {
-    open: Option<(Site, cubecl_runtime::client::ProfileWindow)>,
-    done: Vec<(Site, cubecl::profile::ProfileDuration)>,
+    open: Option<(String, cubecl_runtime::client::ProfileWindow)>,
+    done: Vec<(String, cubecl::profile::ProfileDuration)>,
 }
 
 impl Profile {
-    fn mark(&mut self, next: Option<Site>) {
+    fn mark(&mut self, next: Option<String>) {
         if let Some((site, w)) = self.open.take() {
             self.done.push((site, client().profile_end(w).unwrap()));
         }
@@ -74,7 +80,7 @@ pub fn profile_take() -> Vec<(String, usize, f64)> {
     p.mark(None);
     let mut sites: std::collections::HashMap<String, (usize, f64)> = Default::default();
     for (site, d) in p.done.drain(..) {
-        let e = sites.entry(format!("{}:{}", site.file(), site.line())).or_default();
+        let e = sites.entry(site).or_default();
         e.0 += 1;
         if let Some(t) = pollster::block_on(d.resolve()) {
             e.1 += t.duration().as_secs_f64();
