@@ -574,7 +574,16 @@ other examples. The ops table leaves room for them later.
 
 ## Open questions
 
-- None open. The CPU batched-heads question is settled below.
+- **Parked until batching is settled (2026-09-25): train K seeds at once
+  and let them interact.** Substrate: horizontal fusion, K models in the
+  same ~145 launches (HFTA, MLSys 2021, arXiv 2102.02344), since the step
+  is dispatch-bound and Windows time-slices separate processes. Then, in
+  order: codistillation / deep mutual learning (loss += a·KL(peers' mean
+  || own); Anil et al. 2018, Zhang et al. 2018), aimed at the overfitting
+  gap that decay and dropout barely moved; periodic weight averaging of
+  shared-init replicas (local SGD, DiLoCo arXiv 2311.08105). Baselines at
+  equal compute: an ensemble of K independent models, and one model with
+  K× the steps.
 
 ## CPU model: batched heads (done 2026-09-24)
 

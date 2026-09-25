@@ -8,7 +8,7 @@
 //
 // One condition per process (crash-isolated, launchable at low priority,
 // per LONG_RUNS.md):
-//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout]
+//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout] [warmup_windows]
 // `windows` is the total training budget in 64-byte windows (default
 // 64000, tiny_lm_corpus.rs's), so batch size changes steps, not data:
 // steps = windows / batch. Progress streams to stdout as it happens; the
@@ -35,6 +35,9 @@
 // LayerNorm and biases exempt, Config::decay_mask). `dropout` (default
 // 0, GPU only) is the rate on each block's attention output and FFN
 // hidden layer (gpu_step::tape::block_forward), training steps only.
+// `warmup_windows` (default 0) ramps lr linearly from lr/k to lr over
+// the first k = warmup_windows / batch steps, so warmup covers the same
+// data at any batch size (Goyal et al. 2017, for large-batch lr scaling).
 //
 // Same architecture and init stream as tiny_lm_corpus.rs (seed 1), so
 // batch=1 lr=0.3 reproduces attention_uniformity_check.rs's plain (1.852)
@@ -85,6 +88,11 @@
 //   softmax1  1.8037 +- 0.0089   (1.7989 1.8050 1.7923 1.8062 1.8162)
 // Paired, plain - softmax1 = 0.021, 95% CI [0.011, 0.031], 5 of 5 seeds.
 // Batch 1 beats batch 8 by 0.027 (plain) and 0.044 (softmax1).
+// Batch 8 at lr 1.2 with 6400 warmup windows matches batch 1 (plain,
+// seeds 1-5): 1.8187 +- 0.0091 vs 1.8247, paired 0.006, 95% CI [-0.014,
+// 0.026], at ~6x the windows per second. lr 0.6: 1.8241. Without warmup
+// lr 0.6 ends at 1.864 and 1.2 diverges. Batch 16 (lr 1.2: 1.846) and 32
+// (lr 1.2: 1.923) can't catch up: lr 1.7 / 2.4 diverge.
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, pack, read_f32, upload_f32};
@@ -166,7 +174,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> f32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout]");
+    assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout] [warmup_windows]");
     let name = &args[1];
     let softmax1 = args[2] == "1";
     let batch: usize = args[3].parse().unwrap();
@@ -189,6 +197,8 @@ fn main() {
     };
     let dropout: f32 = args.get(11).map(|s| s.parse().unwrap()).unwrap_or(0.0);
     assert!(dropout == 0.0 || gpu, "dropout is GPU only");
+    let warmup_windows: usize = args.get(12).map(|s| s.parse().unwrap()).unwrap_or(0);
+    let warmup = (warmup_windows / batch).max(1);
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
 
@@ -206,10 +216,9 @@ fn main() {
         final_ln: LayerNorm::new(D_MODEL),
         output_proj: Linear::new(&mut rng, D_MODEL, VOCAB),
     };
-    let opt = Sgd { lr };
 
     // Resume: header "<config> | <step> <rng state>", then the parameters.
-    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed} wd={weight_decay} decay_all={decay_all} dropout={dropout}");
+    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed} wd={weight_decay} decay_all={decay_all} dropout={dropout} warmup={warmup_windows}");
     let resume_path = format!("runs/{name}.resume");
     let mut first = 0;
     if let Ok(text) = std::fs::read_to_string(&resume_path) {
@@ -292,6 +301,7 @@ fn main() {
         if step == steps {
             break;
         }
+        let lr = lr * ((step + 1) as f32 / warmup as f32).min(1.0);
         let mut input = Vec::with_capacity(batch * SEQ_LEN);
         let mut target = Vec::with_capacity(batch * SEQ_LEN);
         for _ in 0..batch {
@@ -323,7 +333,7 @@ fn main() {
             return;
         }
         tape.backward(loss);
-        apply_grad(&tape, &out, &mut m.token_emb, &mut m.pos_emb, &mut m.blocks, &mut m.final_ln, &mut m.output_proj, &opt);
+        apply_grad(&tape, &out, &mut m.token_emb, &mut m.pos_emb, &mut m.blocks, &mut m.final_ln, &mut m.output_proj, &Sgd { lr });
     }
 
     let flat = flatten_all(&m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj);

@@ -515,11 +515,43 @@ it's an optimization gain, not a regularizer.
 
 Batch 1 beats batch 8 at equal data, paired by seed: plain by 0.027 (95%
 CI [−0.001, 0.055], 4 of 5 seeds) and softmax1 by 0.044 ([0.028, 0.061],
-5 of 5). The 8× more updates are worth more to softmax1, which is why its
-lead vanishes at batch 8. Batch-1 softmax1 (1.804) also beats batch 8 with
-the best weight decay (1.833). So the cheapest known improvement here is
-more steps, not regularization, and the gap to the 7-gram (1.655) is
-still 0.15.
+5 of 5). Batch 8 at lr 0.3 costs softmax1 more, which is why its lead
+vanishes there; whether it returns at batch 8 with the higher lr below is
+untested. Batch-1 softmax1 (1.804) also beats batch 8 with
+the best weight decay (1.833). The gap to the 7-gram (1.655) is still
+0.15. That batch-1 lead was batch 8's too-small lr, not the extra
+updates: see the next paragraph.
+
+**Batch 8 matches batch 1 once its lr is raised, at ~6× the data
+throughput** (`... gpu <seed> 0 all 0 <warmup_windows>`, 2026-09-25). A
+step costs nearly the same at any batch up to 8 (the step is bound by its
+~145 dispatches, not arithmetic), so batch 8 was only losing on lr. Plain,
+64000 windows, warmup = lr ramped linearly over the first 6400 windows:
+
+| recipe | held-out, seeds 1–5 | train-probe | ms/step | s per run |
+|---|---|---|---|---|
+| batch 1, lr 0.3 | 1.8247 ± 0.0138 | 1.333 | 1.9 | ~120 |
+| batch 8, lr 0.3 | 1.8521 ± 0.0108 | 1.372 | 2.5 | ~20 |
+| batch 8, lr 0.6 + warmup | 1.8241 ± 0.0051 | 1.271 | 2.5 | ~20 |
+| batch 8, lr 1.2 + warmup | 1.8187 ± 0.0091 | 1.244 | 2.5 | ~20 |
+
+Paired by seed, batch 1 − batch 8 at lr 1.2 = 0.006, 95% CI [−0.014,
+0.026]: no detectable difference (lr 1.2 was picked on seeds 1–2; 3–5 are
+fresh). Warmup is what makes the higher lr work: without it lr 0.6 ends
+worse than lr 0.3 (1.864, seeds 1–2) and lr 1.2 diverges. Warmup doesn't
+help batch 1 itself (1.8095 vs 1.8150, seeds 1–2, one up and one down).
+
+Larger batches hit plain SGD's stability ceiling, not the warmup's:
+batch 16 reaches 1.8459 at lr 1.2 (seeds 1–2) and diverges at 1.7;
+batch 32 reaches 1.923 at lr 1.2 and diverges at 2.4 and above. Every
+divergence came after the warmup ended, which fits an lr above SGD's
+curvature limit (~2/sharpness) that no batch size raises. Going past
+batch 8 needs momentum, Adam or gradient clipping.
+
+Step cost by batch (1500 steps, best of 2, CPU 34–92% loaded by other
+sessions, so upper bounds): 1.86, 2.54, 4.01, 5.27, 8.22, 11.15 ms for
+batch 1, 8, 16, 32, 64, 96, or 1.86 → 0.12 ms per window. Past batch 8
+arithmetic starts to show, ~0.1 ms per extra window.
 
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
