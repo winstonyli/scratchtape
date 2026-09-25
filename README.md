@@ -553,6 +553,33 @@ sessions, so upper bounds): 1.86, 2.54, 4.01, 5.27, 8.22, 11.15 ms for
 batch 1, 8, 16, 32, 64, 96, or 1.86 → 0.12 ms per window. Past batch 8
 arithmetic starts to show, ~0.1 ms per extra window.
 
+**Momentum removes the ceiling: batch 32 matches batch 1 at ~11× the
+throughput** (`... <warmup_windows> 0.9`, 2026-09-25). Heavy-ball
+momentum (v = μv + g, p −= lr·v, μ = 0.9, so the effective lr is 10·lr),
+same 6400-window warmup. Plain, 64000 windows, held-out CE over seeds
+1–5 (settings picked on seeds 1–2, confirmed on fresh seeds 3–5):
+
+| recipe | held-out | train-probe | batch 1 − this, paired (95% CI) | ms/window |
+|---|---|---|---|---|
+| batch 1, SGD lr 0.3 | 1.8247 ± 0.0138 | 1.333 | — | 1.86 |
+| batch 8, SGD lr 1.2 | 1.8187 ± 0.0091 | 1.244 | 0.006 [−0.014, 0.026] | 0.32 |
+| batch 8, momentum, eff. lr 1.2 | 1.8088 ± 0.0089 | 1.223 | 0.016 [−0.001, 0.032] | 0.32 |
+| batch 16, momentum, eff. lr 2.4 | 1.8110 ± 0.0115 | 1.238 | 0.014 [−0.004, 0.031] | 0.25 |
+| batch 32, momentum, eff. lr 4.8 | 1.8175 ± 0.0155 | 1.278 | 0.007 [−0.016, 0.030] | 0.16 |
+
+Nothing diverged with momentum, up to effective lr 9.6, where CE got
+worse instead (batch 16: 1.851, batch 32: 1.841, seeds 1–2). Plain SGD
+diverged at 1.7 (batch 16) and 2.4 (batch 32). Momentum at batch 8
+beats plain SGD at batch 8 by 0.010 (95% CI [−0.009, 0.029]), so its
+main value here is making larger batches work, not a better optimum.
+A 64000-window run is now 2000 steps of ~5 ms, ~11 s of training.
+Untested: momentum without warmup, other μ.
+
+softmax1 under the tuned batch-8 SGD recipe (lr 1.2 + warmup, seeds
+1–5): 1.8263 ± 0.0115 vs plain's 1.8187, paired plain − softmax1 =
+−0.008, 95% CI [−0.020, 0.004]. Its batch-1 lead (0.021 at lr 0.3)
+doesn't survive tuning the lr (tuned on plain).
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data

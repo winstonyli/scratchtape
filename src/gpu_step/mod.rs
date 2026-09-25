@@ -219,6 +219,13 @@ impl DeviceParams {
         k_sgd::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), lr, self.len as u32);
     }
 
+    /// One launch of heavy-ball momentum: v = mu * v + g, then p -= lr * v.
+    /// `v` holds the velocity (`len` f32s, zero at the start of training).
+    pub fn momentum(&self, lr: f32, mu: f32, v: &Handle) {
+        count_launch();
+        k_momentum::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), buf(v, self.len), lr, mu, self.len as u32);
+    }
+
     /// One launch: p *= 1 - shrink * mask over every parameter (mask is
     /// 0 or 1 per parameter, e.g. `Config::decay_mask`). Weight decay at
     /// rate wd is `decay(lr * wd, mask)` before `sgd(lr)`.
@@ -264,6 +271,15 @@ fn k_sgd(p: &mut [f32], g: &[f32], lr: f32, len: u32) {
     let i = ABSOLUTE_POS;
     if (i as u32) < len {
         p[i] -= lr * g[i];
+    }
+}
+
+#[cube(launch)]
+fn k_momentum(p: &mut [f32], g: &[f32], v: &mut [f32], lr: f32, mu: f32, len: u32) {
+    let i = ABSOLUTE_POS;
+    if (i as u32) < len {
+        v[i] = mu * v[i] + g[i];
+        p[i] -= lr * v[i];
     }
 }
 
@@ -332,5 +348,28 @@ mod tests {
         let decayed = dev.read(&dev.params);
         let exact = decayed.iter().zip(&got).zip(&mask).all(|((d, g), m)| *d == if *m == 1.0 { 0.5 * g } else { *g });
         assert!(exact, "decay(0.5) must halve exactly the masked parameters and leave the rest");
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn device_momentum_matches_reference() {
+        let mut rng = Rng::new(5);
+        let n = 10_000;
+        let mut p: Vec<f32> = (0..n).map(|_| rng.next_gaussian()).collect();
+        let mut dev = DeviceParams::upload(&p);
+        let v = upload_f32(&vec![0.0; n]);
+        let mut vel = vec![0.0f32; n];
+        // Two steps, so the second one exercises the carried velocity.
+        for _ in 0..2 {
+            let g: Vec<f32> = (0..n).map(|_| rng.next_gaussian()).collect();
+            dev.grads = upload(&g);
+            dev.momentum(0.1, 0.9, &v);
+            for i in 0..n {
+                vel[i] = 0.9 * vel[i] + g[i];
+                p[i] -= 0.1 * vel[i];
+            }
+        }
+        let err = dev.read(&dev.params).iter().zip(&p).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(err < 1e-6, "max |gpu - cpu| = {err}");
     }
 }

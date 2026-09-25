@@ -8,7 +8,7 @@
 //
 // One condition per process (crash-isolated, launchable at low priority,
 // per LONG_RUNS.md):
-//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout] [warmup_windows]
+//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout] [warmup_windows] [momentum]
 // `windows` is the total training budget in 64-byte windows (default
 // 64000, tiny_lm_corpus.rs's), so batch size changes steps, not data:
 // steps = windows / batch. Progress streams to stdout as it happens; the
@@ -38,6 +38,9 @@
 // `warmup_windows` (default 0) ramps lr linearly from lr/k to lr over
 // the first k = warmup_windows / batch steps, so warmup covers the same
 // data at any batch size (Goyal et al. 2017, for large-batch lr scaling).
+// `momentum` (default 0, GPU only) is heavy-ball momentum mu: v = mu*v + g,
+// p -= lr*v, so the effective lr is lr / (1 - mu). The velocity isn't
+// checkpointed, so a momentum run refuses to resume.
 //
 // Same architecture and init stream as tiny_lm_corpus.rs (seed 1), so
 // batch=1 lr=0.3 reproduces attention_uniformity_check.rs's plain (1.852)
@@ -93,6 +96,12 @@
 // 0.026], at ~6x the windows per second. lr 0.6: 1.8241. Without warmup
 // lr 0.6 ends at 1.864 and 1.2 diverges. Batch 16 (lr 1.2: 1.846) and 32
 // (lr 1.2: 1.923) can't catch up: lr 1.7 / 2.4 diverge.
+// Momentum 0.9 + warmup, plain, seeds 1-5, held-out (vs batch 1 1.8247):
+//   batch 8,  lr 0.12  1.8088 +- 0.0089
+//   batch 16, lr 0.24  1.8110 +- 0.0115
+//   batch 32, lr 0.48  1.8175 +- 0.0155   (paired 0.007, CI [-0.016, 0.030])
+// No divergence up to lr 0.96 (worse CE). softmax1 at batch 8, SGD lr 1.2
+// + warmup: 1.8263 vs plain 1.8187 (its batch-1 lead doesn't survive).
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, pack, read_f32, upload_f32};
@@ -174,7 +183,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> f32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout] [warmup_windows]");
+    assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout] [warmup_windows] [momentum]");
     let name = &args[1];
     let softmax1 = args[2] == "1";
     let batch: usize = args[3].parse().unwrap();
@@ -199,6 +208,8 @@ fn main() {
     assert!(dropout == 0.0 || gpu, "dropout is GPU only");
     let warmup_windows: usize = args.get(12).map(|s| s.parse().unwrap()).unwrap_or(0);
     let warmup = (warmup_windows / batch).max(1);
+    let momentum: f32 = args.get(13).map(|s| s.parse().unwrap()).unwrap_or(0.0);
+    assert!(momentum == 0.0 || gpu, "momentum is GPU only");
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
 
@@ -218,13 +229,14 @@ fn main() {
     };
 
     // Resume: header "<config> | <step> <rng state>", then the parameters.
-    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed} wd={weight_decay} decay_all={decay_all} dropout={dropout} warmup={warmup_windows}");
+    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed} wd={weight_decay} decay_all={decay_all} dropout={dropout} warmup={warmup_windows} momentum={momentum}");
     let resume_path = format!("runs/{name}.resume");
     let mut first = 0;
     if let Ok(text) = std::fs::read_to_string(&resume_path) {
         let (header, params) = text.split_once('\n').unwrap();
         let (saved, at) = header.split_once(" | ").unwrap();
         assert_eq!(saved, config, "{resume_path} is from a different config");
+        assert!(momentum == 0.0, "{resume_path}: momentum runs can't resume (the velocity isn't saved)");
         let (step, state) = at.split_once(' ').unwrap();
         first = step.parse().unwrap();
         rng = Rng::new(state.parse().unwrap());
@@ -243,6 +255,7 @@ fn main() {
         let mask = if decay_all { vec![1.0; cfg.len()] } else { cfg.decay_mask() };
         upload_f32(&mask)
     });
+    let velocity = (momentum > 0.0).then(|| upload_f32(&vec![0.0; cfg.len()]));
     let sync = |m: &mut Model| {
         if let Some(dev) = &dev {
             let (token_emb, pos_emb, blocks, final_ln, output_proj) = reconstruct(&dev.read(&dev.params), VOCAB, D_MODEL, SEQ_LEN, N_BLOCKS, N_HEADS, D_FF);
@@ -322,7 +335,10 @@ fn main() {
             if let Some(mask) = &decay_mask {
                 dev.decay(lr * weight_decay, mask);
             }
-            dev.sgd(lr);
+            match &velocity {
+                Some(v) => dev.momentum(lr, momentum, v),
+                None => dev.sgd(lr),
+            }
             continue;
         }
         let mut tape = Tape::with_capacity(2000);
