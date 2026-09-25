@@ -20,11 +20,11 @@
 // run; the file is removed once the final .ckpt is written.
 //
 // `gpu` runs each training step on the eGPU (gpu_step's device tape, same
-// init, batches and SGD): no readback per step; the parameters come back
-// to the CPU for each CE evaluation and checkpoint, and the loss is read
-// there to catch NaN. Evaluation stays on the CPU. Holds a shared GPU
-// lease and pauses at evaluations while another job holds an exclusive
-// one. WGPU_BACKEND=dx12 as gpu_step::client. The GPU run is not the CPU
+// init, batches and SGD) with no readback per step, and evaluates there
+// too (`device_ce`); the parameters come back to the CPU only for
+// checkpoints. At the end the CPU re-scores the final model's held-out CE
+// and the run fails if the two differ by 1e-3. Holds a shared GPU lease
+// and pauses at evaluations while another job holds an exclusive one. WGPU_BACKEND=dx12 as gpu_step::client. The GPU run is not the CPU
 // run bit for bit: about once a step a ReLU input lands within rounding
 // of 0 and the two disagree (docs/gpu_step_design.md, milestone 5).
 //
@@ -47,9 +47,12 @@
 // GPU, same recipe (2026-09-25; eGPU on Vulkan, idle otherwise):
 //   gpu_plain_b8     1.357 / 1.857   (CPU above: 1.390 / 1.858)
 //   gpu_softmax1_b8  1.378 / 1.860   (CPU above: 1.375 / 1.846)
-// ~150 s per run instead of ~4.5 h: 21 s of training (2.0-2.7 ms/step
-// once the kernels are compiled; the first 1000 steps include ~1.5 s of
-// compilation) and ~125 s of CPU evaluation. Rerunning gives the same
+// ~20 s per run instead of ~4.5 h, uncontended: ~1.9-2.0 ms/step once
+// the kernels are compiled (the first 1000 steps include ~0.7-1.5 s of
+// compilation), plus ~0.3 s per evaluation on the device (125 s in all
+// when evaluation ran on the CPU). Other sessions' jobs on the eGPU
+// (a render loop, self-play) made steps 2.6-18 ms at times; the column
+// shows it. Reruns, and a run killed and resumed, reproduce the
 // checkpoint byte for byte. GPU and CPU runs are chaotic twins (see
 // above), and their gap is itself a measure of seed-level noise: 0.001
 // held-out for plain but 0.014 for softmax1, with softmax1 behind plain
@@ -115,6 +118,25 @@ fn full_ce(m: &Model, corpus: &[usize], softmax1: bool) -> f32 {
     total / starts.len() as f32
 }
 
+/// full_ce on the device, from the parameters in `dev`. Windows go in
+/// chunks of up to 64: the row kernels launch one cube per softmax row
+/// (batch * heads * T of them), and a launch dimension stops at 65535.
+fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> f32 {
+    let starts: Vec<usize> = (0..corpus.len() - SEQ_LEN).step_by(SEQ_LEN).collect();
+    let mut total = 0.0f64;
+    for chunk in starts.chunks(64) {
+        let (mut ids, mut targets) = (vec![], vec![]);
+        for &s in chunk {
+            ids.extend(&corpus[s..s + SEQ_LEN]);
+            targets.extend(&corpus[s + 1..s + SEQ_LEN + 1]);
+        }
+        let mut dt = DeviceTape::new(dev);
+        let (_, _, loss) = model_forward(&mut dt, cfg, &ids, &targets, chunk.len());
+        total += read_f32(dt.value(loss)) as f64 * chunk.len() as f64;
+    }
+    (total / starts.len() as f64) as f32
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu]");
@@ -166,17 +188,17 @@ fn main() {
 
     println!("run {name}: pid {} {config} steps={steps} device={}", std::process::id(), if gpu { "gpu" } else { "cpu" });
     // On the GPU the parameters live in `dev`; `m` is refreshed from it
-    // (`sync`) before anything reads it.
+    // (`sync`) only to save them.
     let _lease = gpu.then(|| gpu_lease::hold(Kind::Shared, &format!("scratchtape training_recipe_check {name}"), Duration::from_secs(4 * 3600)));
     let dev = gpu.then(|| DeviceParams::upload(&pack(&m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj)));
     let cfg = Config { vocab: VOCAB, d: D_MODEL, heads: N_HEADS, d_ff: D_FF, t: SEQ_LEN, n_blocks: N_BLOCKS, softmax1 };
-    let mut last_loss = None;
-    let sync = |m: &mut Model, last_loss: &mut Option<scratchtape::gpu_step::Handle>| -> bool {
-        let Some(dev) = &dev else { return true };
-        let (token_emb, pos_emb, blocks, final_ln, output_proj) = reconstruct(&dev.read(&dev.params), VOCAB, D_MODEL, SEQ_LEN, N_BLOCKS, N_HEADS, D_FF);
-        *m = Model { token_emb, pos_emb, blocks, final_ln, output_proj };
-        last_loss.take().is_none_or(|l| !read_f32(&l).is_nan())
+    let sync = |m: &mut Model| {
+        if let Some(dev) = &dev {
+            let (token_emb, pos_emb, blocks, final_ln, output_proj) = reconstruct(&dev.read(&dev.params), VOCAB, D_MODEL, SEQ_LEN, N_BLOCKS, N_HEADS, D_FF);
+            *m = Model { token_emb, pos_emb, blocks, final_ln, output_proj };
+        }
     };
+    let mut held_out_ce = f32::NAN;
     if first > 0 {
         println!("resumed from {resume_path} at step {first}");
     }
@@ -191,9 +213,8 @@ fn main() {
         // Save before this step's work; `step` is the next one to run.
         let save = step > first && last_save.elapsed().as_secs() >= checkpoint_secs;
         let eval = step % eval_every == 0 || step == steps;
-        if (save || eval) && !sync(&mut m, &mut last_loss) {
-            println!("diverged to NaN before step {step}");
-            return;
+        if save || step == steps {
+            sync(&mut m);
         }
         if eval && gpu {
             gpu_lease::pause_while_exclusive();
@@ -212,13 +233,16 @@ fn main() {
                 0 => "-".to_string(),
                 n => format!("{:.2}", segment.0.elapsed().as_secs_f64() * 1e3 / n as f64),
             };
-            println!(
-                "{step:>6} | {:>6} | {:.4} | {:.4} | {:.0}s | {ms_per_step}",
-                step * batch,
-                full_ce(&m, train_probe, softmax1),
-                full_ce(&m, held_out, softmax1),
-                start.elapsed().as_secs_f32()
-            );
+            let (probe_ce, held) = match &dev {
+                Some(dev) => (device_ce(dev, &cfg, train_probe), device_ce(dev, &cfg, held_out)),
+                None => (full_ce(&m, train_probe, softmax1), full_ce(&m, held_out, softmax1)),
+            };
+            held_out_ce = held;
+            println!("{step:>6} | {:>6} | {probe_ce:.4} | {held:.4} | {:.0}s | {ms_per_step}", step * batch, start.elapsed().as_secs_f32());
+            if held.is_nan() {
+                println!("diverged to NaN before step {step}");
+                return;
+            }
             std::io::stdout().flush().unwrap();
             evaluating += t.elapsed();
             segment = (Instant::now(), step);
@@ -239,7 +263,6 @@ fn main() {
             let (_, _, dloss) = model_forward(&mut dt, &cfg, &input, &target, batch);
             dt.backward(dloss);
             dev.sgd(lr);
-            last_loss = Some(dt.value(dloss).clone());
             continue;
         }
         let mut tape = Tape::with_capacity(2000);
@@ -258,6 +281,13 @@ fn main() {
     std::fs::write(format!("runs/{name}.ckpt"), text).unwrap();
     let _ = std::fs::remove_file(&resume_path);
     let total = start.elapsed();
+    if gpu {
+        // The device's CE against the CPU's on the final model: the same
+        // numbers up to float summation order.
+        let cpu = full_ce(&m, held_out, softmax1);
+        println!("held-out CE of the final model on the CPU: {cpu:.4} (device {held_out_ce:.4})");
+        assert!((cpu - held_out_ce).abs() < 1e-3, "device CE disagrees with the CPU's");
+    }
     let training = total - evaluating;
     println!(
         "saved runs/{name}.ckpt ({:.0}s total: {:.0}s evaluating, {:.0}s training = {:.2} ms/step)",

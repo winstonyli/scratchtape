@@ -432,9 +432,9 @@ widening at the end, while held-out gains had slowed to 0.03 per 8000
 windows. Regularization (weight decay, dropout) is the next lever, ahead
 of the optimizer.
 
-**On the GPU the same run takes ~150 s, not ~4.5 h** (`training_recipe_check
-... gpu`, 2026-09-25): 21 s of training at 2.0–2.7 ms/step, and ~125 s of
-CPU evaluation. Batch 8 ends at plain 1.357 / 1.857 and softmax1 1.378 /
+**On the GPU the same run takes ~20 s, not ~4.5 h** (`training_recipe_check
+... gpu`, 2026-09-25): ~1.9–2.0 ms/step uncontended, with evaluation on the
+device too (~0.3 s each, checked against the CPU at the end). Batch 8 ends at plain 1.357 / 1.857 and softmax1 1.378 /
 1.860 (train-probe / held-out). The GPU and CPU runs are chaotic twins
 (milestone 5 below), so their gap measures seed-level noise: 0.001
 held-out for plain, 0.014 for softmax1, which trails plain on the GPU.
@@ -1083,11 +1083,13 @@ because raw forgetting deltas hid a floor effect.
     FXC and the step runs ~170× slower. Vulkan stays the default.
   - **A full training run on the GPU (2026-09-25).**
     `training_recipe_check <name> <softmax1> 8 0.3 64000 600 gpu` trains
-    all 8000 steps on the device and reads the parameters back only for
-    each CPU evaluation. Training takes 2.0–2.7 ms/step (first 1000 steps
-    3.5, including kernel compilation). Final CE matches the CPU runs to
-    the chaotic-twin noise (plain held-out 1.857 vs 1.858). Reruns
-    reproduce the checkpoint byte for byte.
+    all 8000 steps and evaluates on the device, and reads the parameters
+    back only for checkpoints. Uncontended, a step takes ~1.9–2.0 ms (the
+    first 1000 include kernel compilation) and an evaluation ~0.3 s, so
+    a run is ~20 s. Slower stretches (2.6–18 ms) were other sessions'
+    eGPU jobs starting mid-run. Final CE matches the CPU runs to the
+    chaotic-twin noise (plain held-out 1.857 vs 1.858). Reruns and
+    kill/resume reproduce the checkpoint byte for byte.
   Details: `docs/gpu_step_design.md`, milestones 5 and 6.
   The CPU tape stays a separate reference rather than
   running the GPU's cubecl kernels on the CPU. A single cubecl source for

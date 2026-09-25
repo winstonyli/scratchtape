@@ -17,8 +17,8 @@ to ~4.6 ms (milestone 5, "Row reductions"), and split-k matmuls to
 step is bounded by host queueing and the per-step loss readback: steps
 pipelined (loss read every N steps) take **~1.5 ms on DX12, ~2.0 ms on
 Vulkan** (milestone 5, "Host side and backends"). A full
-`training_recipe_check` run (8000 steps) trains in ~21 s on the GPU vs
-~4.5 h on the CPU, to the same CE (milestone 6). Rest of milestone 6
+`training_recipe_check` run (8000 steps, evaluation included) takes
+~20 s on the GPU vs ~4.5 h on the CPU, to the same CE (milestone 6). Rest of milestone 6
 (optional) is open.
 
 ## What the evidence says
@@ -514,11 +514,16 @@ Each milestone leaves a runnable check behind.
    is done (milestone 5, "Host side and backends").
    - **Full GPU training run (done 2026-09-25).** `training_recipe_check`
      takes a 7th argument, `gpu`. Each step runs on the device tape with
-     no readback. At each evaluation (every 1000 steps) and checkpoint,
-     the parameters come back to the CPU (`reconstruct`) and the last
-     loss is read to catch NaN. Evaluation and the resume file stay on
-     the CPU, in the same format. The run holds a shared lease and pauses
-     at evaluations for others' exclusive leases.
+     no readback. Evaluation (every 1000 steps) runs on the device too:
+     `device_ce` runs the forward pass over the 371 windows in chunks of
+     64, because the row kernels launch one cube per softmax row
+     (batch·heads·T) and a launch dimension stops at 65535. A NaN CE
+     ends the run. The parameters come back to the CPU (`reconstruct`)
+     only for checkpoints, in the CPU run's resume format. At the end the
+     CPU re-scores the final model's held-out CE and the run fails on a
+     difference over 1e-3 (they agree to 4 decimals). The run holds a
+     shared lease and pauses at evaluations for others' exclusive
+     leases.
    - **Results** (batch 8, lr 0.3, 64000 windows, Vulkan, idle eGPU and
      CPU), train-probe / held-out CE:
 
@@ -532,18 +537,21 @@ Each milestone leaves a runnable check behind.
      error. They are as large as softmax1's batch-8 lead over plain
      (0.012), which reverses on the GPU. A rerun of the plain GPU run
      reproduced the checkpoint byte for byte.
-   - **Time.** ~150 s per run instead of ~4.5 h: ~125 s of CPU evaluation
-     (9 × 371 × 2 windows) and ~21 s of training. The log prints training
-     ms/step for each stretch between evaluations: 3.5 for the first 1000
-     steps (~1.5 s of JIT compilation), then 2.0–2.1, then 2.67 from step
-     3000 on. That step up to 2.67 also appeared in a second clean run, and
-     its cause is unknown (CPU clock after the evaluations, or something
-     else). The benchmark, `gpu_train_check 0 200 time`, gave 1.97 ms
-     pipelined right before this run. Another run, with a game on the
-     eGPU from step 3000, took 23–31 ms/step with CE unchanged.
-   - **Why evaluation stays on the CPU.** It's 85% of the run now, and
-     moving it is the next win if runs get repeated. Leaving it on the CPU
-     kept the comparison with the CPU runs exact and the change small.
+   - **Time.** Uncontended, ~20 s per run instead of ~4.5 h:
+     ~1.9–2.0 ms per step, plus ~0.3 s per evaluation. The log prints
+     training ms/step for each stretch between evaluations. The first
+     1000 steps take 2.6–3.5 ms because they include JIT compilation.
+     With evaluation on the CPU, it was 85% of a run (~125 s).
+   - **Negative result: the slower stretches came from other jobs, not
+     the loop.** Stretches of 2.6–2.7 ms (and 12–31 ms) came and went at
+     different steps in each run: 3000+ in one, 1000–6000 in another,
+     7000+ in a third. With no evaluations, 12000 streamed steps held
+     ~1.9–2.1 ms. Sampling eGPU engine users during runs found other
+     sessions' jobs starting mid-run after the idle check had passed:
+     `selfplay-burn-strat`, and `manifold`, a render loop on the 3D and
+     copy engines that alone made steps ~16 ms. The idle check before a
+     run can't see jobs that start later; the per-stretch column shows
+     them.
 
 **Kill criterion:** if milestone 5's step isn't clearly faster than
 ~130 ms (a well-threaded CPU batch-8 step), stop and record why. The
