@@ -6,7 +6,7 @@ use crate::nn::{Embedding, LayerNorm, Linear, TransformerBlock};
 use cubecl::client::Client;
 use cubecl::prelude::*;
 pub use cubecl::server::Handle;
-use cubecl::wgpu::{RuntimeOptions, Vulkan, WgpuDevice, WgpuDeviceKind, WgpuRuntime, init_setup};
+use cubecl::wgpu::{Dx12, RuntimeOptions, Vulkan, WgpuDevice, WgpuDeviceKind, WgpuRuntime, init_setup};
 use cubecl_runtime::runtime::Runtime;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,6 +21,12 @@ const EW_DIM: u32 = 256;
 
 static CLIENT: OnceLock<Client> = OnceLock::new();
 
+/// Launches per queue submission (cubecl's default is 32). Each submit
+/// costs ~60 µs of host time, and GPU-side per submission on Vulkan;
+/// pipelined steps took 2.35 ms at 32, 1.97 at 128, 1.86 at 512. 128
+/// keeps the GPU fed early when a step ends in a readback.
+const SUBMIT_TASKS: usize = 128;
+
 /// Kernel launches queued so far, for counting launches per step.
 pub static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
@@ -34,10 +40,65 @@ fn count_launch() {
 #[track_caller]
 fn count_launch_as(tag: impl FnOnce() -> String) {
     LAUNCHES.fetch_add(1, Ordering::Relaxed);
-    if let Some(p) = PROFILE.get() {
-        let at = std::panic::Location::caller();
-        p.lock().unwrap().mark(Some(format!("{}:{} {}", at.file(), at.line(), tag())));
+    let mut host = HOST.lock().unwrap();
+    if PROFILE.get().is_none() && host.is_none() {
+        return;
     }
+    let at = std::panic::Location::caller();
+    let site = format!("{}:{} {}", at.file(), at.line(), tag());
+    if let Some(h) = host.as_mut() {
+        h.mark(Some(site.clone()));
+    }
+    if let Some(p) = PROFILE.get() {
+        p.lock().unwrap().mark(Some(site));
+    }
+}
+
+/// Host time per launch site, for finding where queueing a step goes: the
+/// time from one launch's `count_launch` to the next is charged to the
+/// first (its launch call, plus the host work before the next launch). Off
+/// unless `host_profile_start`. Includes building the site key, ~1 µs.
+static HOST: std::sync::Mutex<Option<HostProfile>> = std::sync::Mutex::new(None);
+
+#[derive(Default)]
+struct HostProfile {
+    open: Option<(String, std::time::Instant)>,
+    sites: std::collections::HashMap<String, (usize, f64)>,
+}
+
+impl HostProfile {
+    fn mark(&mut self, next: Option<String>) {
+        let now = std::time::Instant::now();
+        if let Some((site, t)) = self.open.take() {
+            let e = self.sites.entry(site).or_default();
+            e.0 += 1;
+            e.1 += (now - t).as_secs_f64();
+        }
+        self.open = next.map(|n| (n, now));
+    }
+}
+
+/// Starts charging host time to launch sites (see `HOST`).
+pub fn host_profile_start() {
+    *HOST.lock().unwrap() = Some(HostProfile::default());
+}
+
+/// Charges the open site up to now and stops charging until the next
+/// launch; call it before a blocking readback so the wait isn't charged.
+pub fn host_profile_cut() {
+    if let Some(h) = HOST.lock().unwrap().as_mut() {
+        h.mark(None);
+    }
+}
+
+/// (site, launches, total host s), most expensive first; stops the
+/// host profile.
+pub fn host_profile_take() -> Vec<(String, usize, f64)> {
+    let mut h = HOST.lock().unwrap().take().expect("host_profile_start first");
+    h.mark(None);
+    let mut v: Vec<_> = h.sites.into_iter().map(|(k, (n, t))| (k, n, t)).collect();
+    v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    v
 }
 
 /// Per-launch-site GPU time from device timestamps, for finding slow
@@ -90,7 +151,12 @@ pub fn profile_take() -> Vec<(String, usize, f64)> {
     v
 }
 
-/// The first discrete GPU, on Vulkan. Never falls back to the iGPU or CPU:
+/// The first discrete GPU, on Vulkan, or DX12 with `WGPU_BACKEND=dx12` (as
+/// `gpu.rs`). DX12 needs DXC (`dxcompiler.dll` on PATH, e.g. the Windows
+/// SDK's `bin/<ver>/x64`): without it wgpu silently falls back to FXC,
+/// whose shaders ran the step ~170× slower, so that panics here. cubecl
+/// submits every `SUBMIT_TASKS` launches unless `CUBECL_WGPU_MAX_TASKS`
+/// says otherwise. Never falls back to the iGPU or CPU:
 /// cubecl panics with "No Discrete GPU device found" if there's none, and
 /// its `CUBECL_WGPU_DEFAULT_DEVICE` override only applies to the default
 /// device kind, not this one. Logs the adapter once. Cached: cubecl
@@ -98,7 +164,18 @@ pub fn profile_take() -> Vec<(String, usize, f64)> {
 pub fn client() -> &'static Client {
     CLIENT.get_or_init(|| {
         let device = WgpuDevice::new(WgpuDeviceKind::DiscreteGpu(0));
-        let setup = init_setup::<Vulkan>(&device, RuntimeOptions::default());
+        let dx12 = std::env::var("WGPU_BACKEND").is_ok_and(|b| b.eq_ignore_ascii_case("dx12"));
+        let mut options = RuntimeOptions::default();
+        if std::env::var_os("CUBECL_WGPU_MAX_TASKS").is_none() {
+            options.tasks_max = SUBMIT_TASKS;
+        }
+        let setup = if dx12 {
+            let on_path = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("dxcompiler.dll").is_file()));
+            assert!(on_path, "WGPU_BACKEND=dx12 needs dxcompiler.dll on PATH (Windows SDK bin/<ver>/x64); without it wgpu falls back to FXC");
+            init_setup::<Dx12>(&device, options)
+        } else {
+            init_setup::<Vulkan>(&device, options)
+        };
         let info = setup.adapter.get_info();
         eprintln!("gpu_step: {} ({:?}, {:?}, driver {})", info.name, info.device_type, setup.backend, info.driver_info);
         <WgpuRuntime>::client(&device)

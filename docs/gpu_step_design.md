@@ -13,9 +13,11 @@ device step trains like the CPU tape and takes ~9.5 ms on an idle eGPU,
 ~14× under the kill criterion.** Parallel row reductions then halved it
 to ~4.6 ms (milestone 5, "Row reductions"), and split-k matmuls to
 ~3.3 ms (milestone 5, "Split-k"). Head views then cut 32 launches and
-0.3 ms of kernel time but left the wall step at ~3.35 ms: the remaining
-floor is host- or driver-side (milestone 5, "Head views"). Next: find
-that floor, then milestone 6 (optional).
+0.3 ms of kernel time (milestone 5, "Head views"). With a free CPU, the
+step is bounded by host queueing and the per-step loss readback: steps
+pipelined (loss read every N steps) take **~1.5 ms on DX12, ~2.0 ms on
+Vulkan** (milestone 5, "Host side and backends"). Next: milestone 6
+(optional).
 
 ## What the evidence says
 
@@ -437,7 +439,10 @@ Each milestone leaves a runnable check behind.
      | head views | 3.38 / 3.41 / 3.47 / 3.74 | 3.36 |
 
      **Negative result: the ~1 ms between wall step and kernel time is
-     not per-dispatch GPU cost.** Cutting 32 dispatches and 0.3 ms of
+     not per-dispatch GPU cost.** (The rest of this paragraph was measured
+     with a CPU-loaded host and is partly wrong: see "Host side and
+     backends" below. The readback does cost ~1.3 ms once the host is
+     fast.) Cutting 32 dispatches and 0.3 ms of
      kernels left the floor at ~3.35 ms, and the gap grew to ~1.2 ms. It
      isn't the loss readback either: `gpu_train_check ... time` now also
      runs the steps pipelined (one readback at the end), and that is no
@@ -448,6 +453,54 @@ Each milestone leaves a runnable check behind.
      allocation path, or the driver). Next: one device-timestamp window
      around a whole step (GPU span vs wall), then a host-side look at
      where the 1.7 ms of queueing goes.
+   - **Host side and backends (done 2026-09-25).**
+     - **Host profiler.** `gpu_step::host_profile_start` charges the host
+       time from one launch's `count_launch` to the next to the first
+       (`gpu_train_check 0 101 host`). A plain launch costs ~2 µs of host
+       time on Vulkan with a free CPU and 7–9 µs with other jobs loading
+       it. cubecl-wgpu submits a command buffer every
+       `CUBECL_WGPU_MAX_TASKS` launches (default 32), and each submit
+       costs ~60 µs more: the launch that triggers it stands out in the
+       profile.
+     - **Method flaw found.** The earlier "idle" runs only checked the
+       eGPU's process list. Other sessions' CPU-heavy jobs had the host
+       3–4× slower, so the step was host-bound (queueing ~1.7 ms), and
+       pipelining couldn't help. For a host-bound step, CPU load matters
+       as much as GPU contention.
+     - **Sweep** (plain, 201 steps, 4 interleaved rounds; rounds 2–4
+       clean: no other eGPU users, CPU ~7%; medians, ms/step):
+
+       | backend, submit size | synced | pipelined | host queueing (best) |
+       |---|---|---|---|
+       | Vulkan 16 | 3.8 | 3.0 | 0.76 |
+       | Vulkan 32 (cubecl default) | 3.25 | 2.35 | 0.68 |
+       | Vulkan 64 | 3.2 | 2.08 | 0.71 |
+       | Vulkan 128 | 3.19 | 1.97 | 0.62 |
+       | Vulkan 512 | 3.23 | 1.86 | 0.37 |
+       | DX12 32 | 3.06 | 1.63 | 1.05 |
+       | DX12 64 | 3.67 | 1.56 | 1.08 |
+       | DX12 128 | 3.8 | 1.53 | 1.10 |
+
+     - **Readings.**
+       - Reading the loss every step costs ~1.3 ms, the USB4 round trip:
+         synced steps sit at ~3.2 ms on every setting. A training loop
+         should read the loss every N steps.
+       - Pipelined, DX12 beats Vulkan's best (1.53 vs 1.86 ms), although
+         its host cost per launch is higher (~6 vs ~2 µs). Vulkan loses
+         on the GPU side of each submission, which fits raw wgpu's
+         earlier result (DX12 ahead on short dispatches).
+       - Bigger submits help Vulkan's pipelined throughput (2.35 → 1.86)
+         but start the GPU later when a step ends in a readback.
+       - The profiler's 2.16 ms kernel total exceeds the 1.53 ms
+         pipelined step, so per-window timestamps overstate kernel time
+         (each window is its own pass) or consecutive dispatches overlap.
+     - **Changes.** `client()` submits every 128 launches (`SUBMIT_TASKS`;
+       the env var still overrides). Vulkan stays the default: it's the
+       route to matrix cores (milestone 6). `WGPU_BACKEND=dx12` selects
+       DX12 and panics unless `dxcompiler.dll` is on PATH. Without DXC,
+       wgpu silently uses FXC, whose shaders ran the step at ~577 ms
+       (~170× slower), with no error. All 10 GPU tests pass on both
+       backends (DX12 with the SDK 10.0.26100 DXC 1.8).
    - **Negative result: a sync-after-every-launch profiler didn't work.**
      Its step ran at ~70–100 ms. The ~0.5 ms round trip charged to each
      launch swamped the kernels, so it couldn't rank them. Device

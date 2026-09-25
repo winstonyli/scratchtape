@@ -1,6 +1,6 @@
 // Milestone 5 of docs/gpu_step_design.md: does the device tape train like
 // the CPU tape, and is its step faster?
-//   gpu_train_check [softmax1 0|1] [steps=200] [control [index] | time | profile]
+//   gpu_train_check [softmax1 0|1] [steps=200] [control [index] | time | profile | host]
 // training_recipe_check's setup (tiny_lm, batch 8, lr 0.3, seed 1): the
 // same init and the same batches go to both tapes, in lockstep. Prints
 // both training losses as it goes, then both models' train-probe and
@@ -17,12 +17,14 @@
 // the step time when steps are pipelined (no readback until the last
 // step, as a training loop that logs the loss rarely would run). `profile` does the
 // same with gpu_step's device-timestamp profiler on and prints each launch
-// site's GPU time per step.
+// site's GPU time per step. `host` does the same with the host-side
+// profiler (gpu_step::host_profile_start): host time per launch site
+// while queueing a step, readback excluded.
 // Holds an exclusive GPU lease; runs at Normal CPU priority (LONG_RUNS.md:
 // a BelowNormal GPU feeder starves under load).
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
-use scratchtape::gpu_step::{DeviceParams, LAUNCHES, client, pack, profile_start, profile_take, read_f32};
+use scratchtape::gpu_step::{DeviceParams, LAUNCHES, client, host_profile_cut, host_profile_start, host_profile_take, pack, profile_start, profile_take, read_f32};
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::{Tape, Var};
@@ -160,7 +162,8 @@ fn main() {
     let dev = DeviceParams::upload(&pack(&m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj));
     println!("gpu_train_check: pid {} softmax1={softmax1} batch={BATCH} lr={LR} steps={steps}", std::process::id());
     let profile = args.get(3).is_some_and(|a| a == "profile");
-    if profile || args.get(3).is_some_and(|a| a == "time") {
+    let host = args.get(3).is_some_and(|a| a == "host");
+    if profile || host || args.get(3).is_some_and(|a| a == "time") {
         let mut batches = |n: usize| -> Vec<(Vec<usize>, Vec<usize>)> {
             (0..n)
                 .map(|_| {
@@ -188,12 +191,17 @@ fn main() {
             let t0 = Instant::now();
             let loss = queue_step(input, target);
             let queued = t0.elapsed().as_secs_f64();
+            if host {
+                host_profile_cut();
+            }
             let gl = read_f32(&loss);
             if step > 0 {
                 t.push(t0.elapsed().as_secs_f64());
                 t_queue.push(queued);
             } else if profile {
                 profile_start(); // after compilation
+            } else if host {
+                host_profile_start();
             }
             assert!(gl.is_finite(), "GPU loss diverged at step {step}");
         }
@@ -206,9 +214,18 @@ fn main() {
             }
             println!("GPU time, all launches: {:.2} ms/step", per(total));
         }
+        if host {
+            let sites = host_profile_take();
+            let per = |x: f64| x * 1e3 / (steps - 1) as f64;
+            let total: f64 = sites.iter().map(|s| s.2).sum();
+            for (site, n, secs) in sites {
+                println!("{:>7.3} ms/step {:>5.1}%  {:>3} launches/step  {:>5.1} us each  {site}", per(secs), 100.0 * secs / total, n / (steps - 1), secs * 1e6 / n as f64);
+            }
+            println!("host time, all launches: {:.2} ms/step", per(total));
+        }
         let ((b, m), (qb, qm)) = (summary(t), summary(t_queue));
         println!("gpu only, {steps} steps back to back: step ms best {b:.2} / median {m:.2}; host queueing best {qb:.2} / median {qm:.2}");
-        if !profile {
+        if !profile && !host {
             let mut runs = vec![];
             for _ in 0..3 {
                 let batches = batches(steps);

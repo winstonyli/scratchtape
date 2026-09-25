@@ -1062,7 +1062,16 @@ because raw forgetting deltas hid a floor effect.
     launches, kernel time 2.16 ms. **The wall step stayed ~3.35 ms**, and
     pipelining steps (no per-step readback) doesn't help either, so the
     remaining ~1.2 ms gap is host- or driver-side serialization, not
-    per-launch GPU cost. Finding it is the next step.
+    per-launch GPU cost. Finding it is the next step. (Corrected below:
+    that run's host was slowed by other jobs' CPU load.)
+  - **Host side and backends (2026-09-25).** With a free CPU the step is
+    bounded by host queueing and the per-step loss readback (~1.3 ms over
+    USB4). Pipelined (loss read every N steps), a step takes **~1.5 ms on
+    DX12 and ~2.0 ms on Vulkan**, ~150× the CPU tape. `gpu_step` now
+    submits every 128 launches (cubecl's default of 32 cost ~60 µs of
+    host time per submit), and `WGPU_BACKEND=dx12` selects DX12 but
+    requires `dxcompiler.dll` on PATH: without DXC, wgpu silently uses
+    FXC and the step runs ~170× slower. Vulkan stays the default.
   Details: `docs/gpu_step_design.md`, milestone 5.
   The CPU tape stays a separate reference rather than
   running the GPU's cubecl kernels on the CPU. A single cubecl source for
