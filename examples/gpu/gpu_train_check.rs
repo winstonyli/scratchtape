@@ -12,7 +12,10 @@
 // the GPU's drift (its ReLUs disagree with the CPU's on a unit or so a
 // step; see device_training_tracks_cpu_over_steps).
 // `time` runs GPU steps only, back to back (no CPU step in between to let
-// the GPU clock down), and reports best/median step ms. `profile` does the
+// the GPU clock down), and reports best/median step ms, how much of the
+// step the host spends queueing it (before the loss readback blocks), and
+// the step time when steps are pipelined (no readback until the last
+// step, as a training loop that logs the loss rarely would run). `profile` does the
 // same with gpu_step's device-timestamp profiler on and prints each launch
 // site's GPU time per step.
 // Holds an exclusive GPU lease; runs at Normal CPU priority (LONG_RUNS.md:
@@ -158,23 +161,37 @@ fn main() {
     println!("gpu_train_check: pid {} softmax1={softmax1} batch={BATCH} lr={LR} steps={steps}", std::process::id());
     let profile = args.get(3).is_some_and(|a| a == "profile");
     if profile || args.get(3).is_some_and(|a| a == "time") {
-        let mut t = vec![];
-        for step in 0..steps {
-            let (mut input, mut target) = (Vec::with_capacity(BATCH * SEQ_LEN), Vec::with_capacity(BATCH * SEQ_LEN));
-            for _ in 0..BATCH {
-                let (i, t) = sample_window(&mut rng, train, SEQ_LEN);
-                input.extend(i);
-                target.extend(t);
-            }
-            let t0 = Instant::now();
+        let mut batches = |n: usize| -> Vec<(Vec<usize>, Vec<usize>)> {
+            (0..n)
+                .map(|_| {
+                    let (mut input, mut target) = (Vec::with_capacity(BATCH * SEQ_LEN), Vec::with_capacity(BATCH * SEQ_LEN));
+                    for _ in 0..BATCH {
+                        let (i, t) = sample_window(&mut rng, train, SEQ_LEN);
+                        input.extend(i);
+                        target.extend(t);
+                    }
+                    (input, target)
+                })
+                .collect()
+        };
+        // Queues one step; returns the loss's handle without reading it.
+        let queue_step = |input: &[usize], target: &[usize]| {
             dev.zero_grads();
             let mut dt = DeviceTape::new(&dev);
-            let (_, _, dloss) = model_forward(&mut dt, &cfg, &input, &target, BATCH);
+            let (_, _, dloss) = model_forward(&mut dt, &cfg, input, target, BATCH);
             dt.backward(dloss);
             dev.sgd(LR);
-            let gl = read_f32(dt.value(dloss));
+            dt.value(dloss).clone()
+        };
+        let (mut t, mut t_queue) = (vec![], vec![]);
+        for (step, (input, target)) in batches(steps).iter().enumerate() {
+            let t0 = Instant::now();
+            let loss = queue_step(input, target);
+            let queued = t0.elapsed().as_secs_f64();
+            let gl = read_f32(&loss);
             if step > 0 {
                 t.push(t0.elapsed().as_secs_f64());
+                t_queue.push(queued);
             } else if profile {
                 profile_start(); // after compilation
             }
@@ -189,8 +206,23 @@ fn main() {
             }
             println!("GPU time, all launches: {:.2} ms/step", per(total));
         }
-        let (b, m) = summary(t);
-        println!("gpu only, {steps} steps back to back: step ms best {b:.2} / median {m:.2}");
+        let ((b, m), (qb, qm)) = (summary(t), summary(t_queue));
+        println!("gpu only, {steps} steps back to back: step ms best {b:.2} / median {m:.2}; host queueing best {qb:.2} / median {qm:.2}");
+        if !profile {
+            let mut runs = vec![];
+            for _ in 0..3 {
+                let batches = batches(steps);
+                let t0 = Instant::now();
+                let mut loss = None;
+                for (input, target) in &batches {
+                    loss = Some(queue_step(input, target));
+                }
+                assert!(read_f32(&loss.unwrap()).is_finite(), "GPU loss diverged");
+                runs.push(t0.elapsed().as_secs_f64() / steps as f64);
+            }
+            let (b, m) = summary(runs);
+            println!("pipelined, {steps} steps, one readback, 3 runs: step ms best {b:.2} / median {m:.2}");
+        }
         return;
     }
     println!("columns: step | cpu loss | gpu loss | gpu - cpu");

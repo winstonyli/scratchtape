@@ -12,7 +12,10 @@ parity with the CPU tape).** **Milestone 5 done the same day: the
 device step trains like the CPU tape and takes ~9.5 ms on an idle eGPU,
 ~14× under the kill criterion.** Parallel row reductions then halved it
 to ~4.6 ms (milestone 5, "Row reductions"), and split-k matmuls to
-~3.3 ms (milestone 5, "Split-k"). Next: milestone 6 (optional).
+~3.3 ms (milestone 5, "Split-k"). Head views then cut 32 launches and
+0.3 ms of kernel time but left the wall step at ~3.35 ms: the remaining
+floor is host- or driver-side (milestone 5, "Head views"). Next: find
+that floor, then milestone 6 (optional).
 
 ## What the evidence says
 
@@ -175,9 +178,11 @@ Each milestone leaves a runnable check behind.
      `gpu_step::tokens` has Embed (token + position; backward is one
      ordered reduction per table, no atomics) and CrossEntropy (per-row
      logsumexp, then one unit sums the mean; backward is the closed form
-     (softmax − onehot)/rows). `gpu_step::heads` has split/merge heads,
+     (softmax − onehot)/rows). `gpu_step::heads` had split/merge heads,
      each the other's backward; merge writes or accumulates at a column
-     offset, so dQ/dK/dV merge straight into dQKV. The matmul epilogue
+     offset, so dQ/dK/dV merge straight into dQKV. (Removed later the same
+     day: the matmul addresses heads in place; milestone 5, "Head
+     views".) The matmul epilogue
      gained the ReLU backward mask. Checks (ignored; GPU):
      `embed_matches_cpu_tape` (forward exact, repeated and unused ids),
      `cross_entropy_matches_cpu_tape` (plus finite differences),
@@ -201,7 +206,8 @@ Each milestone leaves a runnable check behind.
    the CPU tape to 1e-4 relative.
    - `gpu_step::tape::DeviceTape` is option C as designed: it records
      coarse ops (Embed, LayerNorm, Linear with bias/ReLU/residual,
-     split/merge heads, batched matmul, causal softmax, CrossEntropy)
+     split/merge heads (since replaced by head views, milestone 5),
+     batched matmul, causal softmax, CrossEntropy)
      with their device values, and `backward` walks them in reverse,
      calling the milestone-2 kernels. Parameter gradients accumulate
      into the flat buffer. Activation gradients are allocated on first
@@ -402,9 +408,46 @@ Each milestone leaves a runnable check behind.
      The wall step (~3.3 ms) is now ~1 ms above kernel time, so launch
      and submit overhead matters again: with 209 launches, the DX12
      comparison (milestone 6) and fusing the split sums into a following
-     kernel are the next levers. Checks: new matmul test cases (split 6,
+     kernel are the next levers (but see "Head views": the gap turned out
+     not to be per-launch). Checks: new matmul test cases (split 6,
      split 8, and split 4 with a ragged last slice); dropping the first
      partial from the sum fails the test (error 50 at scale 109).
+   - **Head views (done 2026-09-24).** `MatRef` gained a row stride
+     (`ld`) and a two-level batch offset, matrix z at off + (z / group)·
+     stride + (z % group)·inner, so `MatRef::heads` addresses head h of
+     batch row b in place in a [B·T, cols] buffer. The tape's
+     `batched_matmul` takes a `Layout` (Stacked or Heads) per operand and
+     for its output: scores read Q and K straight from the QKV output,
+     the attention output is written straight into the merged [B·T, D]
+     layout, and backward writes dQ, dK, dV into the QKV gradient (zeroed
+     once, then accumulated). SplitHeads/MergeHeads and `gpu_step::heads`
+     are gone; a block is 9 tape ops, not 13. Checks:
+     `matmul_head_views_match_reference` (Q Kᵀ, P V into the merged
+     layout with +=, Pᵀ dCtx into V's columns); dropping the in-group
+     offset fails it (error 1.16); full-step parity passes unchanged.
+
+     Result: launches 209 → 177 and kernel time 2.45 → **2.16 ms**
+     (profiles back to back, idle). **The wall step didn't move.**
+     Interleaved A/B, 101 plain steps, idle-gated (medians were spoiled
+     by bursty other users the 2 s idle check misses, so best-of):
+
+     | | synced best, 4 runs | pipelined best |
+     |---|---|---|
+     | before (2b4034a) | 3.37 / 3.53 / 3.53 / 3.61 | 3.43 |
+     | head views | 3.38 / 3.41 / 3.47 / 3.74 | 3.36 |
+
+     **Negative result: the ~1 ms between wall step and kernel time is
+     not per-dispatch GPU cost.** Cutting 32 dispatches and 0.3 ms of
+     kernels left the floor at ~3.35 ms, and the gap grew to ~1.2 ms. It
+     isn't the loss readback either: `gpu_train_check ... time` now also
+     runs the steps pipelined (one readback at the end), and that is no
+     faster than syncing every step (3.31 vs 3.38 ms). The host spends
+     ~1.7 ms queueing a step (~10 µs per launch). Pipelining should then
+     give max(host, GPU) ≈ 2.2 ms, not 3.35, so host queueing and GPU
+     execution are serialized somewhere (cubecl's submission or
+     allocation path, or the driver). Next: one device-timestamp window
+     around a whole step (GPU span vs wall), then a host-side look at
+     where the 1.7 ms of queueing goes.
    - **Negative result: a sync-after-every-launch profiler didn't work.**
      Its step ran at ~70–100 ms. The ~0.5 ms round trip charged to each
      launch swamped the kernels, so it couldn't rank them. Device

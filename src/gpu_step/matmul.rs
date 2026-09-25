@@ -6,6 +6,11 @@
 //! - batched over the cube grid's z, each operand with its own per-batch
 //!   stride, and an element offset into its buffer (parameters live in
 //!   one flat buffer);
+//! - operands and output addressed in place as attention heads: a row
+//!   stride, and matrix z at (z / group)·stride + (z % group)·inner, so
+//!   Q, K, V are read straight out of the fused QKV buffer and the
+//!   attention output lands in the merged [B·T, D] layout (no split or
+//!   merge launches);
 //! - an epilogue: + bias[col], ReLU, the ReLU backward mask, + residual,
 //!   and accumulate into out;
 //! - split-k for shapes with too few output tiles to fill the GPU (the
@@ -19,19 +24,37 @@ use std::sync::OnceLock;
 
 /// A matrix inside a device buffer: element offset, per-batch stride (0 to
 /// reuse one matrix for every batch), and whether it's stored transposed
-/// (a logical [r, c] operand stored as [c, r]).
+/// (a logical [r, c] operand stored as [c, r]). Matrix z starts at
+/// off + (z / group)·stride + (z % group)·inner, and its stored rows are
+/// `ld` apart (0: packed, the stored row length).
 #[derive(Clone, Copy)]
 pub struct MatRef<'a> {
     pub h: &'a Handle,
     pub off: usize,
     pub stride: usize,
     pub trans: bool,
+    pub ld: usize,
+    pub group: usize,
+    pub inner: usize,
 }
 
 impl<'a> MatRef<'a> {
     /// The whole buffer from 0, one batch, not transposed.
     pub fn new(h: &'a Handle) -> Self {
-        Self { h, off: 0, stride: 0, trans: false }
+        Self { h, off: 0, stride: 0, trans: false, ld: 0, group: 1, inner: 0 }
+    }
+
+    /// Attention heads in place: matrix z = b·heads + h is rows b·t ..
+    /// b·t + t, columns col0 + h·width .. + width, of a row-major
+    /// [B·t, cols] buffer.
+    pub fn heads(h: &'a Handle, col0: usize, cols: usize, t: usize, heads: usize, width: usize) -> Self {
+        Self { off: col0, stride: t * cols, ld: cols, group: heads, inner: width, ..Self::new(h) }
+    }
+
+    /// (group, inner, ld) as kernel arguments; `packed` is the stored row
+    /// length when ld is 0.
+    fn layout(&self, packed: usize) -> (u32, u32, u32) {
+        (self.group as u32, self.inner as u32, if self.ld == 0 { packed } else { self.ld } as u32)
     }
 }
 
@@ -49,11 +72,13 @@ pub struct Epilogue<'a> {
 }
 
 /// out[z] (+)= epilogue(a[z] @ b[z]) for z in 0..batch, with a[z] logically
-/// [m, k] and b[z] [k, n]; out is row-major [m, n] at `out.off +
-/// z * out.stride` (out.trans must be false). One launch.
+/// [m, k] and b[z] [k, n]; out[z] is row-major [m, n] (out.trans must be
+/// false), addressed as `MatRef` says. One launch, or two when split-k
+/// applies (batch 1, packed out, no epilogue but +=, see `split_count`).
 #[allow(clippy::too_many_arguments)]
 pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usize, n: usize, epi: Epilogue) {
     assert!(!out.trans, "out is stored row-major");
+    let dest = out;
     let dummy = dummy();
     let (bias_h, bias_off) = epi.bias.unwrap_or((dummy, 0));
     let (mask_h, mask_off) = epi.mask.unwrap_or((dummy, 0));
@@ -61,16 +86,20 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
     let tiles = n.div_ceil(64) * m.div_ceil(64);
     let k_blocks = k.div_ceil(16);
     let epi_free = epi.bias.is_none() && !epi.relu && epi.mask.is_none() && epi.residual.is_none();
-    let splits = if batch == 1 && epi_free { split_count(tiles, k_blocks) } else { 1 };
+    let splits = if batch == 1 && epi_free && out.ld == 0 { split_count(tiles, k_blocks) } else { 1 };
     let slice_blocks = k_blocks.div_ceil(splits);
     let count = CubeCount::Static((n as u32).div_ceil(64), (m as u32).div_ceil(64), (batch * splits) as u32);
     let u = |x: usize| x as u32;
     // Split: each slice writes its own [m, n] partial, no epilogue.
     let scratch = (splits > 1).then(|| client().empty(splits * m * n * 4));
-    let (out_h, out_off, out_stride, accumulate) = match &scratch {
-        Some(h) => (h, 0, m * n, false),
-        None => (out.h, out.off, out.stride, epi.accumulate),
+    let out = match &scratch {
+        Some(h) => MatRef { stride: m * n, ..MatRef::new(h) },
+        None => out,
     };
+    let accumulate = epi.accumulate && scratch.is_none();
+    let (ag, ai, lda) = a.layout(if a.trans { m } else { k });
+    let (bg, bi, ldb) = b.layout(if b.trans { k } else { n });
+    let (og, oi, ldo) = out.layout(n);
     super::count_launch_as(|| {
         let t = |x: bool| if x { "T" } else { "N" };
         let ops = [(epi.bias.is_some(), " +bias"), (epi.relu, " relu"), (epi.mask.is_some(), " mask"), (epi.residual.is_some(), " +res"), (epi.accumulate, " +=")];
@@ -83,7 +112,7 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
         CubeDim::new_2d(16, 16),
         whole(a.h),
         whole(b.h),
-        whole(out_h),
+        whole(out.h),
         whole(bias_h),
         whole(mask_h),
         whole(res_h),
@@ -94,10 +123,19 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
         u(splits),
         u(a.off),
         u(a.stride),
+        ag,
+        ai,
+        lda,
         u(b.off),
         u(b.stride),
-        u(out_off),
-        u(out_stride),
+        bg,
+        bi,
+        ldb,
+        u(out.off),
+        u(out.stride),
+        og,
+        oi,
+        ldo,
         u(bias_off),
         u(mask_off),
         u(res_off),
@@ -112,7 +150,7 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
     if let Some(partial) = &scratch {
         let len = m * n;
         super::count_launch_as(|| format!("split-k sum {splits}x[{m}x{n}]"));
-        k_split_sum::launch(client(), CubeCount::Static((len as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), whole(partial), whole(out.h), u(len), u(splits), u(out.off), epi.accumulate);
+        k_split_sum::launch(client(), CubeCount::Static((len as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), whole(partial), whole(dest.h), u(len), u(splits), u(dest.off), epi.accumulate);
     }
 }
 
@@ -176,10 +214,19 @@ fn k_matmul(
     splits: u32,
     a_off: u32,
     a_stride: u32,
+    a_group: u32,
+    a_inner: u32,
+    lda: u32,
     b_off: u32,
     b_stride: u32,
+    b_group: u32,
+    b_inner: u32,
+    ldb: u32,
     o_off: u32,
     o_stride: u32,
+    o_group: u32,
+    o_inner: u32,
+    ldo: u32,
     bias_off: u32,
     mask_off: u32,
     res_off: u32,
@@ -202,8 +249,9 @@ fn k_matmul(
     let kb1 = u32::min(kb0 + slice_blocks, k.div_ceil(16));
     let row0 = CUBE_POS_Y * 64;
     let col0 = CUBE_POS_X * 64;
-    let a0 = a_off + zb * a_stride;
-    let b0 = b_off + zb * b_stride;
+    let a0 = a_off + (zb / a_group) * a_stride + (zb % a_group) * a_inner;
+    let b0 = b_off + (zb / b_group) * b_stride + (zb % b_group) * b_inner;
+    let o0 = (z / o_group) * o_stride + (z % o_group) * o_inner;
     let mut a_s = Shared::<[f32]>::new_slice(1024usize);
     let mut b_s = Shared::<[f32]>::new_slice(1024usize);
     let mut acc = Array::<f32>::new(16usize);
@@ -227,9 +275,9 @@ fn k_matmul(
             let gk = kk * 16 + c;
             let mut v = 0.0f32;
             if gm < m && gk < k {
-                let mut idx = gm * k + gk;
+                let mut idx = gm * lda + gk;
                 if trans_a {
-                    idx = gk * m + gm;
+                    idx = gk * lda + gm;
                 }
                 v = a[(a0 + idx) as usize];
             }
@@ -245,9 +293,9 @@ fn k_matmul(
             let gn = col0 + bc;
             let mut w = 0.0f32;
             if gk2 < k && gn < n {
-                let mut idx = gk2 * n + gn;
+                let mut idx = gk2 * ldb + gn;
                 if trans_b {
-                    idx = gn * k + gk2;
+                    idx = gn * ldb + gk2;
                 }
                 w = b[(b0 + idx) as usize];
             }
@@ -287,7 +335,7 @@ fn k_matmul(
                         v = 0.0;
                     }
                 }
-                let idx = z * o_stride + gm * n + gn;
+                let idx = o0 + gm * ldo + gn;
                 if has_mask {
                     if mask[(mask_off + idx) as usize] <= 0.0 {
                         v = 0.0;
@@ -392,7 +440,7 @@ mod tests {
 
             let (ah, bh, bias_h, mask_h, res_h, oh) = (upload(&a), upload(&b), upload(&bias), upload(&mask), upload(&res), upload(&out0));
             let epi = Epilogue { bias: has_bias.then_some((&bias_h, bias_off)), relu, mask: has_mask.then_some((&mask_h, m_off)), residual: has_res.then_some((&res_h, r_off)), accumulate: acc };
-            matmul(MatRef { h: &ah, off: a_off, stride: sa, trans: ta }, MatRef { h: &bh, off: b_off, stride: sb, trans: tb }, MatRef { h: &oh, off: o_off, stride: so, trans: false }, batch, m, k, n, epi);
+            matmul(MatRef { off: a_off, stride: sa, trans: ta, ..MatRef::new(&ah) }, MatRef { off: b_off, stride: sb, trans: tb, ..MatRef::new(&bh) }, MatRef { off: o_off, stride: so, trans: false, ..MatRef::new(&oh) }, batch, m, k, n, epi);
             let got = read(&oh);
             let scale = want.iter().fold(0.0f32, |s, v| s.max(v.abs()));
             let err = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
@@ -401,5 +449,67 @@ mod tests {
             // Also covers the padding between batches and before the offset.
             assert!(err <= 1e-5 * scale, "{case}: max err {err} (scale {scale})");
         }
+    }
+
+    /// Needs the discrete GPU. Head views (`MatRef::heads`) against plain
+    /// loops, B 2, H 3, t 5, width 4, in a fused [B·t, 3·H·w] buffer:
+    /// scores = Q Kᵀ into a stacked out; ctx += P V into the merged
+    /// [B·t, H·w] layout; dV += Pᵀ dCtx, a transposed stacked operand times
+    /// a head view, into V's columns of the fused buffer.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn matmul_head_views_match_reference() {
+        let (bsz, heads, t, w) = (2, 3, 5, 4);
+        let (hw, fused) = (heads * w, 3 * heads * w);
+        let batch = bsz * heads;
+        let mut rng = Rng::new(9);
+        let mut gauss = |len: usize| -> Vec<f32> { (0..len).map(|_| rng.next_gaussian()).collect() };
+        let (qkv, p, ctx0, dctx) = (gauss(bsz * t * fused), gauss(batch * t * t), gauss(bsz * t * hw), gauss(bsz * t * hw));
+        // Element (i, j) of head matrix z at column col0 of a [B·t, cols] buffer.
+        let at = |cols: usize, col0: usize, z: usize, i: usize, j: usize| (z / heads * t + i) * cols + col0 + z % heads * w + j;
+        let (qh, ph, dh) = (upload(&qkv), upload(&p), upload(&dctx));
+        let err = |got: &[f32], want: &[f32]| {
+            let scale = want.iter().fold(0.0f32, |s, v| s.max(v.abs()));
+            got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max) / scale
+        };
+
+        let mut want = vec![0.0f32; batch * t * t];
+        for z in 0..batch {
+            for i in 0..t {
+                for j in 0..t {
+                    want[(z * t + i) * t + j] = (0..w).map(|c| qkv[at(fused, 0, z, i, c)] * qkv[at(fused, hw, z, j, c)]).sum();
+                }
+            }
+        }
+        let sh = client().empty(want.len() * 4);
+        matmul(MatRef::heads(&qh, 0, fused, t, heads, w), MatRef { trans: true, ..MatRef::heads(&qh, hw, fused, t, heads, w) }, MatRef { stride: t * t, ..MatRef::new(&sh) }, batch, t, w, t, Epilogue::default());
+        let e = err(&read(&sh), &want);
+        assert!(e < 1e-5, "scores: {e}");
+
+        let mut want = ctx0.clone();
+        for z in 0..batch {
+            for i in 0..t {
+                for j in 0..w {
+                    want[at(hw, 0, z, i, j)] += (0..t).map(|c| p[(z * t + i) * t + c] * qkv[at(fused, 2 * hw, z, c, j)]).sum::<f32>();
+                }
+            }
+        }
+        let ch = upload(&ctx0);
+        matmul(MatRef { stride: t * t, ..MatRef::new(&ph) }, MatRef::heads(&qh, 2 * hw, fused, t, heads, w), MatRef::heads(&ch, 0, hw, t, heads, w), batch, t, t, w, Epilogue { accumulate: true, ..Default::default() });
+        let e = err(&read(&ch), &want);
+        assert!(e < 1e-5, "ctx: {e}");
+
+        let mut want = qkv.clone();
+        for z in 0..batch {
+            for i in 0..t {
+                for j in 0..w {
+                    want[at(fused, 2 * hw, z, i, j)] += (0..t).map(|c| p[(z * t + c) * t + i] * dctx[at(hw, 0, z, c, j)]).sum::<f32>();
+                }
+            }
+        }
+        let gh = upload(&qkv);
+        matmul(MatRef { stride: t * t, trans: true, ..MatRef::new(&ph) }, MatRef::heads(&dh, 0, hw, t, heads, w), MatRef::heads(&gh, 2 * hw, fused, t, heads, w), batch, t, t, w, Epilogue { accumulate: true, ..Default::default() });
+        let e = err(&read(&gh), &want);
+        assert!(e < 1e-5, "dV: {e}");
     }
 }

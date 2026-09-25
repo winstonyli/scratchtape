@@ -10,7 +10,6 @@
 //!   passes its gradient through by aliasing the buffer: in reverse order
 //!   every consumer of that buffer has already run, so later accumulation
 //!   into it can't corrupt anything still needed.
-use super::heads::{merge_heads, split_heads};
 use super::matmul::{Epilogue, MatRef, matmul};
 use super::rows::{LnOut, col_sum, layer_norm, layer_norm_backward, softmax, softmax_backward};
 use super::tokens::{CeOut, cross_entropy, cross_entropy_backward, embed, embed_backward, upload_ids};
@@ -31,13 +30,21 @@ enum Op {
     LayerNorm { x: usize, fwd: LnOut, off: usize },
     /// y = act(x @ W + b) (+ residual). W [inp, out] at w_off, b right after.
     Linear { x: usize, inp: usize, w_off: usize, relu: bool, residual: Option<usize> },
-    /// Columns col0.. of x [B·T, cols] as [B·H·T, width].
-    SplitHeads { x: usize, cols: usize, col0: usize, heads: usize, width: usize, batch: usize, t: usize },
-    MergeHeads { x: usize, heads: usize, width: usize, batch: usize, t: usize },
-    /// c[z] = a[z] @ b[z] (b stored transposed if trans_b), z < batch.
-    BatchedMatmul { a: usize, b: usize, batch: usize, m: usize, k: usize, n: usize, trans_b: bool },
+    /// c[z] = a[z] @ b[z] (b stored transposed if trans_b), z < batch,
+    /// each operand and c laid out in its node as its `Layout` says.
+    BatchedMatmul { a: usize, b: usize, lay: [Layout; 3], batch: usize, m: usize, k: usize, n: usize, trans_b: bool },
     Softmax { x: usize, scale: f32 },
     CrossEntropy { logits: usize, targets: Handle, fwd: CeOut, vocab: usize },
+}
+
+/// Where a batched matmul's matrices sit in a node's [rows, cols] buffer.
+#[derive(Clone, Copy, Debug)]
+pub enum Layout {
+    /// Stacked: matrix z is rows z·r .. z·r + r.
+    Stacked,
+    /// Attention heads in place (`MatRef::heads`): matrix z = b·heads + h
+    /// is columns col0 + h·width .. + width of rows b·t .. b·t + t.
+    Heads { col0: usize, heads: usize, width: usize },
 }
 
 struct Node {
@@ -104,36 +111,41 @@ impl<'p> DeviceTape<'p> {
         let y = client().empty(rows * out * 4);
         let p = &self.params.params;
         let epi = Epilogue { bias: Some((p, w_off + inp * out)), relu, residual: residual.map(|r| (self.value(r), 0)), ..Default::default() };
-        let w = MatRef { h: p, off: w_off, stride: 0, trans: false };
+        let w = MatRef { off: w_off, stride: 0, trans: false, ..MatRef::new(p) };
         matmul(MatRef::new(self.value(x)), w, MatRef::new(&y), 1, rows, inp, out, epi);
         self.push(y, rows, out, Op::Linear { x: x.0, inp, w_off, relu, residual: residual.map(|r| r.0) })
     }
 
-    pub fn split_heads(&mut self, x: DVar, col0: usize, heads: usize, width: usize, batch: usize) -> DVar {
-        let (rows, cols) = self.shape(x);
-        let t = rows / batch;
-        let y = split_heads(self.value(x), cols, col0, heads, width, batch, t);
-        self.push(y, rows * heads, width, Op::SplitHeads { x: x.0, cols, col0, heads, width, batch, t })
+    /// out[z] = a[z] @ b[z] (b[z] used transposed if trans_b) for z in
+    /// 0..batch, each matrix found in its node through its `Layout`; out is
+    /// a new node, laid out as `out` says (Heads needs col0 0: the node is
+    /// exactly the heads' columns). One launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_matmul(&mut self, a: DVar, a_lay: Layout, b: DVar, b_lay: Layout, batch: usize, trans_b: bool, out: Layout) -> DVar {
+        let ((m, k), (br, bc)) = (self.mat_shape(a.0, a_lay, batch), self.mat_shape(b.0, b_lay, batch));
+        let n = if trans_b { br } else { bc };
+        assert_eq!(k, if trans_b { bc } else { br }, "inner dimensions");
+        let (rows, cols) = match out {
+            Layout::Stacked => (batch * m, n),
+            Layout::Heads { col0, heads, width } => {
+                assert!(col0 == 0 && width == n);
+                (batch / heads * m, heads * width)
+            }
+        };
+        let y = client().empty(rows * cols * 4);
+        let (av, bv) = (self.value(a), self.value(b));
+        let (ac, bcols) = (self.nodes[a.0].cols, self.nodes[b.0].cols);
+        matmul(view(av, a_lay, ac, m, k, false), view(bv, b_lay, bcols, br, bc, trans_b), view(&y, out, cols, m, n, false), batch, m, k, n, Epilogue::default());
+        self.push(y, rows, cols, Op::BatchedMatmul { a: a.0, b: b.0, lay: [a_lay, b_lay, out], batch, m, k, n, trans_b })
     }
 
-    pub fn merge_heads(&mut self, x: DVar, heads: usize, batch: usize) -> DVar {
-        let (rows, width) = self.shape(x);
-        let t = rows / (batch * heads);
-        let y = client().empty(rows * width * 4);
-        merge_heads(self.value(x), &y, heads * width, 0, heads, width, batch, t, false);
-        self.push(y, batch * t, heads * width, Op::MergeHeads { x: x.0, heads, width, batch, t })
-    }
-
-    /// a and b hold `batch` stacked matrices: a [batch·m, k], b [batch·k, n]
-    /// or, with trans_b, [batch·n, k]. Out [batch·m, n].
-    pub fn batched_matmul(&mut self, a: DVar, b: DVar, batch: usize, trans_b: bool) -> DVar {
-        let ((ar, k), (br, bc)) = (self.shape(a), self.shape(b));
-        let m = ar / batch;
-        let n = if trans_b { br / batch } else { bc };
-        let y = client().empty(batch * m * n * 4);
-        let bref = MatRef { h: self.value(b), off: 0, stride: k * n, trans: trans_b };
-        matmul(MatRef { h: self.value(a), off: 0, stride: m * k, trans: false }, bref, MatRef { h: &y, off: 0, stride: m * n, trans: false }, batch, m, k, n, Epilogue::default());
-        self.push(y, batch * m, n, Op::BatchedMatmul { a: a.0, b: b.0, batch, m, k, n, trans_b })
+    /// The [r, c] of each of node v's `batch` matrices under `lay`.
+    fn mat_shape(&self, v: usize, lay: Layout, batch: usize) -> (usize, usize) {
+        let (rows, cols) = (self.nodes[v].rows, self.nodes[v].cols);
+        match lay {
+            Layout::Stacked => (rows / batch, cols),
+            Layout::Heads { heads, width, .. } => (rows / (batch / heads), width),
+        }
     }
 
     /// Causal softmax (or softmax1) of `scale * x` over attention scores
@@ -221,39 +233,37 @@ impl<'p> DeviceTape<'p> {
                     let out = cols;
                     let xv = self.nodes[x].value.clone();
                     // dW += xᵀ dz, db += colsum(dz)
-                    matmul(MatRef { h: &xv, off: 0, stride: 0, trans: true }, MatRef::new(&dz), MatRef { h: &grads, off: w_off, stride: 0, trans: false }, 1, inp, rows, out, Epilogue { accumulate: true, ..Default::default() });
+                    matmul(MatRef { off: 0, stride: 0, trans: true, ..MatRef::new(&xv) }, MatRef::new(&dz), MatRef { off: w_off, stride: 0, trans: false, ..MatRef::new(&grads) }, 1, inp, rows, out, Epilogue { accumulate: true, ..Default::default() });
                     col_sum(&dz, rows, out, &grads, w_off + inp * out);
                     // dx (+)= dz Wᵀ
                     let (dx, acc) = self.grad_slot(x, true);
-                    matmul(MatRef::new(&dz), MatRef { h: &p, off: w_off, stride: 0, trans: true }, MatRef::new(&dx), 1, rows, out, inp, Epilogue { accumulate: acc, ..Default::default() });
+                    matmul(MatRef::new(&dz), MatRef { off: w_off, stride: 0, trans: true, ..MatRef::new(&p) }, MatRef::new(&dx), 1, rows, out, inp, Epilogue { accumulate: acc, ..Default::default() });
                     if let Some(r) = residual {
                         self.add_grad(r, dz);
                     }
                 }
-                Op::SplitHeads { x, cols: xc, col0, heads, width, batch, t } => {
-                    let (dx, acc) = self.grad_slot(x, false);
-                    merge_heads(&dy.unwrap(), &dx, xc, col0, heads, width, batch, t, acc);
-                }
-                Op::MergeHeads { x, heads, width, batch, t } => {
-                    let dx = split_heads(&dy.unwrap(), heads * width, 0, heads, width, batch, t);
-                    self.add_grad(x, dx);
-                }
-                Op::BatchedMatmul { a, b, batch, m, k, n, trans_b } => {
+                Op::BatchedMatmul { a, b, lay: [a_lay, b_lay, c_lay], batch, m, k, n, trans_b } => {
                     let dc = dy.unwrap();
                     let (av, bv) = (self.nodes[a].value.clone(), self.nodes[b].value.clone());
-                    let dcr = MatRef { h: &dc, off: 0, stride: m * n, trans: false };
-                    let (da, acc_a) = self.grad_slot(a, true);
-                    let (db, acc_b) = self.grad_slot(b, true);
-                    let da_ref = MatRef { h: &da, off: 0, stride: m * k, trans: false };
-                    let db_ref = MatRef { h: &db, off: 0, stride: k * n, trans: false };
+                    let (ac, bcols) = (self.nodes[a].cols, self.nodes[b].cols);
+                    let dcr = view(&dc, c_lay, cols, m, n, false);
+                    // A head view covers only some of its node's columns, so
+                    // that gradient starts zeroed and is accumulated into.
+                    let partial = |l: Layout| matches!(l, Layout::Heads { .. });
+                    let (da, acc_a) = self.grad_slot(a, !partial(a_lay));
+                    let (db, acc_b) = self.grad_slot(b, !partial(b_lay));
+                    let (br, bc) = if trans_b { (n, k) } else { (k, n) };
+                    let db_ref = view(&db, b_lay, bcols, br, bc, false);
+                    let (av_ref, bv_ref) = (view(&av, a_lay, ac, m, k, false), view(&bv, b_lay, bcols, br, bc, false));
+                    let da_ref = view(&da, a_lay, ac, m, k, false);
                     if trans_b {
                         // c = a bᵀ, b [n, k]: da = dc b, db = dcᵀ a
-                        matmul(dcr, MatRef { h: &bv, off: 0, stride: n * k, trans: false }, da_ref, batch, m, n, k, Epilogue { accumulate: acc_a, ..Default::default() });
-                        matmul(MatRef { trans: true, ..dcr }, MatRef { h: &av, off: 0, stride: m * k, trans: false }, db_ref, batch, n, m, k, Epilogue { accumulate: acc_b, ..Default::default() });
+                        matmul(dcr, bv_ref, da_ref, batch, m, n, k, Epilogue { accumulate: acc_a, ..Default::default() });
+                        matmul(MatRef { trans: true, ..dcr }, av_ref, db_ref, batch, n, m, k, Epilogue { accumulate: acc_b, ..Default::default() });
                     } else {
                         // c = a b, b [k, n]: da = dc bᵀ, db = aᵀ dc
-                        matmul(dcr, MatRef { h: &bv, off: 0, stride: k * n, trans: true }, da_ref, batch, m, n, k, Epilogue { accumulate: acc_a, ..Default::default() });
-                        matmul(MatRef { h: &av, off: 0, stride: m * k, trans: true }, dcr, db_ref, batch, k, m, n, Epilogue { accumulate: acc_b, ..Default::default() });
+                        matmul(dcr, MatRef { trans: true, ..bv_ref }, da_ref, batch, m, n, k, Epilogue { accumulate: acc_a, ..Default::default() });
+                        matmul(MatRef { trans: true, ..av_ref }, dcr, db_ref, batch, k, m, n, Epilogue { accumulate: acc_b, ..Default::default() });
                     }
                 }
                 Op::Softmax { x, scale } => {
@@ -309,7 +319,9 @@ impl Config {
 
 /// One transformer block, as `TransformerBlock::forward_full` without the
 /// extras (QK-norm, gate, sinks are out of scope for v1). `off` is the
-/// block's `to_flat` start. 13 ops.
+/// block's `to_flat` start. 9 ops: attention reads Q, K and V as head
+/// views of the QKV output and writes its heads straight into the merged
+/// layout.
 pub fn block_forward(tape: &mut DeviceTape, cfg: &Config, x: DVar, off: usize, batch: usize) -> DVar {
     let (d, h, f) = (cfg.d, cfg.heads, cfg.d_ff);
     let dk = d / h;
@@ -320,13 +332,10 @@ pub fn block_forward(tape: &mut DeviceTape, cfg: &Config, x: DVar, off: usize, b
     let ffn2_off = ffn1_off + d * f + f;
     let ln1 = tape.layer_norm(x, off);
     let qkv = tape.linear(ln1, qkv_off, 3 * d, false, None);
-    let q = tape.split_heads(qkv, 0, h, dk, batch);
-    let k = tape.split_heads(qkv, d, h, dk, batch);
-    let v = tape.split_heads(qkv, 2 * d, h, dk, batch);
-    let scores = tape.batched_matmul(q, k, batch * h, true);
+    let head = |col0| Layout::Heads { col0, heads: h, width: dk };
+    let scores = tape.batched_matmul(qkv, head(0), qkv, head(d), batch * h, true, Layout::Stacked);
     let weights = tape.causal_softmax(scores, 1.0 / (dk as f32).sqrt(), cfg.softmax1);
-    let heads = tape.batched_matmul(weights, v, batch * h, false);
-    let merged = tape.merge_heads(heads, h, batch);
+    let merged = tape.batched_matmul(weights, Layout::Stacked, qkv, head(2 * d), batch * h, false, head(0));
     let x1 = tape.linear(merged, out_off, d, false, Some(x));
     let ln2 = tape.layer_norm(x1, ln2_off);
     let hidden = tape.linear(ln2, ffn1_off, f, true, None);
@@ -346,6 +355,16 @@ pub fn model_forward(tape: &mut DeviceTape, cfg: &Config, ids: &[usize], targets
     let logits = tape.linear(ln, cfg.proj_off(), cfg.vocab, false, None);
     let loss = tape.cross_entropy(logits, targets);
     (outs, logits, loss)
+}
+
+/// Node matrix z, under `lay`, of a buffer h shaped like its node (width
+/// `cols`, each matrix stored [r, c]) as a matmul operand, used transposed
+/// if `trans`.
+fn view(h: &Handle, lay: Layout, cols: usize, r: usize, c: usize, trans: bool) -> MatRef<'_> {
+    match lay {
+        Layout::Stacked => MatRef { stride: r * c, trans, ..MatRef::new(h) },
+        Layout::Heads { col0, heads, width } => MatRef { trans, ..MatRef::heads(h, col0, cols, r, heads, width) },
+    }
 }
 
 #[cube(launch)]

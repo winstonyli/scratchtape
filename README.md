@@ -1009,7 +1009,8 @@ because raw forgetting deltas hid a floor effect.
     epilogue;
   - LayerNorm and Softmax (`rows`);
   - Embed and CrossEntropy (`tokens`);
-  - split/merge heads (`heads`).
+  - split/merge heads (`heads`; later replaced by head views in the
+    matmul, see below).
   Each is checked against the CPU tape (`cargo test --lib gpu_step --
   --ignored`). The backward kernels are also checked by finite
   differences through the GPU forward, and deliberate mutations fail the
@@ -1055,6 +1056,13 @@ because raw forgetting deltas hid a floor effect.
     run in parallel, then sum the partials in a fixed order (still
     deterministic). Step: **~3.3 ms best** (was 4.6); kernel time
     2.36 ms, so launch overhead (209 launches) is now ~1 ms of the step.
+  - **Head views (2026-09-24).** The matmul now reads Q, K, V straight
+    out of the fused QKV buffer and writes attention heads straight into
+    the merged layout, removing the split/merge-heads kernels: 177
+    launches, kernel time 2.16 ms. **The wall step stayed ~3.35 ms**, and
+    pipelining steps (no per-step readback) doesn't help either, so the
+    remaining ~1.2 ms gap is host- or driver-side serialization, not
+    per-launch GPU cost. Finding it is the next step.
   Details: `docs/gpu_step_design.md`, milestone 5.
   The CPU tape stays a separate reference rather than
   running the GPU's cubecl kernels on the CPU. A single cubecl source for
