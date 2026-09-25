@@ -10,7 +10,8 @@ batched heads the same day (section below). **Milestone 2 (kernels)
 done the same day, and so were milestones 3 and 4 (forward and gradient
 parity with the CPU tape).** **Milestone 5 done the same day: the
 device step trains like the CPU tape and takes ~9.5 ms on an idle eGPU,
-~14× under the kill criterion.** Next: milestone 6 (optional).
+~14× under the kill criterion.** Next: parallel row reductions (62% of the
+step; see milestone 5), then milestone 6 (optional).
 
 ## What the evidence says
 
@@ -275,18 +276,51 @@ Each milestone leaves a runnable check behind.
        tape).
      - The kill criterion (~130 ms) is beaten ~14×.
      - The GPU step is still 2–5× over the 2–5 ms estimate. The launch
-       floor is ~1.75 ms (175 × ~10 µs), so ~8 ms is kernel time or
-       queueing that isn't yet explained.
+       floor is only ~1.75 ms (175 × ~10 µs).
    - **Contention dominates any timing.** With 5 other jobs on the eGPU,
      the lockstep runs' GPU steps took 1–25 s. With one other job, back
      to back, they took ~208 ms. Idle, they took ~9.5 ms. Any GPU time
      measured without first checking the eGPU's process list is
      meaningless.
+   - **Where the time goes: kernels, not launches**
+     (`gpu_train_check 0 41 profile`, idle eGPU). gpu_step's profiler
+     gives each launch its own cubecl device-timestamp window and charges
+     it to the launching line (`#[track_caller]` on `count_launch`).
+     Summed kernel time is 9.09 ms per step, against a 9.5 ms unprofiled
+     step. A first idle run read 12.3 ms, probably clocks ramping.
+
+     | launch site | ms/step | launches | share |
+     |---|---|---|---|
+     | matmul (all) | 3.02 | 75 | 33% |
+     | `col_sum` (bias grads) | 1.87 | 17 | 21% |
+     | LayerNorm backward dx | 1.21 | 9 | 13% |
+     | LayerNorm backward gamma/beta | 1.06 | 9 | 12% |
+     | LayerNorm forward | 0.89 | 9 | 10% |
+     | Softmax backward | 0.50 | 4 | 6% |
+     | Softmax forward | 0.15 | 4 | 2% |
+     | everything else (68 launches) | ~0.4 | 68 | 4% |
+
+     The row kernels take 5.7 ms (62%). The cause is the one-unit-per-row
+     (or per-column) design, which serially loops over d = 128 (or 512
+     rows) three times:
+     - 512 rows is 2 cubes of 256, on a GPU with 32 compute units.
+     - Neighbouring units read addresses d floats apart, so no load is
+       coalesced.
+     - Each launch takes ~100–130 µs.
+     - Softmax, with 2048 rows of 64, is the cheapest of them per launch
+       (38 µs).
+     This is the caveat left open in milestone 2 ("Milestone 5 decides
+     whether it matters"): it does.
+     Fix, not yet done: a cube per row (or per group of columns) with a
+     fixed-order shared-memory tree reduction. That keeps results
+     deterministic and should bring the row kernels to about matmul's
+     per-launch cost (~40 µs or less), giving a step of ~4 ms.
    - **Negative result: a sync-after-every-launch profiler didn't work.**
      Its step ran at ~70–100 ms. The ~0.5 ms round trip charged to each
-     launch swamps the kernels, so it can't rank them, and it was
-     removed. Finding the missing ~8 ms needs GPU timestamp queries, or
-     fewer launches (see "Launch count is the lever").
+     launch swamped the kernels, so it couldn't rank them. Device
+     timestamps replaced it. With them, a profiled step takes 50–60 ms of
+     wall time, because each window flushes the queue, but kernel times
+     are unaffected.
 6. **Optional:** cmma f16 matmul behind a flag, a DX12 comparison, and a
    longer run of `training_recipe_check` on the GPU.
 

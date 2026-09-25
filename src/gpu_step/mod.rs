@@ -25,8 +25,64 @@ static CLIENT: OnceLock<Client> = OnceLock::new();
 /// Kernel launches queued so far, for counting launches per step.
 pub static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
+#[track_caller]
 fn count_launch() {
     LAUNCHES.fetch_add(1, Ordering::Relaxed);
+    if let Some(p) = PROFILE.get() {
+        p.lock().unwrap().mark(Some(std::panic::Location::caller()));
+    }
+}
+
+type Site = &'static std::panic::Location<'static>;
+
+/// Per-launch-site GPU time from device timestamps, for finding slow
+/// kernels. Each launch runs in its own profile window (no host sync; the
+/// window only flushes the queue and brackets its compute pass with
+/// timestamp writes), charged to the line that launched it. Off unless
+/// `profile_start` is called. A sync-per-launch profiler was tried first
+/// and couldn't rank kernels: its ~0.5 ms round trip swamped them.
+static PROFILE: OnceLock<std::sync::Mutex<Profile>> = OnceLock::new();
+
+#[derive(Default)]
+struct Profile {
+    open: Option<(Site, cubecl_runtime::client::ProfileWindow)>,
+    done: Vec<(Site, cubecl::profile::ProfileDuration)>,
+}
+
+impl Profile {
+    fn mark(&mut self, next: Option<Site>) {
+        if let Some((site, w)) = self.open.take() {
+            self.done.push((site, client().profile_end(w).unwrap()));
+        }
+        self.open = next.map(|n| (n, client().profile_start().unwrap()));
+    }
+}
+
+/// Starts charging GPU time to launch sites (see `PROFILE`). Panics if
+/// the device can't report timestamps.
+pub fn profile_start() {
+    let method = client().properties().timing_method;
+    assert_eq!(method, cubecl::profile::TimingMethod::Device, "no device timestamps");
+    PROFILE.get_or_init(Default::default);
+}
+
+/// Closes the open window and returns (site, launches, total GPU s),
+/// most expensive first; clears the tally. Windows that carried no
+/// measurement are counted as launches but add no time.
+pub fn profile_take() -> Vec<(String, usize, f64)> {
+    let mut p = PROFILE.get().expect("profile_start first").lock().unwrap();
+    p.mark(None);
+    let mut sites: std::collections::HashMap<String, (usize, f64)> = Default::default();
+    for (site, d) in p.done.drain(..) {
+        let e = sites.entry(format!("{}:{}", site.file(), site.line())).or_default();
+        e.0 += 1;
+        if let Some(t) = pollster::block_on(d.resolve()) {
+            e.1 += t.duration().as_secs_f64();
+        }
+    }
+    let mut v: Vec<_> = sites.into_iter().map(|(k, (n, t))| (k, n, t)).collect();
+    v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    v
 }
 
 /// The first discrete GPU, on Vulkan. Never falls back to the iGPU or CPU:

@@ -1,6 +1,6 @@
 // Milestone 5 of docs/gpu_step_design.md: does the device tape train like
 // the CPU tape, and is its step faster?
-//   gpu_train_check [softmax1 0|1] [steps=200] [control [index] | time]
+//   gpu_train_check [softmax1 0|1] [steps=200] [control [index] | time | profile]
 // training_recipe_check's setup (tiny_lm, batch 8, lr 0.3, seed 1): the
 // same init and the same batches go to both tapes, in lockstep. Prints
 // both training losses as it goes, then both models' train-probe and
@@ -12,12 +12,14 @@
 // the GPU's drift (its ReLUs disagree with the CPU's on a unit or so a
 // step; see device_training_tracks_cpu_over_steps).
 // `time` runs GPU steps only, back to back (no CPU step in between to let
-// the GPU clock down), and reports best/median step ms.
+// the GPU clock down), and reports best/median step ms. `profile` does the
+// same with gpu_step's device-timestamp profiler on and prints each launch
+// site's GPU time per step.
 // Holds an exclusive GPU lease; runs at Normal CPU priority (LONG_RUNS.md:
 // a BelowNormal GPU feeder starves under load).
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
-use scratchtape::gpu_step::{DeviceParams, LAUNCHES, client, pack, read_f32};
+use scratchtape::gpu_step::{DeviceParams, LAUNCHES, client, pack, profile_start, profile_take, read_f32};
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::{Tape, Var};
@@ -154,7 +156,8 @@ fn main() {
     client();
     let dev = DeviceParams::upload(&pack(&m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj));
     println!("gpu_train_check: pid {} softmax1={softmax1} batch={BATCH} lr={LR} steps={steps}", std::process::id());
-    if args.get(3).is_some_and(|a| a == "time") {
+    let profile = args.get(3).is_some_and(|a| a == "profile");
+    if profile || args.get(3).is_some_and(|a| a == "time") {
         let mut t = vec![];
         for step in 0..steps {
             let (mut input, mut target) = (Vec::with_capacity(BATCH * SEQ_LEN), Vec::with_capacity(BATCH * SEQ_LEN));
@@ -172,8 +175,19 @@ fn main() {
             let gl = read_f32(dt.value(dloss));
             if step > 0 {
                 t.push(t0.elapsed().as_secs_f64());
+            } else if profile {
+                profile_start(); // after compilation
             }
             assert!(gl.is_finite(), "GPU loss diverged at step {step}");
+        }
+        if profile {
+            let sites = profile_take();
+            let per = |x: f64| x * 1e3 / (steps - 1) as f64;
+            let total: f64 = sites.iter().map(|s| s.2).sum();
+            for (site, n, secs) in sites {
+                println!("{:>7.3} ms/step {:>5.1}%  {:>3} launches/step  {site}", per(secs), 100.0 * secs / total, n / (steps - 1));
+            }
+            println!("GPU time, all launches: {:.2} ms/step", per(total));
         }
         let (b, m) = summary(t);
         println!("gpu only, {steps} steps back to back: step ms best {b:.2} / median {m:.2}");

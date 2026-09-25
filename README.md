@@ -1038,6 +1038,13 @@ because raw forgetting deltas hid a floor effect.
     launches, vs 259–292 ms for the single-threaded CPU tape. That is
     ~14× under the 130 ms kill criterion.
   - **Contention.** With other jobs on the eGPU, steps took 0.2–25 s.
+  - **Where the time goes.** Device-timestamp profiling
+    (`gpu_train_check 0 41 profile`) puts 9.1 of the 9.5 ms in kernels,
+    not launch overhead. Matmul takes 3.0 ms. The row-wise kernels
+    (LayerNorm, the bias column sums, softmax) take 5.7 ms: they run one
+    serial unit per row, so 512 rows fill 2 cubes and every load is
+    uncoalesced. Parallelizing those reductions is the next speedup,
+    worth ~2×.
   Details: `docs/gpu_step_design.md`, milestone 5.
   The CPU tape stays a separate reference rather than
   running the GPU's cubecl kernels on the CPU. A single cubecl source for
