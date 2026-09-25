@@ -822,6 +822,14 @@ it means here.
   protection. A candidate factor in the Fisher run's new-task cost,
   unverified.
 
+**GPU step layout**
+- Karpathy, *llm.c* ([GitHub](https://github.com/karpathy/llm.c)): the CPU
+  reference (`train_gpt2.c`) indexes heads inside the fused `(B, T, 3C)`
+  QKV by stride, with no permute. The CUDA path (`llmc/attention.cuh`)
+  permutes to `(B, NH, T, HS)`, runs batched matmuls and a softmax, then
+  unpermutes. The CPU batched-heads plan mirrors the CUDA pipeline
+  (`docs/gpu_step_design.md`, "Survey: alternatives to full batched heads").
+
 **Sibling project: `humble-cortex`** (`../humble-cortex`, predictive
 coding in Rust). Its 95 checks overlap here in three places. First, every
 model is benchmarked against the simplest baseline for the task

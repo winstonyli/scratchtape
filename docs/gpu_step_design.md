@@ -249,6 +249,24 @@ rows, no barriers) gets near `NdArray`. See "Next" in the experiment.
   - `softmax1_qknorm_fix` has its own block copy and is unaffected.
   - `to_fused_flat`/`from_fused_flat` become `to_flat`/`from_flat`.
 
+### Survey: alternatives to full batched heads (2026-09-24)
+
+Re-checked before implementing. Nothing beat the decision above.
+
+| option | verdict |
+|---|---|
+| **Full batched heads** (`split_heads` → `batched_matmul` over B·H → softmax → `batched_matmul` → `merge_heads`) | **Keep.** It's exactly llm.c's CUDA attention pipeline (`permute_kernel`, batched matmul, softmax, batched matmul, `unpermute_kernel`, with permutes as copies), so the op boundaries are the standard ones. |
+| Skip it: keep per-head CPU, bridge with `to_fused_flat` | Works for parity (M1 already checks the bridge). It forgoes the CPU speedup and leaves M2's per-op tests converting layouts ad hoc. |
+| llm.c's CPU style: one fused attention op that indexes heads inside `[B·T, 3D]` by stride, with no copies and a hand-written backward | Fastest CPU, but the reference tape would then hold a coarse hand-written backward, the very thing it exists to check. |
+| Strided views / einsum in `NdArray` (the PyTorch way) | General, but a large infrastructure change for one use. |
+| Fuse only QKV into one `Linear`; keep the per-head attention loop via column slices | Smaller blast radius (`head_weights` and extras unchanged). It gets the wide-matmul gain but not the tape-node or launch-structure gain, and it's a second migration later. |
+
+Upper bound on the CPU gain: `step_profile 8 10` with `CENSUS_HEADS=1`
+(same matmul work, 8× less softmax work, so a best case), CPU contended,
+best of 5: 835 ms for 8 heads vs 471 ms for 1 head, **≤1.8×**. Real
+batched heads keeps the per-head softmax work and adds permute copies,
+so expect less.
+
 ### Experiment: one kernel source on the CPU runtime (2026-09-24)
 
 `cubecl_spike cpu-step` runs a step-shaped chain:

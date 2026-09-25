@@ -17,7 +17,8 @@
 // Launch census (`step_profile 8 1 census`, 2026-09-24): kernel launches one
 // step would make on a device-resident tape, under the model in `census`.
 // CENSUS_HEADS=1 stands in for batching all heads into one op (same widths,
-// same launch structure).
+// same launch structure). It applies to the timing run too: a best-case
+// bound on the CPU gain from batched heads (<=1.8x, 2026-09-24).
 //   layout            unfused   elementwise-fused   ms at ~10 us/launch
 //   8 heads as ops    2372      1281                23.7 / 12.8
 //   heads batched      776       385                 7.8 /  3.9
@@ -182,7 +183,7 @@ fn main() {
     let mut m = Model {
         token_emb: Embedding::new(&mut rng, VOCAB, D_MODEL),
         pos_emb: Embedding::new(&mut rng, SEQ_LEN, D_MODEL),
-        blocks: (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF)).collect(),
+        blocks: (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, std::env::var("CENSUS_HEADS").map(|h| h.parse().unwrap()).unwrap_or(N_HEADS), D_FF)).collect(),
         final_ln: LayerNorm::new(D_MODEL),
         output_proj: Linear::new(&mut rng, D_MODEL, VOCAB),
     };
