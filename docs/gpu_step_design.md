@@ -147,6 +147,9 @@ Each milestone leaves a runnable check behind.
    - Timing runs hold an exclusive GPU lease (`gpu_lease::hold`). Long
      training runs hold a shared lease and call
      `gpu_lease::pause_while_exclusive()` at each checkpoint.
+   - GPU runs go at Normal CPU priority, not BelowNormal: with every
+     core busy, BelowNormal made round trips ~25× slower
+     (`gpu_cpu_priority_check.rs`).
 6. **Optional:** cmma f16 matmul behind a flag, a DX12 comparison, and a
    longer run of `training_recipe_check` on the GPU.
 

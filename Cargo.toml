@@ -118,6 +118,10 @@ path = "examples/gpu/gpu_dispatch_overhead.rs"
 name = "gpu_priority_check"
 path = "examples/gpu/gpu_priority_check.rs"
 
+[[example]]
+name = "gpu_cpu_priority_check"
+path = "examples/gpu/gpu_cpu_priority_check.rs"
+
 # alternative computational/training mechanisms
 [[example]]
 name = "attention_recall"

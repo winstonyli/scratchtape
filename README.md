@@ -1033,6 +1033,13 @@ because raw forgetting deltas hid a floor effect.
   turn-taking is the fix: `gpu_lease.rs`, which both GPU examples now
   hold, and the matching rule in LONG_RUNS.md.
 
+  **GPU-feeding processes need Normal CPU priority (2026-09-24,
+  `gpu_cpu_priority_check.rs`).** `gpu.rs` blocks in `device.poll` rather
+  than sleep-polling, but that didn't protect it. With 16 BelowNormal
+  spinner threads, a BelowNormal `gpu_matmul` round trip's median rose from
+  5–8 ms to 138–171 ms (~25×). At Normal it was unaffected. So GPU training
+  runs at Normal, the exception LONG_RUNS.md already makes for burn.
+
 ## A note on the name
 
 The crate is `scratchtape`: from-scratch, and literally built around a
