@@ -432,6 +432,15 @@ widening at the end, while held-out gains had slowed to 0.03 per 8000
 windows. Regularization (weight decay, dropout) is the next lever, ahead
 of the optimizer.
 
+**On the GPU the same run takes ~150 s, not ~4.5 h** (`training_recipe_check
+... gpu`, 2026-09-25): 21 s of training at 2.0–2.7 ms/step, and ~125 s of
+CPU evaluation. Batch 8 ends at plain 1.357 / 1.857 and softmax1 1.378 /
+1.860 (train-probe / held-out). The GPU and CPU runs are chaotic twins
+(milestone 5 below), so their gap measures seed-level noise: 0.001
+held-out for plain, 0.014 for softmax1, which trails plain on the GPU.
+That noise is as big as softmax1's batch-8 lead, so the lead is unresolved.
+Several seeds per condition now cost minutes, not days.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data
@@ -1072,7 +1081,14 @@ because raw forgetting deltas hid a floor effect.
     host time per submit), and `WGPU_BACKEND=dx12` selects DX12 but
     requires `dxcompiler.dll` on PATH: without DXC, wgpu silently uses
     FXC and the step runs ~170× slower. Vulkan stays the default.
-  Details: `docs/gpu_step_design.md`, milestone 5.
+  - **A full training run on the GPU (2026-09-25).**
+    `training_recipe_check <name> <softmax1> 8 0.3 64000 600 gpu` trains
+    all 8000 steps on the device and reads the parameters back only for
+    each CPU evaluation. Training takes 2.0–2.7 ms/step (first 1000 steps
+    3.5, including kernel compilation). Final CE matches the CPU runs to
+    the chaotic-twin noise (plain held-out 1.857 vs 1.858). Reruns
+    reproduce the checkpoint byte for byte.
+  Details: `docs/gpu_step_design.md`, milestones 5 and 6.
   The CPU tape stays a separate reference rather than
   running the GPU's cubecl kernels on the CPU. A single cubecl source for
   both was tested and ruled out (2026-09-24, `cubecl_spike cpu-step`):

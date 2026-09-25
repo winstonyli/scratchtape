@@ -16,8 +16,10 @@ to ~4.6 ms (milestone 5, "Row reductions"), and split-k matmuls to
 0.3 ms of kernel time (milestone 5, "Head views"). With a free CPU, the
 step is bounded by host queueing and the per-step loss readback: steps
 pipelined (loss read every N steps) take **~1.5 ms on DX12, ~2.0 ms on
-Vulkan** (milestone 5, "Host side and backends"). Next: milestone 6
-(optional).
+Vulkan** (milestone 5, "Host side and backends"). A full
+`training_recipe_check` run (8000 steps) trains in ~21 s on the GPU vs
+~4.5 h on the CPU, to the same CE (milestone 6). Rest of milestone 6
+(optional) is open.
 
 ## What the evidence says
 
@@ -508,7 +510,40 @@ Each milestone leaves a runnable check behind.
      wall time, because each window flushes the queue, but kernel times
      are unaffected.
 6. **Optional:** cmma f16 matmul behind a flag, a DX12 comparison, and a
-   longer run of `training_recipe_check` on the GPU.
+   longer run of `training_recipe_check` on the GPU. The DX12 comparison
+   is done (milestone 5, "Host side and backends").
+   - **Full GPU training run (done 2026-09-25).** `training_recipe_check`
+     takes a 7th argument, `gpu`. Each step runs on the device tape with
+     no readback. At each evaluation (every 1000 steps) and checkpoint,
+     the parameters come back to the CPU (`reconstruct`) and the last
+     loss is read to catch NaN. Evaluation and the resume file stay on
+     the CPU, in the same format. The run holds a shared lease and pauses
+     at evaluations for others' exclusive leases.
+   - **Results** (batch 8, lr 0.3, 64000 windows, Vulkan, idle eGPU and
+     CPU), train-probe / held-out CE:
+
+     | | GPU | CPU (round 1) |
+     |---|---|---|
+     | plain | 1.3573 / 1.8573 | 1.3900 / 1.8581 |
+     | softmax1 | 1.3779 / 1.8603 | 1.3747 / 1.8463 |
+
+   - **Drift stays small; its size is seed noise.** The final gaps (0.001
+     and 0.014 held-out) are the chaotic-twin spread from milestone 5, not
+     error. They are as large as softmax1's batch-8 lead over plain
+     (0.012), which reverses on the GPU. A rerun of the plain GPU run
+     reproduced the checkpoint byte for byte.
+   - **Time.** ~150 s per run instead of ~4.5 h: ~125 s of CPU evaluation
+     (9 × 371 × 2 windows) and ~21 s of training. The log prints training
+     ms/step for each stretch between evaluations: 3.5 for the first 1000
+     steps (~1.5 s of JIT compilation), then 2.0–2.1, then 2.67 from step
+     3000 on. That step up to 2.67 also appeared in a second clean run, and
+     its cause is unknown (CPU clock after the evaluations, or something
+     else). The benchmark, `gpu_train_check 0 200 time`, gave 1.97 ms
+     pipelined right before this run. Another run, with a game on the
+     eGPU from step 3000, took 23–31 ms/step with CE unchanged.
+   - **Why evaluation stays on the CPU.** It's 85% of the run now, and
+     moving it is the next win if runs get repeated. Leaving it on the CPU
+     kept the comparison with the CPU runs exact and the change small.
 
 **Kill criterion:** if milestone 5's step isn't clearly faster than
 ~130 ms (a well-threaded CPU batch-8 step), stop and record why. The
