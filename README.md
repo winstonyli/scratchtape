@@ -402,6 +402,8 @@ nothing once softmax1 is correct. The gates never go sparse (mean
 log's 20-window evals ran optimistic by 0.1+ nats (plain logged 1.738).
 The headline stands: every transformer here trails the count model by
 0.15–0.20 nats, so training (not attention variants) is the bottleneck.
+(Training was: long runs with dropout later cut the gap to 0.02; see
+"Long runs" below.)
 One seed. Over 5 seeds at batch 1 (below), softmax1's lead over plain
 holds but is 0.021, not 0.049: this plain run was an unlucky draw.
 
