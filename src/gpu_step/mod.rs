@@ -10,8 +10,10 @@ use cubecl::wgpu::{RuntimeOptions, Vulkan, WgpuDevice, WgpuDeviceKind, WgpuRunti
 use cubecl_runtime::runtime::Runtime;
 use std::sync::OnceLock;
 
+pub mod heads;
 pub mod matmul;
 pub mod rows;
+pub mod tokens;
 
 /// Units per cube for 1-D elementwise kernels.
 const EW_DIM: u32 = 256;

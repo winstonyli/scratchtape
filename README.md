@@ -1001,7 +1001,22 @@ because raw forgetting deltas hid a floor effect.
   has 280 tape nodes instead of 888 and trains ~1.35× faster; the
   survey had bounded the gain at ≤1.8×. Old checkpoints load but are
   wrong, since the length is the same and the order isn't; the ones in
-  `runs/` were converted once. Details are in the design note. The CPU tape stays a separate reference rather than
+  `runs/` were converted once. Details are in the design note.
+  **Milestone 2 done (2026-09-24):** every op in the design's table has
+  forward and backward kernels in `src/gpu_step/`:
+  - one generalized tiled matmul (`matmul`): transposes, batching,
+    offsets into the flat buffers, and a bias/ReLU/mask/residual/accumulate
+    epilogue;
+  - LayerNorm and Softmax (`rows`);
+  - Embed and CrossEntropy (`tokens`);
+  - split/merge heads (`heads`).
+  Each is checked against the CPU tape (`cargo test --lib gpu_step --
+  --ignored`). The backward kernels are also checked by finite
+  differences through the GPU forward, and deliberate mutations fail the
+  tests. One intended difference: CrossEntropy uses the exact gradient,
+  while the tape's −log(p + 1e-9) is off by 1e-9/p_t (1.2e-4 in the test;
+  ~3e-7 at the real step's scale).
+  The CPU tape stays a separate reference rather than
   running the GPU's cubecl kernels on the CPU. A single cubecl source for
   both was tested and ruled out (2026-09-24, `cubecl_spike cpu-step`):
   - The GPU's tiled matmul never finishes on cubecl's CPU runtime, which

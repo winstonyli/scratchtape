@@ -6,7 +6,9 @@ entirely on the RX 9060 XT eGPU. It must match the CPU tape's losses and
 gradients, and be faster than the CPU step. Status: **milestone 1 done
 (2026-09-24)**. A single cubecl source for CPU and GPU was tested and
 ruled out the same day (experiment below). The CPU model moved to
-batched heads the same day (section below). Next: milestone 2 (kernels).
+batched heads the same day (section below). **Milestone 2 (kernels)
+done the same day.** Next: milestone 3 (a block's forward on the GPU,
+composed from the kernels, against `forward_full`).
 
 ## What the evidence says
 
@@ -165,8 +167,30 @@ Each milestone leaves a runnable check behind.
      the bias reduction.
    - One unit per row is the simplest correct shape, not the fastest:
      512 rows is 2 cubes of 256. Milestone 5 decides whether it matters.
-   - Next: Embed, CrossEntropy, split/merge heads, and the ReLU mask in
-     the matmul epilogue (for FFN1's dX).
+   - **Embed, CrossEntropy, heads, ReLU mask: done (2026-09-24).**
+     `gpu_step::tokens` has Embed (token + position; backward is one
+     ordered reduction per table, no atomics) and CrossEntropy (per-row
+     logsumexp, then one unit sums the mean; backward is the closed form
+     (softmax − onehot)/rows). `gpu_step::heads` has split/merge heads,
+     each the other's backward; merge writes or accumulates at a column
+     offset, so dQ/dK/dV merge straight into dQKV. The matmul epilogue
+     gained the ReLU backward mask. Checks (ignored; GPU):
+     `embed_matches_cpu_tape` (forward exact, repeated and unused ids),
+     `cross_entropy_matches_cpu_tape` (plus finite differences),
+     `split_and_merge_match_tape` (exact), and new mask cases in
+     `matmul_matches_reference`.
+   - **CrossEntropy differs from the tape on purpose.** The tape computes
+     −log(p + 1e-9), which scales its gradient by p_t/(p_t + 1e-9). The
+     GPU uses the exact form. In the test (p_t down to 8.3e-6) the tape
+     sits 1.2e-4 from an f64 closed form and the GPU 2.8e-7; the gap is
+     1e-9/p_t exactly. At the step's scale (p ≈ 1/256 at init) it's ~3e-7,
+     so it won't show in milestones 3–5 unless a model gets very
+     confident and very wrong.
+   - **Milestone 2 is complete:** every op in the ops table has its
+     forward and backward kernels, each checked against the CPU tape.
+   - Timing note: with 5 other processes on the eGPU (2026-09-24), the
+     8 GPU tests took 275 s instead of ~10 s; the finite-difference loops'
+     readbacks queue behind the other jobs.
 3. **Forward parity.** A block's output and the loss match
    `forward_full` (plain and softmax1) to 1e-4 relative.
 4. **Gradient parity.** Every parameter gradient after one step matches

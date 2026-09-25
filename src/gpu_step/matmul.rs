@@ -6,7 +6,8 @@
 //! - batched over the cube grid's z, each operand with its own per-batch
 //!   stride, and an element offset into its buffer (parameters live in
 //!   one flat buffer);
-//! - an epilogue: + bias[col], ReLU, + residual, and accumulate into out.
+//! - an epilogue: + bias[col], ReLU, the ReLU backward mask, + residual,
+//!   and accumulate into out.
 use super::{buf, client};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -31,12 +32,14 @@ impl<'a> MatRef<'a> {
 }
 
 /// What to do with each output element after the dot product, in this
-/// order: + bias[col], ReLU, + residual (same layout as out), + the value
-/// already in out.
+/// order: + bias[col], ReLU, zero it where `mask` (same layout as out) is
+/// not positive (ReLU's backward, given ReLU's output), + residual (same
+/// layout as out), + the value already in out.
 #[derive(Clone, Copy, Default)]
 pub struct Epilogue<'a> {
     pub bias: Option<(&'a Handle, usize)>,
     pub relu: bool,
+    pub mask: Option<(&'a Handle, usize)>,
     pub residual: Option<(&'a Handle, usize)>,
     pub accumulate: bool,
 }
@@ -49,6 +52,7 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
     assert!(!out.trans, "out is stored row-major");
     let dummy = dummy();
     let (bias_h, bias_off) = epi.bias.unwrap_or((dummy, 0));
+    let (mask_h, mask_off) = epi.mask.unwrap_or((dummy, 0));
     let (res_h, res_off) = epi.residual.unwrap_or((dummy, 0));
     let count = CubeCount::Static((n as u32).div_ceil(64), (m as u32).div_ceil(64), batch as u32);
     let u = |x: usize| x as u32;
@@ -60,6 +64,7 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
         whole(b.h),
         whole(out.h),
         whole(bias_h),
+        whole(mask_h),
         whole(res_h),
         u(m),
         u(n),
@@ -71,11 +76,13 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
         u(out.off),
         u(out.stride),
         u(bias_off),
+        u(mask_off),
         u(res_off),
         a.trans,
         b.trans,
         epi.bias.is_some(),
         epi.relu,
+        epi.mask.is_some(),
         epi.residual.is_some(),
         epi.accumulate,
     );
@@ -86,7 +93,7 @@ fn whole(h: &Handle) -> BufferArg {
     buf(h, h.size_in_used() as usize / 4)
 }
 
-/// Bound in place of an absent bias or residual: wgpu rejects one buffer
+/// Bound in place of an absent bias, mask or residual: wgpu rejects one buffer
 /// bound as both read-only and read-write in the same dispatch, so `out`
 /// can't stand in.
 fn dummy() -> &'static Handle {
@@ -106,6 +113,7 @@ fn k_matmul(
     b: &[f32],
     out: &mut [f32],
     bias: &[f32],
+    mask: &[f32],
     res: &[f32],
     m: u32,
     n: u32,
@@ -117,11 +125,13 @@ fn k_matmul(
     o_off: u32,
     o_stride: u32,
     bias_off: u32,
+    mask_off: u32,
     res_off: u32,
     #[comptime] trans_a: bool,
     #[comptime] trans_b: bool,
     #[comptime] has_bias: bool,
     #[comptime] relu: bool,
+    #[comptime] has_mask: bool,
     #[comptime] has_res: bool,
     #[comptime] accumulate: bool,
 ) {
@@ -217,6 +227,11 @@ fn k_matmul(
                     }
                 }
                 let idx = z * o_stride + gm * n + gn;
+                if has_mask {
+                    if mask[(mask_off + idx) as usize] <= 0.0 {
+                        v = 0.0;
+                    }
+                }
                 if has_res {
                     v += res[(res_off + idx) as usize];
                 }
@@ -238,7 +253,7 @@ mod tests {
 
     /// Plain-loop reference for one case, same argument meaning as `matmul`.
     #[allow(clippy::too_many_arguments)]
-    fn reference(a: &[f32], ar: (usize, usize, bool), b: &[f32], br: (usize, usize, bool), out: &mut [f32], or: (usize, usize), batch: usize, m: usize, k: usize, n: usize, bias: Option<&[f32]>, relu: bool, res: Option<&[f32]>, accumulate: bool) {
+    fn reference(a: &[f32], ar: (usize, usize, bool), b: &[f32], br: (usize, usize, bool), out: &mut [f32], or: (usize, usize), batch: usize, m: usize, k: usize, n: usize, bias: Option<&[f32]>, relu: bool, mask: Option<&[f32]>, res: Option<&[f32]>, accumulate: bool) {
         for z in 0..batch {
             for i in 0..m {
                 for j in 0..n {
@@ -255,6 +270,9 @@ mod tests {
                         s = s.max(0.0);
                     }
                     let idx = z * or.1 + i * n + j;
+                    if mask.is_some_and(|mask| mask[idx] <= 0.0) {
+                        s = 0.0;
+                    }
                     if let Some(res) = res {
                         s += res[idx];
                     }
@@ -278,41 +296,44 @@ mod tests {
     fn matmul_matches_reference() {
         let mut rng = Rng::new(5);
         let mut gauss = |len: usize| -> Vec<f32> { (0..len).map(|_| rng.next_gaussian()).collect() };
-        // (batch, m, k, n, trans_a, trans_b, bias, relu, residual, accumulate)
+        // (batch, m, k, n, trans_a, trans_b, bias, relu, mask, residual, accumulate)
         let cases = [
-            (1, 70, 35, 20, false, false, false, false, false, false),
-            (1, 70, 35, 20, true, false, false, false, false, false),
-            (1, 70, 35, 20, false, true, false, false, false, false),
-            (1, 70, 35, 20, true, true, false, false, false, false),
-            (3, 33, 17, 65, false, true, true, true, false, false),
-            (3, 64, 64, 64, true, false, false, false, true, true),
-            (1, 512, 128, 384, false, false, true, false, false, false), // QKV forward
-            (1, 128, 512, 384, true, false, false, false, false, true),  // dW (TN), accumulated
-            (1, 512, 256, 128, false, true, false, false, false, false), // dX (NT)
-            (64, 64, 16, 64, false, true, false, false, false, false),  // AttnScores
-            (64, 64, 64, 16, false, false, false, false, false, false), // AttnOut
-            (1, 512, 128, 256, false, false, true, true, false, false), // FFN1
-            (1, 512, 256, 128, false, false, true, false, true, false), // FFN2 + residual
+            (1, 70, 35, 20, false, false, false, false, false, false, false),
+            (1, 70, 35, 20, true, false, false, false, false, false, false),
+            (1, 70, 35, 20, false, true, false, false, false, false, false),
+            (1, 70, 35, 20, true, true, false, false, false, false, false),
+            (3, 33, 17, 65, false, true, true, true, false, false, false),
+            (3, 64, 64, 64, true, false, false, false, false, true, true),
+            (1, 512, 128, 384, false, false, true, false, false, false, false), // QKV forward
+            (1, 128, 512, 384, true, false, false, false, false, false, true),  // dW (TN), accumulated
+            (1, 512, 256, 128, false, true, false, false, false, false, false), // dX (NT)
+            (64, 64, 16, 64, false, true, false, false, false, false, false),  // AttnScores
+            (64, 64, 64, 16, false, false, false, false, false, false, false), // AttnOut
+            (1, 512, 128, 256, false, false, true, true, false, false, false), // FFN1
+            (1, 512, 256, 128, false, false, true, false, false, true, false), // FFN2 + residual
+            (1, 512, 128, 256, false, true, false, false, true, false, false), // FFN1 dX, ReLU-masked
+            (2, 33, 17, 65, true, false, true, true, true, true, true),        // everything at once
         ];
-        for &(batch, m, k, n, ta, tb, has_bias, relu, has_res, acc) in &cases {
+        for &(batch, m, k, n, ta, tb, has_bias, relu, has_mask, has_res, acc) in &cases {
             // Offsets and strides that aren't multiples of anything.
-            let (a_off, b_off, o_off, bias_off, r_off) = (3, 5, 7, 2, 1);
+            let (a_off, b_off, o_off, bias_off, m_off, r_off) = (3, 5, 7, 2, 6, 1);
             let (sa, sb, so) = (m * k + 1, if batch > 1 { k * n + 2 } else { 0 }, m * n + 3);
             let a = gauss(a_off + batch * sa);
             let b = gauss(b_off + batch.max(1) * sb.max(k * n));
             let bias = gauss(bias_off + n);
             let res = gauss(r_off + batch * so);
+            let mask = gauss(m_off + batch * so); // about half positive
             let out0 = gauss(o_off + batch * so);
             let mut want = out0.clone();
-            reference(&a, (a_off, sa, ta), &b, (b_off, sb, tb), &mut want, (o_off, so), batch, m, k, n, has_bias.then_some(&bias[bias_off..]), relu, has_res.then_some(&res[r_off..]), acc);
+            reference(&a, (a_off, sa, ta), &b, (b_off, sb, tb), &mut want, (o_off, so), batch, m, k, n, has_bias.then_some(&bias[bias_off..]), relu, has_mask.then_some(&mask[m_off..]), has_res.then_some(&res[r_off..]), acc);
 
-            let (ah, bh, bias_h, res_h, oh) = (upload(&a), upload(&b), upload(&bias), upload(&res), upload(&out0));
-            let epi = Epilogue { bias: has_bias.then_some((&bias_h, bias_off)), relu, residual: has_res.then_some((&res_h, r_off)), accumulate: acc };
+            let (ah, bh, bias_h, mask_h, res_h, oh) = (upload(&a), upload(&b), upload(&bias), upload(&mask), upload(&res), upload(&out0));
+            let epi = Epilogue { bias: has_bias.then_some((&bias_h, bias_off)), relu, mask: has_mask.then_some((&mask_h, m_off)), residual: has_res.then_some((&res_h, r_off)), accumulate: acc };
             matmul(MatRef { h: &ah, off: a_off, stride: sa, trans: ta }, MatRef { h: &bh, off: b_off, stride: sb, trans: tb }, MatRef { h: &oh, off: o_off, stride: so, trans: false }, batch, m, k, n, epi);
             let got = read(&oh);
             let scale = want.iter().fold(0.0f32, |s, v| s.max(v.abs()));
             let err = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
-            let case = format!("batch {batch} m {m} k {k} n {n} ta {ta} tb {tb} bias {has_bias} relu {relu} res {has_res} acc {acc}");
+            let case = format!("batch {batch} m {m} k {k} n {n} ta {ta} tb {tb} bias {has_bias} relu {relu} mask {has_mask} res {has_res} acc {acc}");
             assert_eq!(got.len(), want.len(), "{case}");
             // Also covers the padding between batches and before the offset.
             assert!(err <= 1e-5 * scale, "{case}: max err {err} (scale {scale})");
