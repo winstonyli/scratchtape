@@ -1016,6 +1016,13 @@ because raw forgetting deltas hid a floor effect.
   tests. One intended difference: CrossEntropy uses the exact gradient,
   while the tape's −log(p + 1e-9) is off by 1e-9/p_t (1.2e-4 in the test;
   ~3e-7 at the real step's scale).
+  **Milestones 3 and 4 done (2026-09-24):** `gpu_step::tape::DeviceTape`
+  records coarse ops and backpropagates through them on the device. One
+  full tiny_lm step (batch 8, 4 blocks, plain softmax and softmax1)
+  matches the CPU tape to 1e-4: every block's output, the logits, the
+  loss, and every parameter gradient. The worst gradient error measured
+  was 1.7e-5 (`device_step_matches_cpu_tape`). Next is milestone 5:
+  training parity and timing against the CPU step.
   The CPU tape stays a separate reference rather than
   running the GPU's cubecl kernels on the CPU. A single cubecl source for
   both was tested and ruled out (2026-09-24, `cubecl_spike cpu-step`):

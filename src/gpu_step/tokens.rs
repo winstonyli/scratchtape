@@ -39,6 +39,7 @@ pub fn embed_backward(dy: &Handle, ids: &Handle, rows: usize, d: usize, t: usize
 
 /// What CrossEntropy's backward needs, and the loss itself (one f32, the
 /// only thing a training step reads back).
+#[derive(Clone)]
 pub struct CeOut {
     pub loss: Handle,
     pub lse: Handle,

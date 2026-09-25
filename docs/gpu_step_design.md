@@ -7,8 +7,9 @@ gradients, and be faster than the CPU step. Status: **milestone 1 done
 (2026-09-24)**. A single cubecl source for CPU and GPU was tested and
 ruled out the same day (experiment below). The CPU model moved to
 batched heads the same day (section below). **Milestone 2 (kernels)
-done the same day.** Next: milestone 3 (a block's forward on the GPU,
-composed from the kernels, against `forward_full`).
+done the same day, and so were milestones 3 and 4 (forward and gradient
+parity with the CPU tape).** Next: milestone 5 (training parity and
+timing).
 
 ## What the evidence says
 
@@ -191,10 +192,34 @@ Each milestone leaves a runnable check behind.
    - Timing note: with 5 other processes on the eGPU (2026-09-24), the
      8 GPU tests took 275 s instead of ~10 s; the finite-difference loops'
      readbacks queue behind the other jobs.
-3. **Forward parity.** A block's output and the loss match
+3. **Forward parity. Done (2026-09-24).** A block's output and the loss match
    `forward_full` (plain and softmax1) to 1e-4 relative.
-4. **Gradient parity.** Every parameter gradient after one step matches
+4. **Gradient parity. Done (2026-09-24).** Every parameter gradient after one step matches
    the CPU tape to 1e-4 relative.
+   - `gpu_step::tape::DeviceTape` is option C as designed: it records
+     coarse ops (Embed, LayerNorm, Linear with bias/ReLU/residual,
+     split/merge heads, batched matmul, causal softmax, CrossEntropy)
+     with their device values, and `backward` walks them in reverse,
+     calling the milestone-2 kernels. Parameter gradients accumulate
+     into the flat buffer. Activation gradients are allocated on first
+     contribution. A residual aliases its gradient buffer instead of
+     copying it, which is safe because in reverse order every other
+     reader of that buffer has already run. `Config` gives each
+     parameter tensor's offset in `pack`'s layout (checked against
+     `pack`'s length). `block_forward` and `model_forward` build a plain
+     tiny_lm; the extras stay out of scope.
+   - Check (ignored; GPU): `device_step_matches_cpu_tape` runs one step's
+     forward and backward on both tapes from the same init and batch:
+     small ragged shapes and the real step (batch 8, d 128, 8 heads, T 64,
+     4 blocks), each with plain softmax and softmax1. Every block output,
+     the logits and the loss match to 1e-4. So does every parameter
+     tensor's gradient, relative to its own scale. Worst measured
+     gradient error: 1.3e-5 (plain) and 1.7e-5 (softmax1), both on the
+     token table at real size; ~1.5e-6 at the small size. Dropping the
+     transpose in AttnScores' dK path fails it (0.77).
+   - The forward records 56 device ops at real size. The ReLU backward
+     is its own launch for now; the matmul's mask epilogue could fold it
+     into ffn2's dX in milestone 5.
 5. **Training parity and timing.**
    - 200 steps from the same init and batches should track the CPU loss
      curve.

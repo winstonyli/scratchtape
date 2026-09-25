@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 pub mod heads;
 pub mod matmul;
 pub mod rows;
+pub mod tape;
 pub mod tokens;
 
 /// Units per cube for 1-D elementwise kernels.

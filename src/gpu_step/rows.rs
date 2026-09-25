@@ -22,6 +22,7 @@ fn empty(len: usize) -> Handle {
 }
 
 /// What LayerNorm's backward needs from its forward.
+#[derive(Clone)]
 pub struct LnOut {
     pub y: Handle,
     pub mean: Handle,
