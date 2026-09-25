@@ -27,6 +27,7 @@
 // DX12 >= Vulkan at every shape here, queued too. The per-op round trip,
 // not the kernel or the USB4 link's bandwidth, is what lost the old branch.
 use scratchtape::gpu::gpu_matmul;
+use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::nn::Rng;
 use scratchtape::tensor::NdArray;
 use std::time::Instant;
@@ -44,6 +45,7 @@ fn bytes(data: &[f32]) -> Vec<u8> {
 }
 
 fn main() {
+    let _lease = gpu_lease::hold(Kind::Exclusive, "scratchtape gpu_dispatch_overhead", std::time::Duration::from_secs(15 * 60));
     let preferred = if cfg!(windows) { wgpu::Backends::DX12 } else { wgpu::Backends::all() };
     let backends = wgpu::Backends::from_env().unwrap_or(preferred);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..wgpu::InstanceDescriptor::new_without_display_handle() });

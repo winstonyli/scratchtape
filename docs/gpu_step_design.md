@@ -144,6 +144,9 @@ Each milestone leaves a runnable check behind.
      shared.
    - Launches per step are counted.
    - Utilization is checked on the discrete GPU.
+   - Timing runs hold an exclusive GPU lease (`gpu_lease::hold`). Long
+     training runs hold a shared lease and call
+     `gpu_lease::pause_while_exclusive()` at each checkpoint.
 6. **Optional:** cmma f16 matmul behind a flag, a DX12 comparison, and a
    longer run of `training_recipe_check` on the GPU.
 

@@ -27,6 +27,7 @@
 // unpreempted packets. Our two processes' relative priority can't fix that.
 // Re-run on an idle eGPU before judging the priority class itself.
 use scratchtape::gpu::gpu_matmul;
+use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::nn::Rng;
 use scratchtape::tensor::NdArray;
 use std::io::{BufRead, BufReader};
@@ -131,6 +132,7 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("load") {
         return load(args[2].parse().unwrap());
     }
+    let _lease = gpu_lease::hold(Kind::Exclusive, "scratchtape gpu_priority_check", Duration::from_secs(15 * 60));
     let mut rng = Rng::new(7);
     let (a, b) = (rand(&mut rng, 64, 64), rand(&mut rng, 64, 64));
     let want = a.matmul(&b);

@@ -7,4 +7,5 @@ pub mod tape;
 pub mod optim;
 pub mod nn;
 pub mod gpu;
+pub mod gpu_lease;
 pub mod gpu_step;

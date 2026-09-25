@@ -51,6 +51,7 @@ transformer forward/apply_grad pair), not an engine primitive.
 | `nn.rs` | Layers built from tape ops: `Linear`, `LayerNorm`, `Embedding`, `TransformerBlock` (multi-head causal self-attention + FFN), plus `Rng` (hand-rolled xorshift, no external RNG crate). |
 | `optim.rs` | `Sgd` and `Adam`. |
 | `gpu.rs` / `matmul.wgsl` | A wgpu compute-shader matmul kernel — verified correct, but not wired into the autodiff path; see the persistent-GPU-backend note below. On wgpu 30, the same version cubecl uses. |
+| `gpu_lease.rs` | Taking turns on the shared eGPU: one lease file per GPU job in `%LOCALAPPDATA%\gpu-leases`, the same format as the LONG_RUNS.md snippet. Benchmarks hold an exclusive lease, and long runs pause for one at checkpoints. |
 | `gpu_step/` | The device-resident training step (cubecl, Vulkan, discrete GPU only): flat parameter and gradient buffers, one-launch SGD. In progress, see [`docs/gpu_step_design.md`](docs/gpu_step_design.md). |
 
 Design stance, held consistently throughout: build the primitive
@@ -1027,7 +1028,8 @@ because raw forgetting deltas hid a floor effect.
   With another session's job on the eGPU, dropping a heavy load to Idle
   GPU priority left a small probe's p95 at ~0.5–0.64 s, the same as at
   Normal. The stalls look like the third job's unpreempted packets, so
-  turn-taking is the fix (GPU leases, drafted for LONG_RUNS.md).
+  turn-taking is the fix: `gpu_lease.rs`, which both GPU examples now
+  hold, and the matching rule in LONG_RUNS.md.
 
 ## A note on the name
 
