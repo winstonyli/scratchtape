@@ -219,6 +219,13 @@ impl DeviceParams {
         k_sgd::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), lr, self.len as u32);
     }
 
+    /// One launch: p *= keep over every parameter. Weight decay at rate
+    /// wd is `decay(1 - lr * wd)` before `sgd(lr)`.
+    pub fn decay(&self, keep: f32) {
+        count_launch();
+        k_scale::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), keep, self.len as u32);
+    }
+
     /// One launch: g = 0.
     pub fn zero_grads(&self) {
         count_launch();
@@ -251,6 +258,14 @@ fn k_sgd(p: &mut [f32], g: &[f32], lr: f32, len: u32) {
     let i = ABSOLUTE_POS;
     if (i as u32) < len {
         p[i] -= lr * g[i];
+    }
+}
+
+#[cube(launch)]
+fn k_scale(x: &mut [f32], s: f32, len: u32) {
+    let i = ABSOLUTE_POS;
+    if (i as u32) < len {
+        x[i] *= s;
     }
 }
 
@@ -305,5 +320,9 @@ mod tests {
 
         dev.zero_grads();
         assert!(dev.read(&dev.grads).iter().all(|&g| g == 0.0));
+
+        dev.decay(0.5);
+        let halved = dev.read(&dev.params);
+        assert!(halved.iter().zip(&got).all(|(h, g)| *h == 0.5 * g), "decay(0.5) must halve every parameter exactly");
     }
 }

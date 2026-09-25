@@ -8,7 +8,7 @@
 //
 // One condition per process (crash-isolated, launchable at low priority,
 // per LONG_RUNS.md):
-//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed]
+//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay]
 // `windows` is the total training budget in 64-byte windows (default
 // 64000, tiny_lm_corpus.rs's), so batch size changes steps, not data:
 // steps = windows / batch. Progress streams to stdout as it happens; the
@@ -29,6 +29,9 @@
 // of 0 and the two disagree (docs/gpu_step_design.md, milestone 5).
 //
 // `seed` (default 1) drives both the init and the batch order.
+// `weight_decay` (default 0, GPU only) shrinks every parameter by
+// (1 - lr * weight_decay) each step before the gradient step: L2 on all
+// of them, embeddings, LayerNorm and biases included.
 //
 // Same architecture and init stream as tiny_lm_corpus.rs (seed 1), so
 // batch=1 lr=0.3 reproduces attention_uniformity_check.rs's plain (1.852)
@@ -64,6 +67,11 @@
 //   softmax1  1.8481 +- 0.0091   (1.8603 1.8553 1.8405 1.8403 1.8443)
 // Paired by seed, plain - softmax1 = 0.004, 95% CI [-0.015, 0.023]: no
 // detectable difference at batch 8.
+//
+// Weight decay, plain, held-out mean over seeds 1-5: wd 0 1.8521, 1e-4
+// 1.8353, 2e-4 1.8334, 3e-4 1.8353; 5e-4 1.898 and 1e-3+ underfit (seeds
+// 1-2). On fresh seeds 6-10, 2e-4 vs 0: 1.8405 vs 1.8708, paired gain
+// 0.030, 95% CI [0.007, 0.054].
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, pack, read_f32};
@@ -145,7 +153,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> f32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed]");
+    assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay]");
     let name = &args[1];
     let softmax1 = args[2] == "1";
     let batch: usize = args[3].parse().unwrap();
@@ -159,6 +167,8 @@ fn main() {
     };
     let seed: u64 = args.get(8).map(|s| s.parse().unwrap()).unwrap_or(1);
     assert!(seed != 0, "seed 0 is xorshift's fixed point");
+    let weight_decay: f32 = args.get(9).map(|s| s.parse().unwrap()).unwrap_or(0.0);
+    assert!(weight_decay == 0.0 || gpu, "weight_decay is GPU only");
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
 
@@ -179,7 +189,7 @@ fn main() {
     let opt = Sgd { lr };
 
     // Resume: header "<config> | <step> <rng state>", then the parameters.
-    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed}");
+    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed} wd={weight_decay}");
     let resume_path = format!("runs/{name}.resume");
     let mut first = 0;
     if let Ok(text) = std::fs::read_to_string(&resume_path) {
@@ -270,6 +280,9 @@ fn main() {
             let mut dt = DeviceTape::new(dev);
             let (_, _, dloss) = model_forward(&mut dt, &cfg, &input, &target, batch);
             dt.backward(dloss);
+            if weight_decay > 0.0 {
+                dev.decay(1.0 - lr * weight_decay);
+            }
             dev.sgd(lr);
             continue;
         }

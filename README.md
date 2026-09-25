@@ -449,8 +449,31 @@ run (`... gpu <seed>`, seeds 1–5, ~20–40 s each). Held-out CE:
 
 Paired by seed (same init and batches), plain − softmax1 = 0.004, 95% CI
 [−0.015, 0.023]: **at batch 8 softmax1 makes no detectable difference.**
-Train-probe CE is also level (1.372 vs 1.376). The seed spread, ~0.01, is
-the yardstick for any recipe change here.
+Train-probe CE is also level (1.372 vs 1.376). The seed spread is the
+yardstick for any recipe change here: sd 0.01 over seeds 1–5, 0.02 over
+6–10 (whose plain mean is 1.871), so compare changes paired by seed.
+
+**Weight decay helps a little** (`... gpu <seed> <weight_decay>`,
+2026-09-25). Every parameter shrinks by 1 − lr·wd each step, LayerNorm
+and biases included. Plain, batch 8, held-out CE:
+
+| wd | seeds 1–5, mean ± sd | paired gain over wd 0 |
+|---|---|---|
+| 0 | 1.8521 ± 0.0108 | — |
+| 1e-4 | 1.8353 ± 0.0020 | 0.017 ± 0.005 |
+| 2e-4 | 1.8334 ± 0.0073 | 0.019 ± 0.003 |
+| 3e-4 | 1.8353 ± 0.0081 | 0.017 ± 0.008 |
+| 5e-4 | 1.898 (seeds 1–2) | worse |
+| 1e-3 and up | 1.96–2.75 (seeds 1–2) | underfits |
+
+2e-4 was chosen on those seeds, so it was checked again on fresh seeds
+6–10: 1.8405 vs 1.8708 without decay, a paired gain of **0.030** (95% CI
+[0.007, 0.054]). Train-probe CE barely moves (1.392 vs 1.399), so the
+overfitting gap narrows only from 0.47 to 0.45. Decay also improves the
+fit to the training set a little, rather than just trading training
+loss for held-out loss. It closes ~15–20% of the gap to the 7-gram
+(1.655). Untried: exempting LayerNorm and biases, which might allow a
+larger rate, and dropout.
 
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
