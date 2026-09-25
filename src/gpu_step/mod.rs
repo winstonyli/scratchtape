@@ -30,13 +30,13 @@ pub fn client() -> &'static Client {
 }
 
 /// Every trainable parameter of a plain tiny_lm, flattened in this order:
-/// token embedding, position embedding, each block's `to_fused_flat`, final
+/// token embedding, position embedding, each block's `to_flat`, final
 /// LayerNorm, output projection. Gradients use the same offsets.
 pub fn pack(token_emb: &Embedding, pos_emb: &Embedding, blocks: &[TransformerBlock], final_ln: &LayerNorm, output_proj: &Linear) -> Vec<f32> {
     let mut out = token_emb.to_flat();
     out.extend(pos_emb.to_flat());
     for b in blocks {
-        out.extend(b.to_fused_flat());
+        out.extend(b.to_flat());
     }
     out.extend(final_ln.to_flat());
     out.extend(output_proj.to_flat());

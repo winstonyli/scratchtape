@@ -986,14 +986,22 @@ because raw forgetting deltas hid a floor effect.
   **Milestone 1 done:** `src/gpu_step/` sits in the main crate, with
   cubecl as a plain dependency rather than a feature. It selects the
   discrete GPU on Vulkan and logs it, with no fallback. It keeps the
-  parameters and gradients in flat device buffers, packed with fused QKV
-  by `TransformerBlock::to_fused_flat`, and runs SGD and gradient zeroing
-  as one launch each. The checks are a CPU test of the fused layout and
-  a GPU SGD test against `optim::Sgd` (`cargo test --lib gpu_step --
-  --ignored`); both pass. The CPU model moves to batched heads next,
-  before milestone 2. The decisions (fused QKV storage, `split_heads`/
-  `merge_heads` tape ops, extras via `gather`, bit-exact forward) are in
-  the design note. The CPU tape stays a separate reference rather than
+  parameters and gradients in flat device buffers, packed by
+  `TransformerBlock::to_flat`, and runs SGD and gradient zeroing as one
+  launch each. Its GPU check tests SGD against `optim::Sgd`
+  (`cargo test --lib gpu_step -- --ignored`).
+  **The CPU model now uses batched heads (2026-09-24).** Each block
+  stores one fused QKV `Linear`. New `split_heads`/`merge_heads` tape
+  ops turn attention into one `batched_matmul` over batch × heads, and
+  the per-head extras (QK-norm, sinks) are gathered from `[H, ·]`
+  tables. `batched_heads_match_per_head_reference` checks it against
+  outputs captured from the old per-head code. The forward is
+  bit-identical, and gradients agree to 1e-4 relative (f32
+  reassociation). A 200-step training curve tracks the old one. The step
+  has 280 tape nodes instead of 888 and trains ~1.35× faster; the
+  survey had bounded the gain at ≤1.8×. Old checkpoints load but are
+  wrong, since the length is the same and the order isn't; the ones in
+  `runs/` were converted once. Details are in the design note. The CPU tape stays a separate reference rather than
   running the GPU's cubecl kernels on the CPU. A single cubecl source for
   both was tested and ruled out (2026-09-24, `cubecl_spike cpu-step`):
   - The GPU's tiled matmul never finishes on cubecl's CPU runtime, which

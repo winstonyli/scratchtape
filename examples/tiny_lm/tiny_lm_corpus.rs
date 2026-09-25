@@ -564,7 +564,7 @@ fn attention_graph(
         let mut tape = Tape::new();
         let (_, out) =
             forward(&mut tape, &model.token_emb, &model.pos_emb, &model.blocks, &model.final_ln, &model.output_proj, &window);
-        let weights = tape.value(out.block_outs[0].head_weights[0]);
+        let weights = out.block_outs[0].head_weights_of(&tape, 0);
         for qi in 0..seq_len {
             let qi_idx = byte_index[&window[qi]];
             for ki in 0..seq_len {
@@ -631,7 +631,7 @@ fn attention_graph_all_heads(
             forward(&mut tape, &model.token_emb, &model.pos_emb, &model.blocks, &model.final_ln, &model.output_proj, &window);
         for block in 0..n_blocks {
             for head in 0..n_heads {
-                let weights = tape.value(out.block_outs[block].head_weights[head]);
+                let weights = out.block_outs[block].head_weights_of(&tape, head);
                 for qi in 0..seq_len {
                     let qi_idx = byte_index[&window[qi]];
                     for ki in 0..seq_len {

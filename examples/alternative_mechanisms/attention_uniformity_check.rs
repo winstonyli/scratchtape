@@ -282,18 +282,16 @@ fn analyze(name: &str, m: &Model, train_set: &[usize], filtered: &[usize], v: Va
         let idxs: Vec<usize> = window.iter().map(|b| byte_index[b]).collect();
         let mut tape = Tape::new();
         let (_, out) = forward(&mut tape, &m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj, &window, softmax1);
-        if !out.block_outs[0].attn_gate_values.is_empty() {
+        if out.block_outs[0].attn_gate_value.is_some() {
             gate_n += 1;
             for (b, bo) in out.block_outs.iter().enumerate() {
-                for &g in &bo.attn_gate_values {
-                    let d = &tape.value(g).data;
-                    gate_sum[b] += d.iter().map(|&x| x as f64).sum::<f64>() / d.len() as f64;
-                }
+                let d = &tape.value(bo.attn_gate_value.unwrap()).data;
+                gate_sum[b] += d.iter().map(|&x| x as f64).sum::<f64>() / d.len() as f64;
             }
         }
         if used == 1 {
             for (b, bo) in out.block_outs.iter().enumerate() {
-                sink_values[b] = bo.sink_leaves.iter().map(|&s| tape.value(s).data[0]).collect();
+                sink_values[b] = bo.sink_leaf.map(|s| tape.value(s).data.clone()).unwrap_or_default();
             }
         }
         for qi in 0..SEQ_LEN {
@@ -308,7 +306,7 @@ fn analyze(name: &str, m: &Model, train_set: &[usize], filtered: &[usize], v: Va
         for b in 0..N_BLOCKS {
             for h in 0..N_HEADS {
                 let hid = b * N_HEADS + h;
-                let w = &tape.value(out.block_outs[b].head_weights[h]).data;
+                let w = &out.block_outs[b].head_weights_of(&tape, h).data;
                 for qi in 0..SEQ_LEN {
                     for ki in 0..SEQ_LEN {
                         wsum[hid * n * n + idxs[qi] * n + idxs[ki]] += w[qi * SEQ_LEN + ki];
@@ -376,7 +374,7 @@ fn analyze(name: &str, m: &Model, train_set: &[usize], filtered: &[usize], v: Va
     let hn = heads as f64;
     lines.push(format!("  mean over {heads} heads: KL={:.5} peak={:.3} mass={:.3} null-argmax-agreement={:.2}", kl_all / hn, peak_all / hn, mass_all / hn, agree_all / hn));
     if gate_n > 0 {
-        let per_block: Vec<String> = gate_sum.iter().map(|g| format!("{:.3}", g / (gate_n as f64 * N_HEADS as f64))).collect();
+        let per_block: Vec<String> = gate_sum.iter().map(|g| format!("{:.3}", g / gate_n as f64)).collect();
         lines.push(format!("  mean gate value per block: {}", per_block.join(" ")));
     }
     for (b, sv) in sink_values.iter().enumerate().filter(|(_, sv)| !sv.is_empty()) {

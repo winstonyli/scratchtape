@@ -5,8 +5,8 @@ Goal: run one tiny_lm training step (batch 8, `d_model` 128, 8 heads,
 entirely on the RX 9060 XT eGPU. It must match the CPU tape's losses and
 gradients, and be faster than the CPU step. Status: **milestone 1 done
 (2026-09-24)**. A single cubecl source for CPU and GPU was tested and
-ruled out the same day (experiment below). Next: move the CPU model to
-batched heads (section below), then milestone 2 (kernels).
+ruled out the same day (experiment below). The CPU model moved to
+batched heads the same day (section below). Next: milestone 2 (kernels).
 
 ## What the evidence says
 
@@ -121,12 +121,13 @@ Each milestone leaves a runnable check behind.
 1. **Scaffolding. Done.** Device selection and logging, the flat
    parameter and gradient buffers (`DeviceParams`), and one-launch SGD
    and gradient zeroing.
-   - `TransformerBlock::to_fused_flat` / `from_fused_flat` convert to and
-     from the fused-QKV layout; `gpu_step::pack` flattens a whole model.
-     A whole-model unpack waits for milestone 5, the first thing that
+   - `gpu_step::pack` flattens a whole model with `TransformerBlock::to_flat`,
+     which is already the fused-QKV layout since batched heads. A
+     whole-model unpack waits for milestone 5, the first thing that
      needs one.
-   - Checks: `fused_qkv_layout_round_trips_and_matches_per_head_projections`
-     (CPU, runs by default) and `device_sgd_matches_optim_sgd` (GPU,
+   - Checks: `batched_heads_match_per_head_reference` (CPU, runs by
+     default; it replaced the per-head-to-fused layout test) and
+     `device_sgd_matches_optim_sgd` (GPU,
      `cargo test --lib gpu_step -- --ignored`, since it needs the
      discrete GPU).
 2. **Kernels one by one.** Each forward is compared with the CPU tape's
@@ -176,7 +177,7 @@ other examples. The ops table leaves room for them later.
 
 - None open. The CPU batched-heads question is settled below.
 
-## CPU model: batched heads (decided 2026-09-24)
+## CPU model: batched heads (done 2026-09-24)
 
 The CPU model moves to batched heads before milestone 2, so the GPU ops'
 parity tests compare against a CPU tape with the same layout and op
@@ -235,9 +236,10 @@ rows, no barriers) gets near `NdArray`. See "Next" in the experiment.
     achievable because `NdArray::matmul` accumulates each output element
     over k in the same order at any width. The reference outputs are
     captured before the switch.
-  - Gradients match to 1e-5 relative. They can't be bit-exact: dX now
-    sums 3D columns in one dot product instead of adding 24 per-head
-    partial sums.
+  - Gradients match to 1e-4 relative (the plan said 1e-5; measured
+    worst case 1.05e-5 for parameter gradients, 2.6e-5 for dX). They
+    can't be bit-exact: dX now sums 3D columns in one dot product
+    instead of adding 24 per-head partial sums.
   - A short `training_recipe_check` loss curve tracks the old one.
   - `step_profile` records the CPU step time before and after.
 - **Blast radius:**
@@ -248,6 +250,28 @@ rows, no barriers) gets near `NdArray`. See "Next" in the experiment.
     those become column blocks of `qkv.w`.
   - `softmax1_qknorm_fix` has its own block copy and is unaffected.
   - `to_fused_flat`/`from_fused_flat` become `to_flat`/`from_flat`.
+
+**Results (2026-09-24):**
+- `batched_heads_match_per_head_reference` (in `src/nn.rs`) checks a
+  plain block and a softmax1 block with QK-norm, gate and sinks against
+  `src/testdata/batched_heads_reference.bin`, captured from the
+  per-head code before the switch. The forward is bit-identical;
+  gradients and dX are within 1e-4 relative.
+- `training_recipe_check`, 200 steps (batch 8, lr 0.3): step 0 is
+  identical (6.2731 / 6.3213). Train-probe / held-out end at
+  2.6857 / 2.8260 before and 2.6914 / 2.8318 after, so the curve tracks.
+- Time for 200 steps, back to back on an idle CPU: ~92–105 s before,
+  ~72–73 s after, about 1.35× faster. That is inside the survey's ≤1.8×
+  bound.
+- `step_profile 8 10`: 280 tape nodes per step (was 888); forward
+  144.8 ms, backward 204.3 ms, total 349.4 ms, 37% in matmul.
+- `step_profile 8 1 census`: ~728 launches per step unfused, ~361 fused
+  (7.3 vs 3.6 ms at ~10 µs per launch). The survey had estimated 776 /
+  385.
+- Old checkpoints hold per-head order at the same length, so they load
+  without error but compute garbage. The ones in `runs/` were converted
+  once, with the per-head originals kept as `*.ckpt.perhead`. There is
+  no legacy reader, as decided.
 
 ### Survey: alternatives to full batched heads (2026-09-24)
 
@@ -261,11 +285,11 @@ Re-checked before implementing. Nothing beat the decision above.
 | Strided views / einsum in `NdArray` (the PyTorch way) | General, but a large infrastructure change for one use. |
 | Fuse only QKV into one `Linear`; keep the per-head attention loop via column slices | Smaller blast radius (`head_weights` and extras unchanged). It gets the wide-matmul gain but not the tape-node or launch-structure gain, and it's a second migration later. |
 
-Upper bound on the CPU gain: `step_profile 8 10` with `CENSUS_HEADS=1`
+Upper bound on the CPU gain: `step_profile 8 10` with `CENSUS_HEADS=1` (a stand-in removed once real batched heads landed)
 (same matmul work, 8× less softmax work, so a best case), CPU contended,
 best of 5: 835 ms for 8 heads vs 471 ms for 1 head, **≤1.8×**. Real
 batched heads keeps the per-head softmax work and adds permute copies,
-so expect less.
+so expect less. Measured afterwards: ~1.35×.
 
 ### Experiment: one kernel source on the CPU runtime (2026-09-24)
 

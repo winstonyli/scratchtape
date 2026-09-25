@@ -43,15 +43,7 @@ fn segment_sq_grads(tape: &Tape, out: &ForwardOut, n_blocks: usize) -> Vec<(Stri
     for i in 0..n_blocks {
         let b = &out.block_outs[i];
         let mut total = sq(tape.grad(b.ln1_out.gamma)) + sq(tape.grad(b.ln1_out.beta));
-        for q in &b.q_outs {
-            total += sq(tape.grad(q.w)) + sq(tape.grad(q.b));
-        }
-        for k in &b.k_outs {
-            total += sq(tape.grad(k.w)) + sq(tape.grad(k.b));
-        }
-        for v in &b.v_outs {
-            total += sq(tape.grad(v.w)) + sq(tape.grad(v.b));
-        }
+        total += sq(tape.grad(b.qkv_out.w)) + sq(tape.grad(b.qkv_out.b));
         total += sq(tape.grad(b.out_proj_out.w)) + sq(tape.grad(b.out_proj_out.b));
         total += sq(tape.grad(b.ln2_out.gamma)) + sq(tape.grad(b.ln2_out.beta));
         total += sq(tape.grad(b.ffn1_out.w)) + sq(tape.grad(b.ffn1_out.b));

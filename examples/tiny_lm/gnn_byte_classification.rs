@@ -53,7 +53,7 @@ fn main() {
         let window = encoded[start..start + seq_len].to_vec();
         let mut tape = Tape::new();
         let (_, out) = forward(&mut tape, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &window);
-        let w = tape.value(out.block_outs[0].head_weights[0]);
+        let w = out.block_outs[0].head_weights_of(&tape, 0);
         for qi in 0..seq_len {
             let qi_idx = byte_index[&window[qi]];
             for ki in 0..seq_len {

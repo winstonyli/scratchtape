@@ -123,18 +123,8 @@ fn train_with_fisher(
             let seg = format!("block{i}");
             fisher.accumulate(&seg, tape.grad(block_out.ln1_out.gamma));
             fisher.accumulate(&seg, tape.grad(block_out.ln1_out.beta));
-            for q in &block_out.q_outs {
-                fisher.accumulate(&seg, tape.grad(q.w));
-                fisher.accumulate(&seg, tape.grad(q.b));
-            }
-            for k in &block_out.k_outs {
-                fisher.accumulate(&seg, tape.grad(k.w));
-                fisher.accumulate(&seg, tape.grad(k.b));
-            }
-            for v in &block_out.v_outs {
-                fisher.accumulate(&seg, tape.grad(v.w));
-                fisher.accumulate(&seg, tape.grad(v.b));
-            }
+            fisher.accumulate(&seg, tape.grad(block_out.qkv_out.w));
+            fisher.accumulate(&seg, tape.grad(block_out.qkv_out.b));
             fisher.accumulate(&seg, tape.grad(block_out.out_proj_out.w));
             fisher.accumulate(&seg, tape.grad(block_out.out_proj_out.b));
             fisher.accumulate(&seg, tape.grad(block_out.ln2_out.gamma));

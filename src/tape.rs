@@ -34,6 +34,10 @@ enum OpKind {
     Gather(usize, Vec<usize>),
     Sqrt(usize),
     Log(usize),
+    /// (a, first column, n_heads, batch_size)
+    SplitHeads(usize, usize, usize, usize),
+    /// (a, n_heads, batch_size)
+    MergeHeads(usize, usize, usize),
 }
 
 struct Node {
@@ -107,6 +111,44 @@ fn batched_matmul_backward(a: &NdArray, b: &NdArray, grad: &NdArray, batch_size:
     (NdArray::new(grad_a, a.shape.clone()), NdArray::new(grad_b, b.shape.clone()))
 }
 
+/// Multi-head attention's layout change, as a copy (llm.c's CUDA path does
+/// the same with permute kernels). `a` is [B*T, C] with batch b's rows at
+/// b*T..; columns col0 + h*w + j (j < w) belong to head h. The result is
+/// [B*H*T, w] with head (b, h)'s rows at (b*H + h)*T.., so batched_matmul
+/// over B*H chunks runs every head of every sample in one op.
+fn split_heads_forward(a: &NdArray, col0: usize, n_heads: usize, width: usize, batch_size: usize) -> NdArray {
+    let (cols, t_len) = (a.shape[1], a.shape[0] / batch_size);
+    let mut out = vec![0.0f32; a.shape[0] * n_heads * width];
+    for b in 0..batch_size {
+        for h in 0..n_heads {
+            for t in 0..t_len {
+                let src = (b * t_len + t) * cols + col0 + h * width;
+                let dst = ((b * n_heads + h) * t_len + t) * width;
+                out[dst..dst + width].copy_from_slice(&a.data[src..src + width]);
+            }
+        }
+    }
+    NdArray::new(out, vec![a.shape[0] * n_heads, width])
+}
+
+/// Inverse of split_heads_forward with col0 = 0: [B*H*T, w] -> [B*T, H*w].
+fn merge_heads_forward(a: &NdArray, n_heads: usize, batch_size: usize) -> NdArray {
+    let width = a.shape[1];
+    let t_len = a.shape[0] / (batch_size * n_heads);
+    let cols = n_heads * width;
+    let mut out = vec![0.0f32; a.data.len()];
+    for b in 0..batch_size {
+        for h in 0..n_heads {
+            for t in 0..t_len {
+                let src = ((b * n_heads + h) * t_len + t) * width;
+                let dst = (b * t_len + t) * cols + h * width;
+                out[dst..dst + width].copy_from_slice(&a.data[src..src + width]);
+            }
+        }
+    }
+    NdArray::new(out, vec![batch_size * t_len, cols])
+}
+
 /// Append-only arena. Because an op can only reference Vars that already
 /// exist, every parent index is strictly less than its child's - topological
 /// order falls out of construction, backward() just walks the arena in reverse.
@@ -161,6 +203,8 @@ impl Tape {
                     OpKind::Gather(a, _) => ("Gather", vec![*a]),
                     OpKind::Sqrt(a) => ("Sqrt", vec![*a]),
                     OpKind::Log(a) => ("Log", vec![*a]),
+                    OpKind::SplitHeads(a, ..) => ("SplitHeads", vec![*a]),
+                    OpKind::MergeHeads(a, ..) => ("MergeHeads", vec![*a]),
                 };
                 (name, parents, n.value.data.len())
             })
@@ -299,6 +343,22 @@ impl Tape {
     pub fn sqrt(&mut self, a: Var) -> Var {
         let val = self.nodes[a.idx].value.sqrt();
         self.push(val, OpKind::Sqrt(a.idx))
+    }
+
+    /// Columns `cols` of `a` ([B*T, C]) as `n_heads` heads stacked by
+    /// (sample, head): [B*H*T, cols.len()/H]. A permutation, so its backward
+    /// is the inverse permutation (zero outside `cols`). See
+    /// split_heads_forward for the row order.
+    pub fn split_heads(&mut self, a: Var, cols: std::ops::Range<usize>, n_heads: usize, batch_size: usize) -> Var {
+        let val = split_heads_forward(&self.nodes[a.idx].value, cols.start, n_heads, cols.len() / n_heads, batch_size);
+        self.push(val, OpKind::SplitHeads(a.idx, cols.start, n_heads, batch_size))
+    }
+
+    /// Inverse of split_heads: [B*H*T, w] -> [B*T, H*w], head h in columns
+    /// h*w..(h+1)*w.
+    pub fn merge_heads(&mut self, a: Var, n_heads: usize, batch_size: usize) -> Var {
+        let val = merge_heads_forward(&self.nodes[a.idx].value, n_heads, batch_size);
+        self.push(val, OpKind::MergeHeads(a.idx, n_heads, batch_size))
     }
 
     /// Max-subtraction stability trick, forced by concrete evidence (an
@@ -543,6 +603,22 @@ impl Tape {
                     // this node's own output, unlike Exp/Sqrt above.
                     let a_val = self.nodes[a].value.clone();
                     self.accumulate(a, grad.div(&a_val));
+                }
+                OpKind::SplitHeads(a, col0, n_heads, batch_size) => {
+                    // Merge the heads back, then place them at their
+                    // columns; columns outside the split get zero.
+                    let merged = merge_heads_forward(&grad, n_heads, batch_size);
+                    let shape = self.nodes[a].value.shape.clone();
+                    let (rows, cols, w) = (shape[0], shape[1], merged.shape[1]);
+                    let mut g = vec![0.0f32; rows * cols];
+                    for r in 0..rows {
+                        g[r * cols + col0..][..w].copy_from_slice(&merged.data[r * w..][..w]);
+                    }
+                    self.accumulate(a, NdArray::new(g, shape));
+                }
+                OpKind::MergeHeads(a, n_heads, batch_size) => {
+                    let w = self.nodes[a].value.shape[1];
+                    self.accumulate(a, split_heads_forward(&grad, 0, n_heads, w, batch_size));
                 }
             }
         }
@@ -1098,5 +1174,64 @@ mod tests {
             let numerical = (run(&xp).0 - run(&xm).0) / (2.0 * eps);
             assert!((numerical - grad.data[i]).abs() < 1e-2, "grad[{i}]: numerical {numerical} vs analytical {}", grad.data[i]);
         }
+    }
+
+    /// split_heads puts element (b*T + t, col0 + h*w + j) at
+    /// ((b*H + h)*T + t, j); merge_heads undoes it. Both are permutations,
+    /// so each backward must route every gradient element back to where its
+    /// value came from, with zero for columns the split didn't take.
+    #[test]
+    fn split_and_merge_heads_permute_and_backprop_exactly() {
+        let (b_n, t_n, h_n, w, cols, col0) = (2, 3, 2, 2, 7, 1);
+        let x: Vec<f32> = (0..b_n * t_n * cols).map(|i| i as f32).collect();
+        let mut tape = Tape::new();
+        let xv = tape.leaf(NdArray::new(x.clone(), vec![b_n * t_n, cols]));
+        let split = tape.split_heads(xv, col0..col0 + h_n * w, h_n, b_n);
+        assert_eq!(tape.value(split).shape, vec![b_n * h_n * t_n, w]);
+        for b in 0..b_n {
+            for h in 0..h_n {
+                for t in 0..t_n {
+                    for j in 0..w {
+                        let got = tape.value(split).data[((b * h_n + h) * t_n + t) * w + j];
+                        assert_eq!(got, x[(b * t_n + t) * cols + col0 + h * w + j], "b{b} h{h} t{t} j{j}");
+                    }
+                }
+            }
+        }
+        let merged = tape.merge_heads(split, h_n, b_n);
+        let expect: Vec<f32> = (0..b_n * t_n).flat_map(|r| x[r * cols + col0..][..h_n * w].to_vec()).collect();
+        assert_eq!(tape.value(merged).data, expect);
+
+        // loss = sum(split * c): d loss / d x = c un-permuted.
+        let c: Vec<f32> = (0..b_n * h_n * t_n * w).map(|i| 0.5 + i as f32).collect();
+        let cv = tape.leaf(NdArray::new(c.clone(), vec![b_n * h_n * t_n, w]));
+        let prod = tape.mul(split, cv);
+        let loss = tape.sum(prod);
+        tape.backward(loss);
+        let g = &tape.grad(xv).unwrap().data;
+        for b in 0..b_n {
+            for t in 0..t_n {
+                for col in 0..cols {
+                    let want = if (col0..col0 + h_n * w).contains(&col) {
+                        let (h, j) = ((col - col0) / w, (col - col0) % w);
+                        c[((b * h_n + h) * t_n + t) * w + j]
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(g[(b * t_n + t) * cols + col], want, "b{b} t{t} col{col}");
+                }
+            }
+        }
+
+        // merge_heads' backward: loss = sum(merge(y) * c2) routes c2 back.
+        let mut tape = Tape::new();
+        let yv = tape.leaf(NdArray::new(c.clone(), vec![b_n * h_n * t_n, w]));
+        let m = tape.merge_heads(yv, h_n, b_n);
+        let c2 = tape.leaf(NdArray::new(x[..b_n * t_n * h_n * w].to_vec(), vec![b_n * t_n, h_n * w]));
+        let prod = tape.mul(m, c2);
+        let loss = tape.sum(prod);
+        tape.backward(loss);
+        let back = split_heads_forward(tape.value(c2), 0, h_n, w, b_n);
+        assert_eq!(tape.grad(yv).unwrap().data, back.data);
     }
 }

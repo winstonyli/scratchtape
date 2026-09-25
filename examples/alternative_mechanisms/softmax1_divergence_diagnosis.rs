@@ -121,18 +121,20 @@ fn l2_norm(v: &[f32]) -> f32 {
 }
 
 /// Recomputes raw attention scores (Q@K^T / sqrt(d_k), pre-softmax1)
-/// for one block from its Out struct's leafed Q/K VALUES (out.q_outs[h].y,
-/// the projected per-position vectors this step actually used) - the
+/// for one block from its Out struct's leafed Q/K VALUES (head h's
+/// columns of out.qkv_out.y, the projected per-position vectors this step
+/// actually used) - the
 /// same computation TransformerBlock::forward_full does internally, but
 /// forward_full doesn't expose the pre-softmax scores themselves, only
 /// the post-softmax head_weights. Returns (min, max) across every head
 /// and position pair.
-fn raw_score_range(block_out: &scratchtape::nn::TransformerBlockOut, tape: &Tape, d_k: usize) -> (f32, f32) {
+fn raw_score_range(block_out: &scratchtape::nn::TransformerBlockOut, tape: &Tape, d_k: usize, n_heads: usize) -> (f32, f32) {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
-    for (q_out, k_out) in block_out.q_outs.iter().zip(block_out.k_outs.iter()) {
-        let q = tape.value(q_out.y);
-        let k = tape.value(k_out.y);
+    let qkv = tape.value(block_out.qkv_out.y);
+    for h in 0..n_heads {
+        let q = qkv.slice_last_axis(h * d_k, d_k);
+        let k = qkv.slice_last_axis(n_heads * d_k + h * d_k, d_k);
         let scores = q.matmul(&k.transpose()).scale(1.0 / (d_k as f32).sqrt());
         for &s in &scores.data {
             if s < min {
@@ -180,14 +182,12 @@ fn run(label: &str, use_softmax1: bool, d_model: usize, n_heads: usize, d_ff: us
                 .map(|b| {
                     let mut total = 0.0f32;
                     let mut count = 0usize;
-                    for &w in &b.head_weights {
-                        let arr = tape.value(w);
-                        let rows = arr.shape[0];
-                        let cols = arr.shape[1];
-                        for r in 0..rows {
-                            total += arr.data[r * cols..(r + 1) * cols].iter().sum::<f32>();
-                            count += 1;
-                        }
+                    let arr = tape.value(b.head_weights);
+                    let rows = arr.shape[0];
+                    let cols = arr.shape[1];
+                    for r in 0..rows {
+                        total += arr.data[r * cols..(r + 1) * cols].iter().sum::<f32>();
+                        count += 1;
                     }
                     total / count as f32
                 })
@@ -198,11 +198,14 @@ fn run(label: &str, use_softmax1: bool, d_model: usize, n_heads: usize, d_ff: us
             // this file's header comment. Focusing instead on block0
             // specifically (the block whose row-sum visibly declines,
             // unlike blocks 1-3): raw pre-softmax1 scores, and its Q/K
-            // weight norms (via out.q_outs[h].w/out.k_outs[h].w - THIS
-            // step's actual leafed weight values, not gradients).
+            // weight norms (per head, via Q's and K's column blocks of
+            // out.qkv_out.w - THIS step's actual leafed weight values, not
+            // gradients).
             let block0 = &out.block_outs[0];
-            let (score_min, score_max) = raw_score_range(block0, &tape, d_k);
-            let qk_norm: f32 = block0.q_outs.iter().chain(block0.k_outs.iter()).map(|o| l2_norm(&tape.value(o.w).data)).sum();
+            let (score_min, score_max) = raw_score_range(block0, &tape, d_k, n_heads);
+            // Sum over Q's and K's heads of each head's weight L2 norm.
+            let qk_head_norms = |w: &scratchtape::tensor::NdArray| -> f32 { (0..2 * n_heads).map(|c| l2_norm(&w.slice_last_axis(c * d_k, d_k).data)).sum() };
+            let qk_norm = qk_head_norms(tape.value(block0.qkv_out.w));
             // Gradient magnitude on the SAME Q/K weights, read right after
             // backward() - tests directly whether softmax1's gradient
             // pressure to keep sharpening actually fails to decay the way
@@ -213,13 +216,7 @@ fn run(label: &str, use_softmax1: bool, d_model: usize, n_heads: usize, d_ff: us
             // not confirmed, so the real differentiator has to show up
             // empirically here or the mechanism stays only partially
             // understood.
-            let qk_grad_norm: f32 = block0
-                .q_outs
-                .iter()
-                .chain(block0.k_outs.iter())
-                .filter_map(|o| tape.grad(o.w))
-                .map(|g| l2_norm(&g.data))
-                .sum();
+            let qk_grad_norm = tape.grad(block0.qkv_out.w).map_or(0.0, qk_head_norms);
             println!(
                 "{step:>4} | {loss_val:.6} | row-sum: {:.4} {:.4} {:.4} {:.4} | block0 score [{:.3}, {:.3}] | block0 Q+K L2: {:.3} | block0 Q+K grad L2: {:.3}",
                 row_sums.first().copied().unwrap_or(f32::NAN),

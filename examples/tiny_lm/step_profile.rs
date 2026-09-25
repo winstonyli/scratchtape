@@ -16,16 +16,20 @@
 //
 // Launch census (`step_profile 8 1 census`, 2026-09-24): kernel launches one
 // step would make on a device-resident tape, under the model in `census`.
-// CENSUS_HEADS=1 stands in for batching all heads into one op (same widths,
-// same launch structure). It applies to the timing run too: a best-case
-// bound on the CPU gain from batched heads (<=1.8x, 2026-09-24).
-//   layout            unfused   elementwise-fused   ms at ~10 us/launch
-//   8 heads as ops    2372      1281                23.7 / 12.8
-//   heads batched      776       385                 7.8 /  3.9
-// Per-head ops dominate: 173 matmuls, against 33 with heads batched, and
-// the softmax ops repeat per head too. Batching heads cuts launches 3x, fusion another 2x. The
-// remaining 81 broadcast reduces are bias gradients, which could fold into
-// matmul epilogues. Launch cost only: kernel time comes on top.
+//   layout                    unfused   elementwise-fused   ms at ~10 us/launch
+//   8 heads as ops (before)   2372      1281                23.7 / 12.8
+//   heads batched (estimate)   776       385                 7.8 /  3.9
+//   heads batched (actual)     728       361                 7.3 /  3.6
+// The estimate ran 1 head of width 128 in place of 8 batched heads. Per-head
+// ops dominated before: 173 matmuls, against 33 batched. Batching heads cut
+// launches 3x, fusion would cut another 2x. The remaining broadcast reduces
+// are bias gradients, which could fold into matmul epilogues. Launch cost
+// only: kernel time comes on top.
+//
+// After batched heads (2026-09-24, idle CPU): 280 tape nodes forward.
+//   batch 8: fwd 145 ms + bwd 204 ms = 349 ms, matmul 37%
+// training_recipe_check trains ~1.35x faster than per-head (the estimate
+// bounded it at <=1.8x).
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::{Tape, Var};
@@ -161,7 +165,7 @@ fn main() {
         let m = Model {
             token_emb: Embedding::new(&mut rng, VOCAB, D_MODEL),
             pos_emb: Embedding::new(&mut rng, SEQ_LEN, D_MODEL),
-            blocks: (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, std::env::var("CENSUS_HEADS").map(|h| h.parse().unwrap()).unwrap_or(N_HEADS), D_FF)).collect(),
+            blocks: (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF)).collect(),
             final_ln: LayerNorm::new(D_MODEL),
             output_proj: Linear::new(&mut rng, D_MODEL, VOCAB),
         };
@@ -183,7 +187,7 @@ fn main() {
     let mut m = Model {
         token_emb: Embedding::new(&mut rng, VOCAB, D_MODEL),
         pos_emb: Embedding::new(&mut rng, SEQ_LEN, D_MODEL),
-        blocks: (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, std::env::var("CENSUS_HEADS").map(|h| h.parse().unwrap()).unwrap_or(N_HEADS), D_FF)).collect(),
+        blocks: (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF)).collect(),
         final_ln: LayerNorm::new(D_MODEL),
         output_proj: Linear::new(&mut rng, D_MODEL, VOCAB),
     };
