@@ -408,7 +408,9 @@ One seed; seed-to-seed spread on this metric is unmeasured.
 the recipe one factor at a time at a fixed data budget (64000 windows,
 so batch changes step count, not data), seed 1, SGD lr 0.3, same
 deterministic eval. Train-probe is the first 371 windows of train, for a
-like-for-like overfitting gap:
+like-for-like overfitting gap. Runs take hours, so they save a resumable
+checkpoint every 10 minutes; relaunching the same command continues
+bit-identically (checked by killing and resuming a short run).
 
 | Recipe | Steps | Train-probe | Held-out |
 |---|---|---|---|

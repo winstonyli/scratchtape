@@ -8,11 +8,16 @@
 //
 // One condition per process (crash-isolated, launchable at low priority,
 // per LONG_RUNS.md):
-//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows]
+//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs]
 // `windows` is the total training budget in 64-byte windows (default
 // 64000, tiny_lm_corpus.rs's), so batch size changes steps, not data:
 // steps = windows / batch. Progress streams to stdout as it happens; the
 // final model is saved to runs/<name>.ckpt.
+//
+// Resumable (LONG_RUNS.md): every `checkpoint_secs` (default 600) the
+// step, RNG state and parameters go to runs/<name>.resume. Relaunching
+// the same command continues from there, bit-identical to an unbroken
+// run; the file is removed once the final .ckpt is written.
 //
 // Same architecture and init stream as tiny_lm_corpus.rs (seed 1), so
 // batch=1 lr=0.3 reproduces attention_uniformity_check.rs's plain (1.852)
@@ -37,7 +42,7 @@ use std::time::Instant;
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{ForwardOut, apply_grad, encode_bytes, flatten_all, sample_window};
+use common::{ForwardOut, apply_grad, encode_bytes, flatten_all, reconstruct, sample_window};
 
 const D_MODEL: usize = 128;
 const N_HEADS: usize = 8;
@@ -94,6 +99,7 @@ fn main() {
     let batch: usize = args[3].parse().unwrap();
     let lr: f32 = args[4].parse().unwrap();
     let windows: usize = args.get(5).map(|w| w.parse().unwrap()).unwrap_or(64000);
+    let checkpoint_secs: u64 = args.get(6).map(|s| s.parse().unwrap()).unwrap_or(600);
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
 
@@ -113,10 +119,40 @@ fn main() {
     };
     let opt = Sgd { lr };
 
-    println!("run {name}: pid {} softmax1={softmax1} batch={batch} lr={lr} windows={windows} steps={steps}", std::process::id());
+    // Resume: header "<config> | <step> <rng state>", then the parameters.
+    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows}");
+    let resume_path = format!("runs/{name}.resume");
+    let mut first = 0;
+    if let Ok(text) = std::fs::read_to_string(&resume_path) {
+        let (header, params) = text.split_once('\n').unwrap();
+        let (saved, at) = header.split_once(" | ").unwrap();
+        assert_eq!(saved, config, "{resume_path} is from a different config");
+        let (step, state) = at.split_once(' ').unwrap();
+        first = step.parse().unwrap();
+        rng = Rng::new(state.parse().unwrap());
+        let flat: Vec<f32> = params.split_whitespace().map(|x| x.parse().unwrap()).collect();
+        let (token_emb, pos_emb, blocks, final_ln, output_proj) = reconstruct(&flat, VOCAB, D_MODEL, SEQ_LEN, N_BLOCKS, N_HEADS, D_FF);
+        m = Model { token_emb, pos_emb, blocks, final_ln, output_proj };
+    }
+
+    println!("run {name}: pid {} {config} steps={steps}", std::process::id());
+    if first > 0 {
+        println!("resumed from {resume_path} at step {first}");
+    }
     println!("columns: step | windows seen | train-probe CE | held-out CE (deterministic) | elapsed");
+    std::fs::create_dir_all("runs").unwrap();
     let start = Instant::now();
-    for step in 0..=steps {
+    let mut last_save = Instant::now();
+    for step in first..=steps {
+        // Save before this step's work; `step` is the next one to run.
+        if step > first && last_save.elapsed().as_secs() >= checkpoint_secs {
+            let flat = flatten_all(&m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj);
+            let params = flat.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+            let tmp = format!("{resume_path}.tmp");
+            std::fs::write(&tmp, format!("{config} | {step} {}\n{params}", rng.state())).unwrap();
+            std::fs::rename(&tmp, &resume_path).unwrap();
+            last_save = Instant::now();
+        }
         if step % eval_every == 0 || step == steps {
             println!(
                 "{step:>6} | {:>6} | {:.4} | {:.4} | {:.0}s",
@@ -148,9 +184,9 @@ fn main() {
         apply_grad(&tape, &out, &mut m.token_emb, &mut m.pos_emb, &mut m.blocks, &mut m.final_ln, &mut m.output_proj, &opt);
     }
 
-    std::fs::create_dir_all("runs").unwrap();
     let flat = flatten_all(&m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj);
     let text = flat.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
     std::fs::write(format!("runs/{name}.ckpt"), text).unwrap();
+    let _ = std::fs::remove_file(&resume_path);
     println!("saved runs/{name}.ckpt ({:.0}s total)", start.elapsed().as_secs_f32());
 }

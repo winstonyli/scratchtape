@@ -11,6 +11,12 @@ impl Rng {
         Self(seed)
     }
 
+    /// The whole generator state: `Rng::new(r.state())` continues `r`'s
+    /// stream exactly (for resumable checkpoints).
+    pub fn state(&self) -> u64 {
+        self.0
+    }
+
     pub fn next_f32(&mut self) -> f32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
