@@ -149,8 +149,24 @@ Each milestone leaves a runnable check behind.
      (AttnOut), wasting 3/4 of that launch, and QKV writes row-major
      `[B·T, 3D]`, so a permute into `[B·H·T, d_k]` is a separate launch
      for now.
-   - Next: LayerNorm, Softmax (plain and softmax1), Embed, CrossEntropy,
-     the bias-gradient column reduction, and split/merge heads.
+   - **Row-wise: done (2026-09-24).** `gpu_step::rows`: LayerNorm
+     forward (saves mean and 1/std) and backward (dx written or
+     accumulated; dgamma/dbeta accumulated), Softmax with the score scale
+     and causal mask folded in (plain or softmax1 by comptime flag) and
+     its backward, and the column sum for bias gradients. One unit per
+     row or column, fixed summation order, so deterministic. Checks
+     (ignored; GPU): `layer_norm_matches_cpu_tape` and
+     `softmax_matches_cpu_tape` compare with the CPU tape's composed ops
+     (forward 1e-5, gradients 1e-4 relative) and check the backward by
+     central differences through the GPU forward. softmax1 is also
+     checked at 40× logits, where its max(row max, 0) shift matters.
+     Mutations (dropping softmax1's phantom term, or LayerNorm dx's
+     xhat term) fail them. `col_sum_accumulates_bias_gradient` covers
+     the bias reduction.
+   - One unit per row is the simplest correct shape, not the fastest:
+     512 rows is 2 cubes of 256. Milestone 5 decides whether it matters.
+   - Next: Embed, CrossEntropy, split/merge heads, and the ReLU mask in
+     the matmul epilogue (for FFN1's dX).
 3. **Forward parity.** A block's output and the loss match
    `forward_full` (plain and softmax1) to 1e-4 relative.
 4. **Gradient parity.** Every parameter gradient after one step matches

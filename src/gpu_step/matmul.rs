@@ -233,15 +233,8 @@ fn k_matmul(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu_step::{read, upload};
     use crate::nn::Rng;
-
-    fn upload(v: &[f32]) -> Handle {
-        client().create_from_slice(f32::as_bytes(v))
-    }
-
-    fn read(h: &Handle) -> Vec<f32> {
-        f32::from_bytes(&client().read_one(h.clone()).unwrap()).to_vec()
-    }
 
     /// Plain-loop reference for one case, same argument meaning as `matmul`.
     #[allow(clippy::too_many_arguments)]

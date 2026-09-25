@@ -11,6 +11,7 @@ use cubecl_runtime::runtime::Runtime;
 use std::sync::OnceLock;
 
 pub mod matmul;
+pub mod rows;
 
 /// Units per cube for 1-D elementwise kernels.
 const EW_DIM: u32 = 256;
@@ -102,6 +103,16 @@ fn k_fill(x: &mut [f32], v: f32, len: u32) {
     if (i as u32) < len {
         x[i] = v;
     }
+}
+
+#[cfg(test)]
+fn upload(v: &[f32]) -> Handle {
+    client().create_from_slice(f32::as_bytes(v))
+}
+
+#[cfg(test)]
+fn read(h: &Handle) -> Vec<f32> {
+    f32::from_bytes(&client().read_one(h.clone()).unwrap()).to_vec()
 }
 
 #[cfg(test)]
