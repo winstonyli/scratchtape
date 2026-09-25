@@ -134,6 +134,23 @@ Each milestone leaves a runnable check behind.
    composed ops on the same inputs. Each backward is checked two ways:
    against CPU gradients, and by finite differences through the GPU
    kernels. That's the branch's discipline.
+   - **Matmul: done (2026-09-24).** `gpu_step::matmul` is the one matmul
+     every coarse op uses: the spike's 64×64-tile f32 kernel, generalized
+     to NN/NT/TN by comptime flag, any m/n/k (guarded loads), batched
+     over the grid's z with per-operand strides and element offsets (the
+     parameters live in one flat buffer), and an epilogue of + bias,
+     ReLU, + residual and accumulate-into-out. Check:
+     `matmul_matches_reference` (ignored; needs the GPU) covers every
+     transpose pair, ragged shapes, batch strides, offsets, each epilogue
+     and the step's own shapes, to 1e-5 of the output scale. A
+     deliberately broken NT index fails it. It's linear, so a
+     finite-difference check would add nothing over the reference.
+   - Caveats for milestone 5: the tile is 64×64 even when n is 16
+     (AttnOut), wasting 3/4 of that launch, and QKV writes row-major
+     `[B·T, 3D]`, so a permute into `[B·H·T, d_k]` is a separate launch
+     for now.
+   - Next: LayerNorm, Softmax (plain and softmax1), Embed, CrossEntropy,
+     the bias-gradient column reduction, and split/merge heads.
 3. **Forward parity.** A block's output and the loss match
    `forward_full` (plain and softmax1) to 1e-4 relative.
 4. **Gradient parity.** Every parameter gradient after one step matches

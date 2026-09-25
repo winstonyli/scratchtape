@@ -1,6 +1,7 @@
 //! Device-resident training step on the discrete eGPU (cubecl, Vulkan
 //! SPIR-V). Design and milestones: docs/gpu_step_design.md. Milestone 1:
-//! device selection, the flat parameter/gradient buffers, SGD.
+//! device selection, the flat parameter/gradient buffers, SGD. Milestone 2:
+//! the kernels, one module each, each with a GPU parity test.
 use crate::nn::{Embedding, LayerNorm, Linear, TransformerBlock};
 use cubecl::client::Client;
 use cubecl::prelude::*;
@@ -8,6 +9,8 @@ use cubecl::server::Handle;
 use cubecl::wgpu::{RuntimeOptions, Vulkan, WgpuDevice, WgpuDeviceKind, WgpuRuntime, init_setup};
 use cubecl_runtime::runtime::Runtime;
 use std::sync::OnceLock;
+
+pub mod matmul;
 
 /// Units per cube for 1-D elementwise kernels.
 const EW_DIM: u32 = 256;
