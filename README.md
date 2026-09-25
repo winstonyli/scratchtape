@@ -472,8 +472,29 @@ and biases included. Plain, batch 8, held-out CE:
 overfitting gap narrows only from 0.47 to 0.45. Decay also improves the
 fit to the training set a little, rather than just trading training
 loss for held-out loss. It closes ~15–20% of the gap to the 7-gram
-(1.655). Untried: exempting LayerNorm and biases, which might allow a
-larger rate, and dropout.
+(1.655).
+
+**Exempting LayerNorm and biases, and dropout, don't help** (`... gpu
+<seed> <wd> weights [dropout]`, 2026-09-25). Plain, batch 8, held-out
+CE, seeds 1 and 2:
+
+| setting | seed 1 | seed 2 | mean | train-probe |
+|---|---|---|---|---|
+| no regularization | 1.8573 | 1.8448 | 1.8511 | 1.36 |
+| decay 2e-4, all parameters | 1.8401 | 1.8361 | 1.8381 | 1.39 |
+| decay 2e-4 / 5e-4 / 1e-3 / 2e-3, weights only | 1.8447 / 1.8466 / 1.8606 / 1.9194 | 1.8377 / 1.8549 / 1.8925 / 1.9940 | 1.8412 / 1.8508 / 1.8766 / 1.9567 | 1.35 / 1.40 / 1.50 / 1.64 |
+| dropout 0.05 / 0.1 / 0.2 | 1.8676 / 1.9048 / 1.9825 | 1.8689 / 1.9020 / 1.9808 | 1.8683 / 1.9034 / 1.9817 | 1.47 / 1.55 / 1.67 |
+
+Exempting LayerNorm and biases doesn't permit a larger rate: the
+weights-only curve peaks at the same 2e-4 and underfits the same way above
+it, so the decay that helps is on the weights (sparing the gains and
+biases fits the training set slightly better, 1.35 vs 1.39, for the same
+held-out CE). Dropout (on each block's
+attention output and FFN hidden layer) is worse at every rate, and worse
+the higher the rate. It does narrow the train/held-out gap (0.49 → 0.40
+at 0.05), but by slowing the fit to the training set more than it helps
+held-out: in 8000 steps the model hasn't fit enough for dropout's noise to
+pay. A longer run is where it could; untested.
 
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention

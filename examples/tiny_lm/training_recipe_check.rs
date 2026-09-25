@@ -8,7 +8,7 @@
 //
 // One condition per process (crash-isolated, launchable at low priority,
 // per LONG_RUNS.md):
-//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay]
+//   training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout]
 // `windows` is the total training budget in 64-byte windows (default
 // 64000, tiny_lm_corpus.rs's), so batch size changes steps, not data:
 // steps = windows / batch. Progress streams to stdout as it happens; the
@@ -29,9 +29,12 @@
 // of 0 and the two disagree (docs/gpu_step_design.md, milestone 5).
 //
 // `seed` (default 1) drives both the init and the batch order.
-// `weight_decay` (default 0, GPU only) shrinks every parameter by
-// (1 - lr * weight_decay) each step before the gradient step: L2 on all
-// of them, embeddings, LayerNorm and biases included.
+// `weight_decay` (default 0, GPU only) shrinks parameters by
+// (1 - lr * weight_decay) each step before the gradient step: every one
+// (`all`, the default), or only the weights and embeddings (`weights`:
+// LayerNorm and biases exempt, Config::decay_mask). `dropout` (default
+// 0, GPU only) is the rate on each block's attention output and FFN
+// hidden layer (gpu_step::tape::block_forward), training steps only.
 //
 // Same architecture and init stream as tiny_lm_corpus.rs (seed 1), so
 // batch=1 lr=0.3 reproduces attention_uniformity_check.rs's plain (1.852)
@@ -71,10 +74,13 @@
 // Weight decay, plain, held-out mean over seeds 1-5: wd 0 1.8521, 1e-4
 // 1.8353, 2e-4 1.8334, 3e-4 1.8353; 5e-4 1.898 and 1e-3+ underfit (seeds
 // 1-2). On fresh seeds 6-10, 2e-4 vs 0: 1.8405 vs 1.8708, paired gain
-// 0.030, 95% CI [0.007, 0.054].
+// 0.030, 95% CI [0.007, 0.054]. Seeds 1-2, held-out mean (wd 0: 1.8511,
+// all 2e-4: 1.8381): weights-only 2e-4 1.8412, 5e-4 1.8508, 1e-3 1.8766,
+// 2e-3 1.9567, so exempting LayerNorm and biases allows no larger rate;
+// dropout 0.05 1.8683, 0.1 1.9034, 0.2 1.9817, worse at every rate.
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
-use scratchtape::gpu_step::{DeviceParams, pack, read_f32};
+use scratchtape::gpu_step::{DeviceParams, pack, read_f32, upload_f32};
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
 use scratchtape::tape::{Tape, Var};
@@ -153,7 +159,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> f32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay]");
+    assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout]");
     let name = &args[1];
     let softmax1 = args[2] == "1";
     let batch: usize = args[3].parse().unwrap();
@@ -169,6 +175,13 @@ fn main() {
     assert!(seed != 0, "seed 0 is xorshift's fixed point");
     let weight_decay: f32 = args.get(9).map(|s| s.parse().unwrap()).unwrap_or(0.0);
     assert!(weight_decay == 0.0 || gpu, "weight_decay is GPU only");
+    let decay_all = match args.get(10).map(String::as_str) {
+        None | Some("all") => true,
+        Some("weights") => false,
+        Some(other) => panic!("decay applies to all or weights, not {other}"),
+    };
+    let dropout: f32 = args.get(11).map(|s| s.parse().unwrap()).unwrap_or(0.0);
+    assert!(dropout == 0.0 || gpu, "dropout is GPU only");
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
 
@@ -189,7 +202,7 @@ fn main() {
     let opt = Sgd { lr };
 
     // Resume: header "<config> | <step> <rng state>", then the parameters.
-    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed} wd={weight_decay}");
+    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed} wd={weight_decay} decay_all={decay_all} dropout={dropout}");
     let resume_path = format!("runs/{name}.resume");
     let mut first = 0;
     if let Ok(text) = std::fs::read_to_string(&resume_path) {
@@ -210,6 +223,10 @@ fn main() {
     let _lease = gpu.then(|| gpu_lease::hold(Kind::Shared, &format!("scratchtape training_recipe_check {name}"), Duration::from_secs(4 * 3600)));
     let dev = gpu.then(|| DeviceParams::upload(&pack(&m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj)));
     let cfg = Config { vocab: VOCAB, d: D_MODEL, heads: N_HEADS, d_ff: D_FF, t: SEQ_LEN, n_blocks: N_BLOCKS, softmax1 };
+    let decay_mask = (weight_decay > 0.0).then(|| {
+        let mask = if decay_all { vec![1.0; cfg.len()] } else { cfg.decay_mask() };
+        upload_f32(&mask)
+    });
     let sync = |m: &mut Model| {
         if let Some(dev) = &dev {
             let (token_emb, pos_emb, blocks, final_ln, output_proj) = reconstruct(&dev.read(&dev.params), VOCAB, D_MODEL, SEQ_LEN, N_BLOCKS, N_HEADS, D_FF);
@@ -277,11 +294,16 @@ fn main() {
         }
         if let Some(dev) = &dev {
             dev.zero_grads();
-            let mut dt = DeviceTape::new(dev);
+            let mut dt = if dropout > 0.0 {
+                // A fresh mask every step, reproducible from (seed, step).
+                DeviceTape::with_dropout(dev, dropout, (seed as u32).wrapping_mul(0x85eb_ca6b) ^ step as u32)
+            } else {
+                DeviceTape::new(dev)
+            };
             let (_, _, dloss) = model_forward(&mut dt, &cfg, &input, &target, batch);
             dt.backward(dloss);
-            if weight_decay > 0.0 {
-                dev.decay(1.0 - lr * weight_decay);
+            if let Some(mask) = &decay_mask {
+                dev.decay(lr * weight_decay, mask);
             }
             dev.sgd(lr);
             continue;

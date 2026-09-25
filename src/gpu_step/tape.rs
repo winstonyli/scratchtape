@@ -34,6 +34,7 @@ enum Op {
     /// each operand and c laid out in its node as its `Layout` says.
     BatchedMatmul { a: usize, b: usize, lay: [Layout; 3], batch: usize, m: usize, k: usize, n: usize, trans_b: bool },
     Softmax { x: usize, scale: f32 },
+    Dropout { x: usize, rate: f32, seed: u32 },
     CrossEntropy { logits: usize, targets: Handle, fwd: CeOut, vocab: usize },
 }
 
@@ -58,11 +59,21 @@ struct Node {
 pub struct DeviceTape<'p> {
     params: &'p DeviceParams,
     nodes: Vec<Node>,
+    /// Dropout rate and this step's seed; None: `dropout` passes through.
+    dropout: Option<(f32, u32)>,
 }
 
 impl<'p> DeviceTape<'p> {
     pub fn new(params: &'p DeviceParams) -> Self {
-        Self { params, nodes: Vec::new() }
+        Self { params, nodes: Vec::new(), dropout: None }
+    }
+
+    /// A tape whose `dropout` ops zero each element with probability
+    /// `rate` (and scale the rest by 1 / (1 - rate)). `seed` should change
+    /// every step; the masks are a hash of it, the op and the element.
+    pub fn with_dropout(params: &'p DeviceParams, rate: f32, seed: u32) -> Self {
+        assert!((0.0..1.0).contains(&rate));
+        Self { params, nodes: Vec::new(), dropout: Some((rate, seed)) }
     }
 
     pub fn value(&self, v: DVar) -> &Handle {
@@ -182,6 +193,16 @@ impl<'p> DeviceTape<'p> {
         (g, !full_write)
     }
 
+    /// Dropout on x if the tape has a rate (`with_dropout`), else x.
+    pub fn dropout(&mut self, x: DVar) -> DVar {
+        let Some((rate, seed)) = self.dropout else { return x };
+        // A distinct seed per node: the node index, mixed in.
+        let seed = seed ^ (self.nodes.len() as u32).wrapping_mul(0x9e37_79b9);
+        let (rows, cols) = self.shape(x);
+        let y = dropout(self.value(x), rows * cols, rate, seed);
+        self.push(y, rows, cols, Op::Dropout { x: x.0, rate, seed })
+    }
+
     /// Adds a finished gradient buffer into node v's: aliases it if v has
     /// none yet (see the module doc), otherwise one add launch.
     fn add_grad(&mut self, v: usize, g: Handle) {
@@ -270,6 +291,11 @@ impl<'p> DeviceTape<'p> {
                     let dx = softmax_backward(&dy.unwrap(), &self.nodes[i].value, rows, cols, scale);
                     self.add_grad(x, dx);
                 }
+                Op::Dropout { x, rate, seed } => {
+                    // The forward's mask and scale, regenerated from the seed.
+                    let dx = dropout(&dy.unwrap(), rows * cols, rate, seed);
+                    self.add_grad(x, dx);
+                }
             }
         }
     }
@@ -315,6 +341,22 @@ impl Config {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Weight decay's usual mask, in `pack` order: 1 for the embedding
+    /// tables and Linear weights, 0 for LayerNorm gains and shifts and
+    /// for biases.
+    pub fn decay_mask(&self) -> Vec<f32> {
+        let (d, f, v) = (self.d, self.d_ff, self.vocab);
+        let mut mask = vec![1.0; (v + self.t) * d];
+        // (weights, then parameters exempt), per piece; LayerNorm is (0, 2d).
+        let block = [(0, 2 * d), (d * 3 * d, 3 * d), (d * d, d), (0, 2 * d), (d * f, f), (f * d, d)];
+        let pieces = (0..self.n_blocks).flat_map(|_| block).chain([(0, 2 * d), (d * v, v)]);
+        for (weights, exempt) in pieces {
+            mask.extend(std::iter::repeat_n(1.0, weights));
+            mask.extend(std::iter::repeat_n(0.0, exempt));
+        }
+        assert_eq!(mask.len(), self.len());
+        mask
+    }
 }
 
 /// One transformer block, as `TransformerBlock::forward_full` without the
@@ -336,9 +378,11 @@ pub fn block_forward(tape: &mut DeviceTape, cfg: &Config, x: DVar, off: usize, b
     let scores = tape.batched_matmul(qkv, head(0), qkv, head(d), batch * h, true, Layout::Stacked);
     let weights = tape.causal_softmax(scores, 1.0 / (dk as f32).sqrt(), cfg.softmax1);
     let merged = tape.batched_matmul(weights, Layout::Stacked, qkv, head(2 * d), batch * h, false, head(0));
+    let merged = tape.dropout(merged);
     let x1 = tape.linear(merged, out_off, d, false, Some(x));
     let ln2 = tape.layer_norm(x1, ln2_off);
     let hidden = tape.linear(ln2, ffn1_off, f, true, None);
+    let hidden = tape.dropout(hidden);
     tape.linear(hidden, ffn2_off, d, false, Some(x1))
 }
 
@@ -376,6 +420,36 @@ fn k_add_into(dst: &mut [f32], src: &[f32], len: u32) {
 }
 
 /// dz = dy where y > 0, else 0: ReLU's backward from its output.
+/// y = x / (1 - rate) where hash(seed, i) >= rate·2³², else 0; one
+/// launch. Applied to dy with the same seed, it is dropout's backward.
+pub fn dropout(x: &Handle, len: usize, rate: f32, seed: u32) -> Handle {
+    let y = client().empty(len * 4);
+    let threshold = (rate as f64 * 4294967296.0) as u32;
+    super::count_launch();
+    k_dropout::launch(client(), CubeCount::Static((len as u32).div_ceil(EW_DIM), 1, 1), CubeDim::new_1d(EW_DIM), buf(x, len), buf(&y, len), seed, threshold, 1.0 / (1.0 - rate), len as u32);
+    y
+}
+
+/// lowbias32 (Wellons) of i + seed·golden ratio: an independent-looking
+/// 32-bit value per (seed, i).
+#[cube(launch)]
+fn k_dropout(x: &[f32], y: &mut [f32], seed: u32, threshold: u32, scale: f32, len: u32) {
+    let i = ABSOLUTE_POS;
+    if (i as u32) < len {
+        let mut h = (i as u32) + seed * 0x9e37_79b9u32;
+        h ^= h >> 16;
+        h *= 0x7feb_352du32;
+        h ^= h >> 15;
+        h *= 0x846c_a68bu32;
+        h ^= h >> 16;
+        let mut v = 0.0f32;
+        if h >= threshold {
+            v = x[i] * scale;
+        }
+        y[i] = v;
+    }
+}
+
 #[cube(launch)]
 fn k_relu_mask(dy: &[f32], y: &[f32], dz: &mut [f32], len: u32) {
     let i = ABSOLUTE_POS;
@@ -394,6 +468,88 @@ mod tests {
     use crate::gpu_step::{pack, read};
     use crate::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
     use crate::tape::{Tape, Var};
+
+    /// decay_mask against a fresh model's `pack`: there, LayerNorm gains
+    /// are 1 and its shifts and all biases 0, while weights and
+    /// embeddings are random. So the exempt parameters must be exactly
+    /// the ones equal to 0 or 1, with one gain per LayerNorm unit.
+    #[test]
+    fn decay_mask_exempts_layer_norm_and_biases() {
+        let cfg = Config { vocab: 21, d: 16, heads: 4, d_ff: 24, t: 6, n_blocks: 2, softmax1: false };
+        let mut rng = Rng::new(5);
+        let tok = Embedding::new(&mut rng, cfg.vocab, cfg.d);
+        let pos = Embedding::new(&mut rng, cfg.t, cfg.d);
+        let blocks: Vec<_> = (0..cfg.n_blocks).map(|_| TransformerBlock::new(&mut rng, cfg.d, cfg.heads, cfg.d_ff)).collect();
+        let flat = pack(&tok, &pos, &blocks, &LayerNorm::new(cfg.d), &Linear::new(&mut rng, cfg.d, cfg.vocab));
+        let mask = cfg.decay_mask();
+        assert_eq!(mask.len(), flat.len());
+        for (i, (p, m)) in flat.iter().zip(&mask).enumerate() {
+            assert_eq!(*m == 0.0, *p == 0.0 || *p == 1.0, "parameter {i} = {p}, mask {m}");
+        }
+        let gains = flat.iter().zip(&mask).filter(|(p, m)| **m == 0.0 && **p == 1.0).count();
+        assert_eq!(gains, (2 * cfg.n_blocks + 1) * cfg.d);
+    }
+
+    /// Dropout's mask: about `rate` of the elements zeroed and the rest
+    /// scaled exactly; the same elements for dy (the backward pass) as for
+    /// x under one seed, and different ones under another seed.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn dropout_masks_match_between_passes() {
+        let (n, rate) = (100_000, 0.1f32);
+        let x: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 1e-3).collect();
+        let dy: Vec<f32> = (0..n).map(|i| -2.0 - i as f32 * 1e-4).collect();
+        let pass = |v: &[f32], seed| read(&dropout(&crate::gpu_step::upload_f32(v), n, rate, seed));
+        let (y, dx, other) = (pass(&x, 7), pass(&dy, 7), pass(&x, 8));
+        let kept = y.iter().filter(|&&v| v != 0.0).count();
+        assert!((kept as f32 / n as f32 - (1.0 - rate)).abs() < 0.005, "kept {kept} of {n}");
+        let scale = 1.0 / (1.0 - rate);
+        for i in 0..n {
+            assert_eq!(y[i] == 0.0, dx[i] == 0.0, "masks differ at {i}");
+            assert!(y[i] == 0.0 || (y[i] == x[i] * scale && dx[i] == dy[i] * scale), "scale at {i}");
+        }
+        let same = (0..n).filter(|&i| (y[i] == 0.0) == (other[i] == 0.0)).count();
+        assert!(same < n * 19 / 20, "seed 8's mask matches seed 7's on {same} of {n}");
+    }
+
+    /// Backward through dropout, end to end: the loss's finite difference
+    /// along the gradient matches the gradient's norm, with the masks held
+    /// fixed by the seed (small config, rate 0.3). Dropout must also
+    /// change the loss.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn dropout_gradient_matches_finite_difference() {
+        let cfg = Config { vocab: 21, d: 16, heads: 4, d_ff: 24, t: 6, n_blocks: 2, softmax1: false };
+        let batch = 3;
+        let mut rng = Rng::new(9);
+        let tok = Embedding::new(&mut rng, cfg.vocab, cfg.d);
+        let pos = Embedding::new(&mut rng, cfg.t, cfg.d);
+        let blocks: Vec<_> = (0..cfg.n_blocks).map(|_| TransformerBlock::new(&mut rng, cfg.d, cfg.heads, cfg.d_ff)).collect();
+        let flat = pack(&tok, &pos, &blocks, &LayerNorm::new(cfg.d), &Linear::new(&mut rng, cfg.d, cfg.vocab));
+        let mut ids = || (0..batch * cfg.t).map(|_| (rng.next_f32() * cfg.vocab as f32) as usize % cfg.vocab).collect::<Vec<_>>();
+        let (input, target) = (ids(), ids());
+        let loss_at = |p: &[f32], rate: Option<f32>, grad: bool| {
+            let dev = DeviceParams::upload(p);
+            let mut dt = match rate {
+                Some(r) => DeviceTape::with_dropout(&dev, r, 11),
+                None => DeviceTape::new(&dev),
+            };
+            let (_, _, l) = model_forward(&mut dt, &cfg, &input, &target, batch);
+            if grad {
+                dt.backward(l);
+            }
+            (read(dt.value(l))[0], dev.read(&dev.grads))
+        };
+        let (loss, g) = loss_at(&flat, Some(0.3), true);
+        assert!((loss - loss_at(&flat, None, false).0).abs() > 1e-3, "dropout didn't change the loss");
+        let norm = g.iter().map(|v| v * v).sum::<f32>().sqrt();
+        // The error shrinks as eps² down to 3e-4 (curvature), then float
+        // noise takes over; no dropout behaves the same.
+        let eps = 3e-4;
+        let moved = |s: f32| flat.iter().zip(&g).map(|(p, gi)| p + s * eps * gi / norm).collect::<Vec<_>>();
+        let fd = (loss_at(&moved(1.0), Some(0.3), false).0 - loss_at(&moved(-1.0), Some(0.3), false).0) / (2.0 * eps);
+        assert!((fd - norm).abs() < 1e-2 * norm, "finite difference {fd} vs |grad| {norm}");
+    }
 
     /// Relative to each parameter tensor's (or activation's) own scale.
     fn rel_err(got: &[f32], want: &[f32]) -> f32 {

@@ -219,11 +219,12 @@ impl DeviceParams {
         k_sgd::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), lr, self.len as u32);
     }
 
-    /// One launch: p *= keep over every parameter. Weight decay at rate
-    /// wd is `decay(1 - lr * wd)` before `sgd(lr)`.
-    pub fn decay(&self, keep: f32) {
+    /// One launch: p *= 1 - shrink * mask over every parameter (mask is
+    /// 0 or 1 per parameter, e.g. `Config::decay_mask`). Weight decay at
+    /// rate wd is `decay(lr * wd, mask)` before `sgd(lr)`.
+    pub fn decay(&self, shrink: f32, mask: &Handle) {
         count_launch();
-        k_scale::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), keep, self.len as u32);
+        k_decay::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(mask, self.len), shrink, self.len as u32);
     }
 
     /// One launch: g = 0.
@@ -248,6 +249,11 @@ pub fn read_f32(h: &Handle) -> f32 {
     f32::from_bytes(&client().read_one(h.clone()).unwrap())[0]
 }
 
+/// A new device buffer holding `v` (crosses USB4; not per step).
+pub fn upload_f32(v: &[f32]) -> Handle {
+    client().create_from_slice(f32::as_bytes(v))
+}
+
 fn buf(h: &Handle, len: usize) -> BufferArg {
     // Safety: every handle here is created with at least `len` f32s.
     unsafe { BufferArg::from_raw_parts(h.clone(), len) }
@@ -262,10 +268,10 @@ fn k_sgd(p: &mut [f32], g: &[f32], lr: f32, len: u32) {
 }
 
 #[cube(launch)]
-fn k_scale(x: &mut [f32], s: f32, len: u32) {
+fn k_decay(p: &mut [f32], mask: &[f32], shrink: f32, len: u32) {
     let i = ABSOLUTE_POS;
     if (i as u32) < len {
-        x[i] *= s;
+        p[i] *= 1.0 - shrink * mask[i];
     }
 }
 
@@ -321,8 +327,10 @@ mod tests {
         dev.zero_grads();
         assert!(dev.read(&dev.grads).iter().all(|&g| g == 0.0));
 
-        dev.decay(0.5);
-        let halved = dev.read(&dev.params);
-        assert!(halved.iter().zip(&got).all(|(h, g)| *h == 0.5 * g), "decay(0.5) must halve every parameter exactly");
+        let mask: Vec<f32> = (0..flat.len()).map(|i| (i % 3 == 0) as u32 as f32).collect();
+        dev.decay(0.5, &upload_f32(&mask));
+        let decayed = dev.read(&dev.params);
+        let exact = decayed.iter().zip(&got).zip(&mask).all(|((d, g), m)| *d == if *m == 1.0 { 0.5 * g } else { *g });
+        assert!(exact, "decay(0.5) must halve exactly the masked parameters and leave the rest");
     }
 }
