@@ -7,7 +7,11 @@
 //!   stride, and an element offset into its buffer (parameters live in
 //!   one flat buffer);
 //! - an epilogue: + bias[col], ReLU, the ReLU backward mask, + residual,
-//!   and accumulate into out.
+//!   and accumulate into out;
+//! - split-k for shapes with too few output tiles to fill the GPU (the
+//!   weight gradients, Xᵀ·dY with k = the batch's rows): slices of k run
+//!   in parallel into a scratch buffer, then one launch sums them in a
+//!   fixed order, so results stay deterministic.
 use super::{buf, client};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -54,13 +58,24 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
     let (bias_h, bias_off) = epi.bias.unwrap_or((dummy, 0));
     let (mask_h, mask_off) = epi.mask.unwrap_or((dummy, 0));
     let (res_h, res_off) = epi.residual.unwrap_or((dummy, 0));
-    let count = CubeCount::Static((n as u32).div_ceil(64), (m as u32).div_ceil(64), batch as u32);
+    let tiles = n.div_ceil(64) * m.div_ceil(64);
+    let k_blocks = k.div_ceil(16);
+    let epi_free = epi.bias.is_none() && !epi.relu && epi.mask.is_none() && epi.residual.is_none();
+    let splits = if batch == 1 && epi_free { split_count(tiles, k_blocks) } else { 1 };
+    let slice_blocks = k_blocks.div_ceil(splits);
+    let count = CubeCount::Static((n as u32).div_ceil(64), (m as u32).div_ceil(64), (batch * splits) as u32);
     let u = |x: usize| x as u32;
+    // Split: each slice writes its own [m, n] partial, no epilogue.
+    let scratch = (splits > 1).then(|| client().empty(splits * m * n * 4));
+    let (out_h, out_off, out_stride, accumulate) = match &scratch {
+        Some(h) => (h, 0, m * n, false),
+        None => (out.h, out.off, out.stride, epi.accumulate),
+    };
     super::count_launch_as(|| {
         let t = |x: bool| if x { "T" } else { "N" };
         let ops = [(epi.bias.is_some(), " +bias"), (epi.relu, " relu"), (epi.mask.is_some(), " mask"), (epi.residual.is_some(), " +res"), (epi.accumulate, " +=")];
         let epi: String = ops.iter().filter(|o| o.0).map(|o| o.1).collect();
-        format!("{batch}x[{m}x{k}]{}·[{k}x{n}]{}{epi}", t(a.trans), t(b.trans))
+        format!("{batch}x[{m}x{k}]{}·[{k}x{n}]{}{epi} split {splits}", t(a.trans), t(b.trans))
     });
     k_matmul::launch(
         client(),
@@ -68,19 +83,21 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
         CubeDim::new_2d(16, 16),
         whole(a.h),
         whole(b.h),
-        whole(out.h),
+        whole(out_h),
         whole(bias_h),
         whole(mask_h),
         whole(res_h),
         u(m),
         u(n),
         u(k),
+        u(slice_blocks),
+        u(splits),
         u(a.off),
         u(a.stride),
         u(b.off),
         u(b.stride),
-        u(out.off),
-        u(out.stride),
+        u(out_off),
+        u(out_stride),
         u(bias_off),
         u(mask_off),
         u(res_off),
@@ -90,8 +107,39 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
         epi.relu,
         epi.mask.is_some(),
         epi.residual.is_some(),
-        epi.accumulate,
+        accumulate,
     );
+    if let Some(partial) = &scratch {
+        let len = m * n;
+        super::count_launch_as(|| format!("split-k sum {splits}x[{m}x{n}]"));
+        k_split_sum::launch(client(), CubeCount::Static((len as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), whole(partial), whole(out.h), u(len), u(splits), u(out.off), epi.accumulate);
+    }
+}
+
+/// How many slices to split k into: enough that the output tiles times
+/// the slices reach `SPLIT_TARGET` cubes, each slice keeping at least 4
+/// blocks of 16 (64 of k). 1 means no split.
+fn split_count(tiles: usize, k_blocks: usize) -> usize {
+    SPLIT_TARGET.div_ceil(tiles).min(k_blocks / 4).max(1)
+}
+
+const SPLIT_TARGET: usize = 64;
+
+/// out[i] (+)= sum over s of partial[s * len + i], s ascending.
+#[cube(launch)]
+fn k_split_sum(partial: &[f32], out: &mut [f32], len: u32, splits: u32, o_off: u32, #[comptime] accumulate: bool) {
+    let i = ABSOLUTE_POS as u32;
+    if i < len {
+        let mut v = 0.0f32;
+        for s in 0..splits {
+            v += partial[(s * len + i) as usize];
+        }
+        let o = (o_off + i) as usize;
+        if accumulate {
+            v += out[o];
+        }
+        out[o] = v;
+    }
 }
 
 /// A whole buffer as a kernel argument.
@@ -124,6 +172,8 @@ fn k_matmul(
     m: u32,
     n: u32,
     k: u32,
+    slice_blocks: u32,
+    splits: u32,
     a_off: u32,
     a_stride: u32,
     b_off: u32,
@@ -144,11 +194,16 @@ fn k_matmul(
     let tx = UNIT_POS_X;
     let ty = UNIT_POS_Y;
     let tid = ty * 16 + tx;
+    // z = batch * splits + slice; the output index keeps the whole z, so a
+    // split's slices land in separate partials.
     let z = CUBE_POS_Z;
+    let zb = z / splits;
+    let kb0 = (z % splits) * slice_blocks;
+    let kb1 = u32::min(kb0 + slice_blocks, k.div_ceil(16));
     let row0 = CUBE_POS_Y * 64;
     let col0 = CUBE_POS_X * 64;
-    let a0 = a_off + z * a_stride;
-    let b0 = b_off + z * b_stride;
+    let a0 = a_off + zb * a_stride;
+    let b0 = b_off + zb * b_stride;
     let mut a_s = Shared::<[f32]>::new_slice(1024usize);
     let mut b_s = Shared::<[f32]>::new_slice(1024usize);
     let mut acc = Array::<f32>::new(16usize);
@@ -157,7 +212,7 @@ fn k_matmul(
     for i in 0..16u32 {
         acc[i as usize] = 0.0;
     }
-    for kk in 0..k.div_ceil(16) {
+    for kk in kb0..kb1 {
         #[unroll]
         for i in 0..4u32 {
             let e = tid + 256 * i;
@@ -311,7 +366,9 @@ mod tests {
             (3, 33, 17, 65, false, true, true, true, false, false, false),
             (3, 64, 64, 64, true, false, false, false, false, true, true),
             (1, 512, 128, 384, false, false, true, false, false, false, false), // QKV forward
-            (1, 128, 512, 384, true, false, false, false, false, false, true),  // dW (TN), accumulated
+            (1, 128, 512, 384, true, false, false, false, false, false, true),  // dW (TN), accumulated, split 6
+            (1, 128, 512, 128, true, false, false, false, false, false, true),  // dW, split 8
+            (1, 70, 300, 20, true, false, false, false, false, false, false),   // split 4, ragged last slice
             (1, 512, 256, 128, false, true, false, false, false, false, false), // dX (NT)
             (64, 64, 16, 64, false, true, false, false, false, false, false),  // AttnScores
             (64, 64, 64, 16, false, false, false, false, false, false, false), // AttnOut

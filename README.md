@@ -1050,7 +1050,11 @@ because raw forgetting deltas hid a floor effect.
     Results stay deterministic.
   - **Matmul per shape.** The weight-gradient matmuls (Xᵀ·dY, k = 512)
     now take ~44% of the step: their small outputs make only 4–12 cubes
-    of 64×64 on 32 compute units. Split-k is the next fix.
+    of 64×64 on 32 compute units.
+  - **Split-k (2026-09-24).** Such matmuls now split k into slices that
+    run in parallel, then sum the partials in a fixed order (still
+    deterministic). Step: **~3.3 ms best** (was 4.6); kernel time
+    2.36 ms, so launch overhead (209 launches) is now ~1 ms of the step.
   Details: `docs/gpu_step_design.md`, milestone 5.
   The CPU tape stays a separate reference rather than
   running the GPU's cubecl kernels on the CPU. A single cubecl source for

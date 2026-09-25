@@ -11,8 +11,8 @@ done the same day, and so were milestones 3 and 4 (forward and gradient
 parity with the CPU tape).** **Milestone 5 done the same day: the
 device step trains like the CPU tape and takes ~9.5 ms on an idle eGPU,
 ~14× under the kill criterion.** Parallel row reductions then halved it
-to ~4.6 ms (milestone 5, "Row reductions"). Next: split-k for the
-weight-gradient matmuls (44% of the step), then milestone 6 (optional).
+to ~4.6 ms (milestone 5, "Row reductions"), and split-k matmuls to
+~3.3 ms (milestone 5, "Split-k"). Next: milestone 6 (optional).
 
 ## What the evidence says
 
@@ -376,6 +376,35 @@ Each milestone leaves a runnable check behind.
      in a fixed order into the gradient (keeps determinism; one extra
      launch per dW). s = 4–8 gives 16–96 cubes. Smaller tiles (32×32) are
      the alternative but shorten each cube's reuse; measure both.
+   - **Split-k (done 2026-09-24).** `matmul` splits k itself when a call
+     has batch 1, no epilogue but `+=`, and fewer than `SPLIT_TARGET` = 64
+     output tiles: slices = ceil(64 / tiles), capped so each slice keeps
+     ≥ 64 of k. Each slice is one z of the grid and writes its own [m, n]
+     partial to a scratch buffer; `k_split_sum` then adds the partials in
+     ascending order into out. Results stay deterministic, at one extra
+     launch per split call (175 → 209 launches). The dW matmuls split
+     6–8 ways; the unmasked dX matmuls (512 × 128 outputs, 16 tiles) split
+     2–4 ways, which the rule picked up on its own.
+
+     Target sweep, plain, 101 steps, idle eGPU, best of two rounds
+     (best ms per round):
+
+     | SPLIT_TARGET | round 1 | round 2 |
+     |---|---|---|
+     | off | 4.61 | 4.73 |
+     | 32 | 3.69 | 3.82 |
+     | **64** | **3.25** | 3.53 |
+     | 128 | 3.57 | 3.49 |
+
+     64 and 128 are within noise of each other; 64 needs half the
+     scratch. Profile at 64 (idle): kernel time 3.47 → **2.36 ms**. The
+     four dW shapes went from ~1.9 ms to 0.32 ms, plus 0.14 ms of sums.
+     The wall step (~3.3 ms) is now ~1 ms above kernel time, so launch
+     and submit overhead matters again: with 209 launches, the DX12
+     comparison (milestone 6) and fusing the split sums into a following
+     kernel are the next levers. Checks: new matmul test cases (split 6,
+     split 8, and split 4 with a ragged last slice); dropping the first
+     partial from the sum fails the test (error 50 at scale 109).
    - **Negative result: a sync-after-every-launch profiler didn't work.**
      Its step ran at ~70–100 ms. The ~0.5 ms round trip charged to each
      launch swamped the kernels, so it couldn't rank them. Device
