@@ -163,6 +163,7 @@ impl<'p> DeviceTape<'p> {
         let len = self.nodes[v].rows * self.nodes[v].cols;
         let g = client().empty(len * 4);
         if !full_write {
+            super::count_launch();
             k_fill::launch(client(), CubeCount::Static((len as u32).div_ceil(EW_DIM), 1, 1), CubeDim::new_1d(EW_DIM), buf(&g, len), 0.0f32, len as u32);
         }
         self.nodes[v].grad = Some(g.clone());
@@ -176,6 +177,7 @@ impl<'p> DeviceTape<'p> {
             None => self.nodes[v].grad = Some(g),
             Some(dst) => {
                 let len = self.nodes[v].rows * self.nodes[v].cols;
+                super::count_launch();
                 k_add_into::launch(client(), CubeCount::Static((len as u32).div_ceil(EW_DIM), 1, 1), CubeDim::new_1d(EW_DIM), buf(dst, len), buf(&g, len), len as u32);
             }
         }
@@ -212,6 +214,7 @@ impl<'p> DeviceTape<'p> {
                     if relu {
                         let masked = client().empty(rows * cols * 4);
                         let len = rows * cols;
+                        super::count_launch();
                         k_relu_mask::launch(client(), CubeCount::Static((len as u32).div_ceil(EW_DIM), 1, 1), CubeDim::new_1d(EW_DIM), buf(&dz, len), buf(&self.nodes[i].value, len), buf(&masked, len), len as u32);
                         dz = masked;
                     }
@@ -459,6 +462,73 @@ mod tests {
             }
             assert_eq!(off, g.len(), "{what}: gradient layout");
             eprintln!("{what}: {} device ops; worst gradient {:.1e} ({})", dt.len(), worst.0, worst.1);
+        }
+    }
+
+    /// Needs the discrete GPU. Milestone 5 at unit scale: several SGD
+    /// steps on both tapes from the same init and batches (small ragged
+    /// model); after every step the loss and every parameter must still
+    /// agree. Catches anything that carries over between steps (gradient
+    /// zeroing, in-place updates, buffer reuse), which the one-step test
+    /// can't. Small on purpose: at the real size (512 rows, 4 blocks) one
+    /// of the ~524k FFN pre-activations lands within float rounding of 0
+    /// about once a step, so the two tapes' ReLUs disagree on it (step 1
+    /// at seed 13: +7.0e-7 on the CPU, <= 0 on the GPU). That unit's whole
+    /// gradient flips, the parameters part by ~1e-4, and from then on
+    /// dozens of units flip per step. Neither tape is wrong; at that size
+    /// the comparison is the training outcome (gpu_train_check).
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn device_training_tracks_cpu_over_steps() {
+        use crate::optim::Sgd;
+        let cfg = Config { vocab: 21, d: 16, heads: 4, d_ff: 24, t: 6, n_blocks: 2, softmax1: false };
+        let (batch, lr) = (3, 0.3);
+        let mut rng = Rng::new(13);
+        let mut tok = Embedding::new(&mut rng, cfg.vocab, cfg.d);
+        let mut pos = Embedding::new(&mut rng, cfg.t, cfg.d);
+        let mut blocks: Vec<_> = (0..cfg.n_blocks).map(|_| TransformerBlock::new(&mut rng, cfg.d, cfg.heads, cfg.d_ff)).collect();
+        let mut final_ln = LayerNorm::new(cfg.d);
+        let mut proj = Linear::new(&mut rng, cfg.d, cfg.vocab);
+        let dev = DeviceParams::upload(&pack(&tok, &pos, &blocks, &final_ln, &proj));
+        let opt = Sgd { lr };
+        let rows = batch * cfg.t;
+        for step in 0..6 {
+            let ids: Vec<usize> = (0..rows).map(|_| (rng.next_gaussian().abs() * 1e4) as usize % cfg.vocab).collect();
+            let targets: Vec<usize> = (0..rows).map(|_| (rng.next_gaussian().abs() * 1e4) as usize % cfg.vocab).collect();
+            dev.zero_grads();
+            let mut dt = DeviceTape::new(&dev);
+            let (_, _, dloss) = model_forward(&mut dt, &cfg, &ids, &targets, batch);
+            dt.backward(dloss);
+            dev.sgd(lr);
+            let gl = read(dt.value(dloss))[0];
+
+            let mut tape = Tape::new();
+            let positions: Vec<usize> = (0..batch).flat_map(|_| 0..cfg.t).collect();
+            let (to, po) = (tok.forward(&mut tape, &ids), pos.forward(&mut tape, &positions));
+            let mut x = tape.add(to.y, po.y);
+            let mut bouts = Vec::new();
+            for b in &blocks {
+                let o = b.forward_full(&mut tape, x, batch, false);
+                x = o.y;
+                bouts.push(o);
+            }
+            let lo = final_ln.forward(&mut tape, x);
+            let po2 = proj.forward(&mut tape, lo.y);
+            let loss = tape.cross_entropy(po2.y, &targets);
+            tape.backward(loss);
+            tok.apply_grad(&tape, &to, &opt);
+            pos.apply_grad(&tape, &po, &opt);
+            for (b, o) in blocks.iter_mut().zip(&bouts) {
+                b.apply_grad(&tape, o, &opt);
+            }
+            final_ln.apply_grad(&tape, &lo, &opt);
+            proj.apply_grad(&tape, &po2, &opt);
+            let cl = tape.value(loss).data[0];
+
+            let e = rel_err(&dev.read(&dev.params), &pack(&tok, &pos, &blocks, &final_ln, &proj));
+            eprintln!("step {step}: loss cpu {cl:.6} gpu {gl:.6}; parameters off by {e:.1e}");
+            assert!((gl - cl).abs() <= 1e-4 * cl.abs(), "step {step}: loss {gl} vs {cl}");
+            assert!(e < 1e-4, "step {step}: parameters off by {e}");
         }
     }
 }

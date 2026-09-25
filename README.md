@@ -1021,8 +1021,24 @@ because raw forgetting deltas hid a floor effect.
   full tiny_lm step (batch 8, 4 blocks, plain softmax and softmax1)
   matches the CPU tape to 1e-4: every block's output, the logits, the
   loss, and every parameter gradient. The worst gradient error measured
-  was 1.7e-5 (`device_step_matches_cpu_tape`). Next is milestone 5:
-  training parity and timing against the CPU step.
+  was 1.7e-5 (`device_step_matches_cpu_tape`).
+  **Milestone 5 done (2026-09-24): the device step trains like the CPU
+  and is ~27× faster.**
+  - **Training parity.** `gpu_train_check` runs 200 steps of
+    training_recipe_check's recipe on both tapes in lockstep. Final
+    train-probe / held-out CE:
+    - plain: GPU 2.6892 / 2.8332 vs CPU 2.6914 / 2.8318;
+    - softmax1: GPU 2.6428 / 2.7863 vs CPU 2.6551 / 2.7888.
+    Both gaps are the size a 1e-6 nudge to one CPU weight produces.
+  - **Why the runs drift apart.** The two runs agree at step 0, then
+    drift: at real size, about once a step one of ~524k FFN
+    pre-activations falls within rounding of 0, and the two ReLUs
+    disagree on it. From then on the runs are chaotic twins, not a bug.
+  - **Timing (idle eGPU).** A GPU step takes 9.4–9.6 ms best, 175
+    launches, vs 259–292 ms for the single-threaded CPU tape. That is
+    ~14× under the 130 ms kill criterion.
+  - **Contention.** With other jobs on the eGPU, steps took 0.2–25 s.
+  Details: `docs/gpu_step_design.md`, milestone 5.
   The CPU tape stays a separate reference rather than
   running the GPU's cubecl kernels on the CPU. A single cubecl source for
   both was tested and ruled out (2026-09-24, `cubecl_spike cpu-step`):

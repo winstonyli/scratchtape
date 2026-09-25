@@ -15,6 +15,7 @@ fn whole(h: &Handle) -> BufferArg {
 pub fn split_heads(src: &Handle, cols: usize, col0: usize, n_heads: usize, width: usize, batch: usize, t: usize) -> Handle {
     let len = batch * n_heads * t * width;
     let out = client().empty(len * 4);
+    super::count_launch();
     k_split::launch(client(), CubeCount::Static((len as u32).div_ceil(EW_DIM), 1, 1), CubeDim::new_1d(EW_DIM), whole(src), whole(&out), len as u32, cols as u32, col0 as u32, n_heads as u32, width as u32, t as u32);
     out
 }
@@ -26,6 +27,7 @@ pub fn split_heads(src: &Handle, cols: usize, col0: usize, n_heads: usize, width
 #[allow(clippy::too_many_arguments)]
 pub fn merge_heads(src: &Handle, dst: &Handle, cols: usize, col0: usize, n_heads: usize, width: usize, batch: usize, t: usize, accumulate: bool) {
     let len = batch * n_heads * t * width;
+    super::count_launch();
     k_merge::launch(client(), CubeCount::Static((len as u32).div_ceil(EW_DIM), 1, 1), CubeDim::new_1d(EW_DIM), whole(src), whole(dst), len as u32, cols as u32, col0 as u32, n_heads as u32, width as u32, t as u32, accumulate);
 }
 

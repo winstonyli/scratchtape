@@ -34,6 +34,7 @@ pub struct LnOut {
 /// `off` and `off + d` in `params` (`LayerNorm::to_flat` order).
 pub fn layer_norm(x: &Handle, rows: usize, d: usize, params: &Handle, off: usize, eps: f32) -> LnOut {
     let out = LnOut { y: empty(rows * d), mean: empty(rows), rstd: empty(rows) };
+    super::count_launch();
     k_ln_fwd::launch(client(), cubes(rows), CubeDim::new_1d(EW_DIM), whole(x), whole(params), whole(&out.y), whole(&out.mean), whole(&out.rstd), rows as u32, d as u32, off as u32, eps);
     out
 }
@@ -43,7 +44,9 @@ pub fn layer_norm(x: &Handle, rows: usize, d: usize, params: &Handle, off: usize
 #[allow(clippy::too_many_arguments)]
 pub fn layer_norm_backward(dy: &Handle, x: &Handle, fwd: &LnOut, rows: usize, d: usize, params: &Handle, grads: &Handle, off: usize, dx: &Handle, accumulate: bool) {
     let c = client();
+    super::count_launch();
     k_ln_bwd_dx::launch(c, cubes(rows), CubeDim::new_1d(EW_DIM), whole(dy), whole(x), whole(params), whole(&fwd.mean), whole(&fwd.rstd), whole(dx), rows as u32, d as u32, off as u32, accumulate);
+    super::count_launch();
     k_ln_bwd_params::launch(c, cubes(d), CubeDim::new_1d(EW_DIM), whole(dy), whole(x), whole(&fwd.mean), whole(&fwd.rstd), whole(grads), rows as u32, d as u32, off as u32);
 }
 
@@ -54,6 +57,7 @@ pub fn layer_norm_backward(dy: &Handle, x: &Handle, fwd: &LnOut, rows: usize, d:
 /// `Tape::softmax1`.
 pub fn softmax(x: &Handle, rows: usize, n: usize, t: usize, scale: f32, causal: bool, one: bool) -> Handle {
     let y = empty(rows * n);
+    super::count_launch();
     k_softmax_fwd::launch(client(), cubes(rows), CubeDim::new_1d(EW_DIM), whole(x), whole(&y), rows as u32, n as u32, t as u32, scale, causal, one);
     y
 }
@@ -63,6 +67,7 @@ pub fn softmax(x: &Handle, rows: usize, n: usize, t: usize, scale: f32, causal: 
 /// of its output; masked entries have y = 0, so they get 0).
 pub fn softmax_backward(dy: &Handle, y: &Handle, rows: usize, n: usize, scale: f32) -> Handle {
     let dx = empty(rows * n);
+    super::count_launch();
     k_softmax_bwd::launch(client(), cubes(rows), CubeDim::new_1d(EW_DIM), whole(dy), whole(y), whole(&dx), rows as u32, n as u32, scale);
     dx
 }
@@ -70,6 +75,7 @@ pub fn softmax_backward(dy: &Handle, y: &Handle, rows: usize, n: usize, scale: f
 /// out[off + j] += sum over rows of x[r, j], for x [rows, n]: a bias
 /// gradient.
 pub fn col_sum(x: &Handle, rows: usize, n: usize, out: &Handle, off: usize) {
+    super::count_launch();
     k_col_sum::launch(client(), cubes(n), CubeDim::new_1d(EW_DIM), whole(x), whole(out), rows as u32, n as u32, off as u32);
 }
 

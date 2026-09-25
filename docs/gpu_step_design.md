@@ -8,8 +8,9 @@ gradients, and be faster than the CPU step. Status: **milestone 1 done
 ruled out the same day (experiment below). The CPU model moved to
 batched heads the same day (section below). **Milestone 2 (kernels)
 done the same day, and so were milestones 3 and 4 (forward and gradient
-parity with the CPU tape).** Next: milestone 5 (training parity and
-timing).
+parity with the CPU tape).** **Milestone 5 done the same day: the
+device step trains like the CPU tape and takes ~9.5 ms on an idle eGPU,
+~14× under the kill criterion.** Next: milestone 6 (optional).
 
 ## What the evidence says
 
@@ -233,6 +234,59 @@ Each milestone leaves a runnable check behind.
    - GPU runs go at Normal CPU priority, not BelowNormal: with every
      core busy, BelowNormal made round trips ~25× slower
      (`gpu_cpu_priority_check.rs`).
+   - **Done (2026-09-24).** `gpu_train_check` runs both tapes in
+     lockstep on the same batches (training_recipe_check's setup: seed 1,
+     batch 8, lr 0.3, 200 steps).
+   - **Exact tracking stops at real size, and neither tape is wrong.**
+     Step 0 matches (loss difference 9.5e-7). By step 20 the losses
+     differ by 0.56. The cause is ReLU kinks: the real step has ~524k FFN
+     pre-activations, and about once a step one lands within float
+     rounding of 0, so the two tapes' ReLUs disagree. Seed 13, step 1:
+     one unit, block 3 row 127, is +7.0e-7 on the CPU and ≤ 0 on the
+     GPU. That flips the whole gradient of that unit. The embedding
+     gradient error sits on the same row, and the parameters then differ
+     by ~1e-4. From step 2, dozens of units flip each step. The GPU
+     backward is deterministic (three reruns, bit-identical). The small
+     test config has ~600× fewer pre-activations and stays at 7e-7 for
+     6 steps. So `device_training_tracks_cpu_over_steps` checks the
+     small config only, and at real size the check is the training
+     outcome.
+   - **Yardstick: CPU vs a nudged CPU** (`gpu_train_check <s> 200
+     control [index]`). This is the CPU tape again, from an init with
+     one weight moved by 1e-6. The first attempt nudged token 0, which
+     never occurs in the corpus, so it changed nothing. Nudging a block
+     weight gives a loss gap of 0.38 at step 40, the same shape as the
+     GPU's 0.81.
+
+     | final CE (train-probe / held-out) | CPU | GPU | CPU, nudged 1e-6 |
+     |---|---|---|---|
+     | plain | 2.6914 / 2.8318 | 2.6892 / 2.8332 | 2.6988 / 2.8400 (1 site) |
+     | softmax1 | 2.6551 / 2.7888 | 2.6428 / 2.7863 | 2.6436–2.6657 / 2.7871–2.7961 (4 sites) |
+
+     The GPU's gaps (≤ 0.0022 plain; 0.0123 / 0.0025 softmax1) are the
+     size of a 1e-6 nudge's. The softmax1 train-probe gap is at the edge
+     of the four nudges' range (−0.0115 to +0.0106).
+   - **Timing (idle eGPU, exclusive lease, 100 steps back to back,
+     `gpu_train_check <s> 101 time`):**
+     - GPU step: 9.60 ms best / 10.18 ms median (plain), 9.38 / 10.05
+       (softmax1).
+     - Launches: 175 per step.
+     - CPU step, in the same runs: 259 / 292 ms best (single-threaded
+       tape).
+     - The kill criterion (~130 ms) is beaten ~14×.
+     - The GPU step is still 2–5× over the 2–5 ms estimate. The launch
+       floor is ~1.75 ms (175 × ~10 µs), so ~8 ms is kernel time or
+       queueing that isn't yet explained.
+   - **Contention dominates any timing.** With 5 other jobs on the eGPU,
+     the lockstep runs' GPU steps took 1–25 s. With one other job, back
+     to back, they took ~208 ms. Idle, they took ~9.5 ms. Any GPU time
+     measured without first checking the eGPU's process list is
+     meaningless.
+   - **Negative result: a sync-after-every-launch profiler didn't work.**
+     Its step ran at ~70–100 ms. The ~0.5 ms round trip charged to each
+     launch swamps the kernels, so it can't rank them, and it was
+     removed. Finding the missing ~8 ms needs GPU timestamp queries, or
+     fewer launches (see "Launch count is the lever").
 6. **Optional:** cmma f16 matmul behind a flag, a DX12 comparison, and a
    longer run of `training_recipe_check` on the GPU.
 

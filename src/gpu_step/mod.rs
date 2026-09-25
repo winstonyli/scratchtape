@@ -5,10 +5,11 @@
 use crate::nn::{Embedding, LayerNorm, Linear, TransformerBlock};
 use cubecl::client::Client;
 use cubecl::prelude::*;
-use cubecl::server::Handle;
+pub use cubecl::server::Handle;
 use cubecl::wgpu::{RuntimeOptions, Vulkan, WgpuDevice, WgpuDeviceKind, WgpuRuntime, init_setup};
 use cubecl_runtime::runtime::Runtime;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub mod heads;
 pub mod matmul;
@@ -20,6 +21,13 @@ pub mod tokens;
 const EW_DIM: u32 = 256;
 
 static CLIENT: OnceLock<Client> = OnceLock::new();
+
+/// Kernel launches queued so far, for counting launches per step.
+pub static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+
+fn count_launch() {
+    LAUNCHES.fetch_add(1, Ordering::Relaxed);
+}
 
 /// The first discrete GPU, on Vulkan. Never falls back to the iGPU or CPU:
 /// cubecl panics with "No Discrete GPU device found" if there's none, and
@@ -69,11 +77,13 @@ impl DeviceParams {
 
     /// One launch: p -= lr * g over every parameter.
     pub fn sgd(&self, lr: f32) {
+        count_launch();
         k_sgd::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), lr, self.len as u32);
     }
 
     /// One launch: g = 0.
     pub fn zero_grads(&self) {
+        count_launch();
         k_fill::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.grads, self.len), 0.0f32, self.len as u32);
     }
 
@@ -85,6 +95,12 @@ impl DeviceParams {
     fn cubes(&self) -> CubeCount {
         CubeCount::Static((self.len as u32).div_ceil(EW_DIM), 1, 1)
     }
+}
+
+/// The first f32 of a buffer, blocking: a training step's one readback
+/// (the loss).
+pub fn read_f32(h: &Handle) -> f32 {
+    f32::from_bytes(&client().read_one(h.clone()).unwrap())[0]
 }
 
 fn buf(h: &Handle, len: usize) -> BufferArg {

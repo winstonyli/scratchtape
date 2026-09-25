@@ -122,6 +122,10 @@ path = "examples/gpu/gpu_priority_check.rs"
 name = "gpu_cpu_priority_check"
 path = "examples/gpu/gpu_cpu_priority_check.rs"
 
+[[example]]
+name = "gpu_train_check"
+path = "examples/gpu/gpu_train_check.rs"
+
 # alternative computational/training mechanisms
 [[example]]
 name = "attention_recall"

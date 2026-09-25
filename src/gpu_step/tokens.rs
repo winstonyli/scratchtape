@@ -23,6 +23,7 @@ pub fn upload_ids(ids: &[usize]) -> Handle {
 /// tables sit in `params` at `tok_off` [vocab, d] and `pos_off` [t, d].
 pub fn embed(ids: &Handle, rows: usize, d: usize, t: usize, params: &Handle, tok_off: usize, pos_off: usize) -> Handle {
     let y = client().empty(rows * d * 4);
+    super::count_launch();
     k_embed::launch(client(), cubes(rows * d), CubeDim::new_1d(EW_DIM), whole(ids), whole(params), whole(&y), rows as u32, d as u32, t as u32, tok_off as u32, pos_off as u32);
     y
 }
@@ -33,7 +34,9 @@ pub fn embed(ids: &Handle, rows: usize, d: usize, t: usize, params: &Handle, tok
 #[allow(clippy::too_many_arguments)]
 pub fn embed_backward(dy: &Handle, ids: &Handle, rows: usize, d: usize, t: usize, vocab: usize, grads: &Handle, tok_off: usize, pos_off: usize) {
     let c = client();
+    super::count_launch();
     k_embed_bwd_tok::launch(c, cubes(vocab * d), CubeDim::new_1d(EW_DIM), whole(dy), whole(ids), whole(grads), rows as u32, d as u32, vocab as u32, tok_off as u32);
+    super::count_launch();
     k_embed_bwd_pos::launch(c, cubes(t * d), CubeDim::new_1d(EW_DIM), whole(dy), whole(grads), rows as u32, d as u32, t as u32, pos_off as u32);
 }
 
@@ -53,7 +56,9 @@ pub fn cross_entropy(logits: &Handle, targets: &Handle, rows: usize, vocab: usiz
     let c = client();
     let out = CeOut { loss: c.empty(4), lse: c.empty(rows * 4) };
     let row_loss = c.empty(rows * 4);
+    super::count_launch();
     k_ce_rows::launch(c, cubes(rows), CubeDim::new_1d(EW_DIM), whole(logits), whole(targets), whole(&out.lse), whole(&row_loss), rows as u32, vocab as u32);
+    super::count_launch();
     k_mean::launch(c, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1), whole(&row_loss), whole(&out.loss), rows as u32);
     out
 }
@@ -62,6 +67,7 @@ pub fn cross_entropy(logits: &Handle, targets: &Handle, rows: usize, vocab: usiz
 /// mean loss. One launch.
 pub fn cross_entropy_backward(logits: &Handle, targets: &Handle, fwd: &CeOut, rows: usize, vocab: usize) -> Handle {
     let dl = client().empty(rows * vocab * 4);
+    super::count_launch();
     k_ce_bwd::launch(client(), cubes(rows * vocab), CubeDim::new_1d(EW_DIM), whole(logits), whole(targets), whole(&fwd.lse), whole(&dl), rows as u32, vocab as u32);
     dl
 }

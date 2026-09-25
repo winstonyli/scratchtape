@@ -56,6 +56,7 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
     let (res_h, res_off) = epi.residual.unwrap_or((dummy, 0));
     let count = CubeCount::Static((n as u32).div_ceil(64), (m as u32).div_ceil(64), batch as u32);
     let u = |x: usize| x as u32;
+    super::count_launch();
     k_matmul::launch(
         client(),
         count,

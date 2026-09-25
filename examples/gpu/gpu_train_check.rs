@@ -1,0 +1,233 @@
+// Milestone 5 of docs/gpu_step_design.md: does the device tape train like
+// the CPU tape, and is its step faster?
+//   gpu_train_check [softmax1 0|1] [steps=200] [control [index] | time]
+// training_recipe_check's setup (tiny_lm, batch 8, lr 0.3, seed 1): the
+// same init and the same batches go to both tapes, in lockstep. Prints
+// both training losses as it goes, then both models' train-probe and
+// held-out CE (evaluated on the CPU; the GPU's parameters are read back
+// once), then step times and launches per step.
+// `control` runs no GPU: the second column is the CPU tape again, from an
+// init with one weight (default mid-vector, a block weight) nudged by 1e-6. That's how far two
+// runs drift from a rounding-sized difference alone, the yardstick for
+// the GPU's drift (its ReLUs disagree with the CPU's on a unit or so a
+// step; see device_training_tracks_cpu_over_steps).
+// `time` runs GPU steps only, back to back (no CPU step in between to let
+// the GPU clock down), and reports best/median step ms.
+// Holds an exclusive GPU lease; runs at Normal CPU priority (LONG_RUNS.md:
+// a BelowNormal GPU feeder starves under load).
+use scratchtape::gpu_lease::{self, Kind};
+use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
+use scratchtape::gpu_step::{DeviceParams, LAUNCHES, client, pack, read_f32};
+use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
+use scratchtape::optim::Sgd;
+use scratchtape::tape::{Tape, Var};
+use std::io::Write;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+#[path = "../common/mod.rs"]
+mod common;
+use common::{ForwardOut, apply_grad, encode_bytes, reconstruct, sample_window};
+
+const D_MODEL: usize = 128;
+const N_HEADS: usize = 8;
+const D_FF: usize = 256;
+const SEQ_LEN: usize = 64;
+const VOCAB: usize = 256;
+const N_BLOCKS: usize = 4;
+const BATCH: usize = 8;
+const LR: f32 = 0.3;
+
+struct Model {
+    token_emb: Embedding,
+    pos_emb: Embedding,
+    blocks: Vec<TransformerBlock>,
+    final_ln: LayerNorm,
+    output_proj: Linear,
+}
+
+/// As training_recipe_check.rs.
+fn forward(tape: &mut Tape, m: &Model, input_ids: &[usize], batch: usize, softmax1: bool) -> (Var, ForwardOut) {
+    let positions: Vec<usize> = (0..batch).flat_map(|_| 0..SEQ_LEN).collect();
+    let tok_out = m.token_emb.forward(tape, input_ids);
+    let pos_out = m.pos_emb.forward(tape, &positions);
+    let mut x = tape.add(tok_out.y, pos_out.y);
+    let mut block_outs = Vec::with_capacity(m.blocks.len());
+    for block in &m.blocks {
+        let out = block.forward_full(tape, x, batch, softmax1);
+        x = out.y;
+        block_outs.push(out);
+    }
+    let ln_out = m.final_ln.forward(tape, x);
+    let proj_out = m.output_proj.forward(tape, ln_out.y);
+    (proj_out.y, ForwardOut { tok_out, pos_out, block_outs, ln_out, proj_out })
+}
+
+/// As training_recipe_check.rs: mean CE over every non-overlapping window.
+fn full_ce(m: &Model, corpus: &[usize], softmax1: bool) -> f32 {
+    let starts: Vec<usize> = (0..corpus.len() - SEQ_LEN).step_by(SEQ_LEN).collect();
+    let mut total = 0.0;
+    for &s in &starts {
+        let mut tape = Tape::new();
+        let (logits, _) = forward(&mut tape, m, &corpus[s..s + SEQ_LEN], 1, softmax1);
+        let loss = tape.cross_entropy(logits, &corpus[s + 1..s + SEQ_LEN + 1]);
+        total += tape.value(loss).data[0];
+    }
+    total / starts.len() as f32
+}
+
+/// One CPU SGD step; returns the loss.
+fn cpu_step(m: &mut Model, input: &[usize], target: &[usize], softmax1: bool, opt: &Sgd) -> f32 {
+    let mut tape = Tape::with_capacity(2000);
+    let (logits, out) = forward(&mut tape, m, input, BATCH, softmax1);
+    let loss = tape.cross_entropy(logits, target);
+    tape.backward(loss);
+    apply_grad(&tape, &out, &mut m.token_emb, &mut m.pos_emb, &mut m.blocks, &mut m.final_ln, &mut m.output_proj, opt);
+    tape.value(loss).data[0]
+}
+
+fn model_from_flat(flat: &[f32]) -> Model {
+    let (token_emb, pos_emb, blocks, final_ln, output_proj) = reconstruct(flat, VOCAB, D_MODEL, SEQ_LEN, N_BLOCKS, N_HEADS, D_FF);
+    Model { token_emb, pos_emb, blocks, final_ln, output_proj }
+}
+
+/// (best, median) in ms.
+fn summary(mut v: Vec<f64>) -> (f64, f64) {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (v[0] * 1e3, v[v.len() / 2] * 1e3)
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let softmax1 = args.get(1).is_some_and(|a| a == "1");
+    let steps: usize = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(200);
+    let cfg = Config { vocab: VOCAB, d: D_MODEL, heads: N_HEADS, d_ff: D_FF, t: SEQ_LEN, n_blocks: N_BLOCKS, softmax1 };
+
+    let full = encode_bytes(include_str!("../../data/aesops_fables.txt"));
+    let split = (full.len() as f32 * 0.9) as usize;
+    let (train, held_out) = full.split_at(split);
+    let train_probe = &train[..held_out.len()];
+
+    let mut rng = Rng::new(1);
+    let mut m = Model {
+        token_emb: Embedding::new(&mut rng, VOCAB, D_MODEL),
+        pos_emb: Embedding::new(&mut rng, SEQ_LEN, D_MODEL),
+        blocks: (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF)).collect(),
+        final_ln: LayerNorm::new(D_MODEL),
+        output_proj: Linear::new(&mut rng, D_MODEL, VOCAB),
+    };
+    let opt = Sgd { lr: LR };
+
+    if args.get(3).is_some_and(|a| a == "control") {
+        let mut flat = pack(&m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj);
+        // default: a block weight (token 0 never occurs in the corpus)
+        let mid = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(flat.len() / 2);
+        flat[mid] += 1e-6;
+        let mut m2 = model_from_flat(&flat);
+        println!("gpu_train_check control: cpu vs cpu with flat[{mid}] += 1e-6; softmax1={softmax1} steps={steps}");
+        println!("columns: step | cpu loss | nudged cpu loss | difference");
+        let (mut a_tail, mut b_tail) = (0.0f64, 0.0f64);
+        for step in 0..steps {
+            let (mut input, mut target) = (Vec::with_capacity(BATCH * SEQ_LEN), Vec::with_capacity(BATCH * SEQ_LEN));
+            for _ in 0..BATCH {
+                let (i, t) = sample_window(&mut rng, train, SEQ_LEN);
+                input.extend(i);
+                target.extend(t);
+            }
+            let (a, b) = (cpu_step(&mut m, &input, &target, softmax1, &opt), cpu_step(&mut m2, &input, &target, softmax1, &opt));
+            if step + 20 >= steps {
+                a_tail += a as f64 / 20.0;
+                b_tail += b as f64 / 20.0;
+            }
+            if step % 20 == 0 || step + 1 == steps {
+                println!("{step:>4} | {a:.4} | {b:.4} | {:+.1e}", b - a);
+                std::io::stdout().flush().unwrap();
+            }
+        }
+        println!("mean training loss, last 20 steps: cpu {a_tail:.4}, nudged {b_tail:.4}");
+        println!("train-probe CE: cpu {:.4}, nudged {:.4}", full_ce(&m, train_probe, softmax1), full_ce(&m2, train_probe, softmax1));
+        println!("held-out CE:    cpu {:.4}, nudged {:.4}", full_ce(&m, held_out, softmax1), full_ce(&m2, held_out, softmax1));
+        return;
+    }
+
+    let _lease = gpu_lease::hold(Kind::Exclusive, "scratchtape gpu_train_check (milestone 5)", Duration::from_secs(15 * 60));
+    client();
+    let dev = DeviceParams::upload(&pack(&m.token_emb, &m.pos_emb, &m.blocks, &m.final_ln, &m.output_proj));
+    println!("gpu_train_check: pid {} softmax1={softmax1} batch={BATCH} lr={LR} steps={steps}", std::process::id());
+    if args.get(3).is_some_and(|a| a == "time") {
+        let mut t = vec![];
+        for step in 0..steps {
+            let (mut input, mut target) = (Vec::with_capacity(BATCH * SEQ_LEN), Vec::with_capacity(BATCH * SEQ_LEN));
+            for _ in 0..BATCH {
+                let (i, t) = sample_window(&mut rng, train, SEQ_LEN);
+                input.extend(i);
+                target.extend(t);
+            }
+            let t0 = Instant::now();
+            dev.zero_grads();
+            let mut dt = DeviceTape::new(&dev);
+            let (_, _, dloss) = model_forward(&mut dt, &cfg, &input, &target, BATCH);
+            dt.backward(dloss);
+            dev.sgd(LR);
+            let gl = read_f32(dt.value(dloss));
+            if step > 0 {
+                t.push(t0.elapsed().as_secs_f64());
+            }
+            assert!(gl.is_finite(), "GPU loss diverged at step {step}");
+        }
+        let (b, m) = summary(t);
+        println!("gpu only, {steps} steps back to back: step ms best {b:.2} / median {m:.2}");
+        return;
+    }
+    println!("columns: step | cpu loss | gpu loss | gpu - cpu");
+
+    let (mut t_cpu, mut t_gpu, mut launches) = (vec![], vec![], 0);
+    let (mut cpu_tail, mut gpu_tail) = (0.0f64, 0.0f64);
+    for step in 0..steps {
+        let (mut input, mut target) = (Vec::with_capacity(BATCH * SEQ_LEN), Vec::with_capacity(BATCH * SEQ_LEN));
+        for _ in 0..BATCH {
+            let (i, t) = sample_window(&mut rng, train, SEQ_LEN);
+            input.extend(i);
+            target.extend(t);
+        }
+
+        // GPU step: zero, forward, backward, SGD, read the loss back.
+        let (t0, l0) = (Instant::now(), LAUNCHES.load(Ordering::Relaxed));
+        dev.zero_grads();
+        let mut dt = DeviceTape::new(&dev);
+        let (_, _, dloss) = model_forward(&mut dt, &cfg, &input, &target, BATCH);
+        dt.backward(dloss);
+        dev.sgd(LR);
+        let gl = read_f32(dt.value(dloss));
+        let gpu_time = t0.elapsed().as_secs_f64();
+        launches = LAUNCHES.load(Ordering::Relaxed) - l0;
+
+        let t1 = Instant::now();
+        let cl = cpu_step(&mut m, &input, &target, softmax1, &opt);
+        let cpu_time = t1.elapsed().as_secs_f64();
+
+        if step > 0 {
+            // step 0 includes kernel compilation
+            t_gpu.push(gpu_time);
+            t_cpu.push(cpu_time);
+        }
+        if step + 20 >= steps {
+            cpu_tail += cl as f64 / 20.0;
+            gpu_tail += gl as f64 / 20.0;
+        }
+        if step % 20 == 0 || step + 1 == steps {
+            println!("{step:>4} | {cl:.4} | {gl:.4} | {:+.1e}   (step ms: cpu {:.0}, gpu {:.1})", gl - cl, cpu_time * 1e3, gpu_time * 1e3);
+            std::io::stdout().flush().unwrap();
+        }
+        assert!(gl.is_finite(), "GPU loss diverged at step {step}");
+    }
+
+    let g = model_from_flat(&dev.read(&dev.params));
+    println!("mean training loss, last 20 steps: cpu {cpu_tail:.4}, gpu {gpu_tail:.4}");
+    println!("train-probe CE: cpu {:.4}, gpu {:.4}", full_ce(&m, train_probe, softmax1), full_ce(&g, train_probe, softmax1));
+    println!("held-out CE:    cpu {:.4}, gpu {:.4}", full_ce(&m, held_out, softmax1), full_ce(&g, held_out, softmax1));
+    let ((cb, cm), (gb, gm)) = (summary(t_cpu), summary(t_gpu));
+    println!("step ms (best / median, steps 1..): cpu {cb:.1} / {cm:.1}, gpu {gb:.2} / {gm:.2}; speedup {:.1}x / {:.1}x", cb / gb, cm / gm);
+    println!("gpu launches per step: {launches}");
+}
+
