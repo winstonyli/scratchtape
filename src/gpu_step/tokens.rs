@@ -71,10 +71,18 @@ pub fn cross_entropy(logits: &Handle, targets: &Handle, rows: usize, vocab: usiz
 
 /// dlogits = (softmax(logits) - onehot(target)) / rows per model: the
 /// gradient of each model's mean loss. One launch.
-pub fn cross_entropy_backward(logits: &Handle, targets: &Handle, fwd: &CeOut, rows: usize, vocab: usize, models: usize) -> Handle {
+///
+/// `distill` > 0 (fused models only) adds deep mutual learning's term
+/// (Zhang et al. 2018): distill · KL(q ‖ p) per row, q the other models'
+/// mean probabilities on the same row, held constant. Its gradient is
+/// distill · (p - q), so row r of model m gets
+/// (p - onehot + distill · (p - q)) / rows.
+#[allow(clippy::too_many_arguments)]
+pub fn cross_entropy_backward(logits: &Handle, targets: &Handle, fwd: &CeOut, rows: usize, vocab: usize, models: usize, distill: f32) -> Handle {
+    assert!(distill == 0.0 || models > 1, "distillation needs peers");
     let dl = client().empty(rows * vocab * 4);
     super::count_launch();
-    k_ce_bwd::launch(client(), cubes(rows * vocab), CubeDim::new_1d(EW_DIM), whole(logits), whole(targets), whole(&fwd.lse), whole(&dl), rows as u32, vocab as u32, (rows / models) as u32);
+    k_ce_bwd::launch(client(), cubes(rows * vocab), CubeDim::new_1d(EW_DIM), whole(logits), whole(targets), whole(&fwd.lse), whole(&dl), rows as u32, vocab as u32, (rows / models) as u32, models as u32, distill, distill != 0.0);
     dl
 }
 
@@ -160,14 +168,28 @@ fn k_mean(x: &[f32], out: &mut [f32], n: u32) {
 }
 
 /// `per`: rows per model, the mean's divisor.
+#[allow(clippy::too_many_arguments)]
 #[cube(launch)]
-fn k_ce_bwd(x: &[f32], targets: &[u32], lse: &[f32], dl: &mut [f32], rows: u32, vocab: u32, per: u32) {
+fn k_ce_bwd(x: &[f32], targets: &[u32], lse: &[f32], dl: &mut [f32], rows: u32, vocab: u32, per: u32, models: u32, alpha: f32, #[comptime] distill: bool) {
     let i = ABSOLUTE_POS as u32;
     if i < rows * vocab {
         let r = i / vocab;
-        let mut v = f32::exp(x[i as usize] - lse[r as usize]);
+        let p = f32::exp(x[i as usize] - lse[r as usize]);
+        let mut v = p;
         if i % vocab == targets[r as usize] {
             v -= 1.0;
+        }
+        if distill {
+            // q: the other models' mean probability of this column, same row
+            let (c, rr) = (i % vocab, r % per);
+            let mut q = 0.0f32;
+            for j in 0..models {
+                let o = j * per + rr;
+                if o != r {
+                    q += f32::exp(x[(o * vocab + c) as usize] - lse[o as usize]);
+                }
+            }
+            v += alpha * (p - q / f32::cast_from(models - 1));
         }
         dl[i as usize] = v / f32::cast_from(per);
     }
@@ -250,7 +272,7 @@ mod tests {
         let got = read(&fwd.loss)[0];
         let want = tape.value(loss).data[0];
         assert!((got - want).abs() <= 1e-5 * want.abs(), "loss {got} vs {want}");
-        let dl = read(&cross_entropy_backward(&xh, &th, &fwd, rows, vocab, 1));
+        let dl = read(&cross_entropy_backward(&xh, &th, &fwd, rows, vocab, 1, 0.0));
         // f64 closed form (softmax - onehot) / rows, the ground truth both
         // are measured against.
         let mut exact = vec![0.0f32; rows * vocab];
@@ -278,6 +300,45 @@ mod tests {
             xm[i] -= h;
             let num = (gpu_loss(&xp) - gpu_loss(&xm)) / (2.0 * h);
             assert!((num - dl[i]).abs() <= 2e-2 * scale, "finite difference at {i}: {num} vs gpu {}", dl[i]);
+        }
+    }
+
+    /// Needs the discrete GPU. Fused models' CE: one mean per model, and
+    /// the backward with mutual distillation against an f64 closed form,
+    /// (p - onehot + a (p - q)) / rows_pm with q the peers' mean
+    /// probabilities. Checked at a 0 (plain, per model) and a 0.7.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn fused_cross_entropy_distills() {
+        let (k, per, vocab) = (3, 5, 7);
+        let rows = k * per;
+        let mut rng = Rng::new(4);
+        let x: Vec<f32> = (0..rows * vocab).map(|_| 2.0 * rng.next_gaussian()).collect();
+        let targets: Vec<usize> = (0..rows).map(|r| (r * 3) % vocab).collect();
+        let p = |r: usize| -> Vec<f64> {
+            let row = &x[r * vocab..(r + 1) * vocab];
+            let m = row.iter().fold(f64::MIN, |m, &v| m.max(v as f64));
+            let s: f64 = row.iter().map(|&v| (v as f64 - m).exp()).sum();
+            row.iter().map(|&v| (v as f64 - m).exp() / s).collect()
+        };
+        let (xh, th) = (upload(&x), upload_ids(&targets));
+        let fwd = cross_entropy(&xh, &th, rows, vocab, k);
+        let loss = read(&fwd.loss);
+        for m in 0..k {
+            let want: f64 = (m * per..(m + 1) * per).map(|r| -p(r)[targets[r]].ln()).sum::<f64>() / per as f64;
+            assert!((loss[m] as f64 - want).abs() < 1e-5 * want, "model {m} loss {} vs {want}", loss[m]);
+        }
+        for a in [0.0f32, 0.7] {
+            let dl = read(&cross_entropy_backward(&xh, &th, &fwd, rows, vocab, k, a));
+            for r in 0..rows {
+                let (m, rr) = (r / per, r % per);
+                let pr = p(r);
+                for c in 0..vocab {
+                    let q: f64 = (0..k).filter(|&j| j != m).map(|j| p(j * per + rr)[c]).sum::<f64>() / (k - 1) as f64;
+                    let want = (pr[c] - if c == targets[r] { 1.0 } else { 0.0 } + a as f64 * (pr[c] - q)) / per as f64;
+                    assert!((dl[r * vocab + c] as f64 - want).abs() < 1e-6, "a {a} row {r} col {c}: {} vs {want}", dl[r * vocab + c]);
+                }
+            }
         }
     }
 }

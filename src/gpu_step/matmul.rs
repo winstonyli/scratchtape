@@ -75,7 +75,7 @@ pub struct Epilogue<'a> {
 /// out[z] (+)= epilogue(a[z] @ b[z]) for z in 0..batch, with a[z] logically
 /// [m, k] and b[z] [k, n]; out[z] is row-major [m, n] (out.trans must be
 /// false), addressed as `MatRef` says. One launch, or two when split-k
-/// applies (batch 1, packed out, no epilogue but +=, see `split_count`).
+/// applies (packed out, no epilogue but +=, see `split_count`).
 #[allow(clippy::too_many_arguments)]
 pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usize, n: usize, epi: Epilogue) {
     assert!(!out.trans, "out is stored row-major");
@@ -87,11 +87,12 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
     let tiles = n.div_ceil(64) * m.div_ceil(64);
     let k_blocks = k.div_ceil(16);
     let epi_free = epi.bias.is_none() && !epi.relu && epi.mask.is_none() && epi.residual.is_none();
-    let splits = if batch == 1 && epi_free && out.ld == 0 { split_count(tiles, k_blocks) } else { 1 };
+    let splits = if epi_free && out.ld == 0 && out.group == 1 { split_count(batch * tiles, k_blocks) } else { 1 };
     let slice_blocks = k_blocks.div_ceil(splits);
     let count = CubeCount::Static((n as u32).div_ceil(64), (m as u32).div_ceil(64), (batch * splits) as u32);
     let u = |x: usize| x as u32;
-    // Split: each slice writes its own [m, n] partial, no epilogue.
+    // Split: each (matrix, slice) writes its own [m, n] partial, at
+    // z = matrix * splits + slice, no epilogue.
     let scratch = (splits > 1).then(|| client().empty(splits * m * n * 4));
     let out = match &scratch {
         Some(h) => MatRef { stride: m * n, ..MatRef::new(h) },
@@ -151,8 +152,8 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
     );
     if let Some(partial) = &scratch {
         let len = m * n;
-        super::count_launch_as(|| format!("split-k sum {splits}x[{m}x{n}]"));
-        k_split_sum::launch(client(), CubeCount::Static((len as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), whole(partial), whole(dest.h), u(len), u(splits), u(dest.off), epi.accumulate);
+        super::count_launch_as(|| format!("split-k sum {batch}x{splits}x[{m}x{n}]"));
+        k_split_sum::launch(client(), CubeCount::Static(((batch * len) as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), whole(partial), whole(dest.h), u(len), u(splits), u(dest.off), u(dest.stride), u(batch), epi.accumulate);
     }
 }
 
@@ -165,16 +166,19 @@ fn split_count(tiles: usize, k_blocks: usize) -> usize {
 
 const SPLIT_TARGET: usize = 64;
 
-/// out[i] (+)= sum over s of partial[s * len + i], s ascending.
+/// Matrix b's out[i] (+)= sum over s of partial[(b * splits + s) * len + i],
+/// s ascending.
+#[allow(clippy::too_many_arguments)]
 #[cube(launch)]
-fn k_split_sum(partial: &[f32], out: &mut [f32], len: u32, splits: u32, o_off: u32, #[comptime] accumulate: bool) {
-    let i = ABSOLUTE_POS as u32;
-    if i < len {
+fn k_split_sum(partial: &[f32], out: &mut [f32], len: u32, splits: u32, o_off: u32, o_stride: u32, batch: u32, #[comptime] accumulate: bool) {
+    let e = ABSOLUTE_POS as u32;
+    if e < batch * len {
+        let (b, i) = (e / len, e % len);
         let mut v = 0.0f32;
         for s in 0..splits {
-            v += partial[(s * len + i) as usize];
+            v += partial[((b * splits + s) * len + i) as usize];
         }
-        let o = (o_off + i) as usize;
+        let o = (o_off + b * o_stride + i) as usize;
         if accumulate {
             v += out[o];
         }
@@ -420,6 +424,8 @@ mod tests {
             (1, 128, 512, 384, true, false, false, false, false, false, true),  // dW (TN), accumulated, split 6
             (1, 128, 512, 128, true, false, false, false, false, false, true),  // dW, split 8
             (1, 70, 300, 20, true, false, false, false, false, false, false),   // split 4, ragged last slice
+            (3, 128, 512, 128, true, false, false, false, false, false, true),  // fused models' dW: 3 matrices, split 6 each
+            (2, 70, 300, 20, true, false, false, false, false, false, false),   // batched split 4, ragged
             (1, 512, 256, 128, false, true, false, false, false, false, false), // dX (NT)
             (64, 64, 16, 64, false, true, false, false, false, false, false),  // AttnScores
             (64, 64, 64, 16, false, false, false, false, false, false, false), // AttnOut

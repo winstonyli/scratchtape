@@ -64,11 +64,13 @@ pub struct DeviceTape<'p> {
     nodes: Vec<Node>,
     /// Dropout rate and this step's seed; None: `dropout` passes through.
     dropout: Option<(f32, u32)>,
+    /// Mutual distillation's weight between fused models (`with_distill`).
+    distill: f32,
 }
 
 impl<'p> DeviceTape<'p> {
     pub fn new(params: &'p DeviceParams) -> Self {
-        Self { params, nodes: Vec::new(), dropout: None }
+        Self { params, nodes: Vec::new(), dropout: None, distill: 0.0 }
     }
 
     /// A tape whose `dropout` ops zero each element with probability
@@ -76,7 +78,15 @@ impl<'p> DeviceTape<'p> {
     /// every step; the masks are a hash of it, the op and the element.
     pub fn with_dropout(params: &'p DeviceParams, rate: f32, seed: u32) -> Self {
         assert!((0.0..1.0).contains(&rate));
-        Self { params, nodes: Vec::new(), dropout: Some((rate, seed)) }
+        Self { params, nodes: Vec::new(), dropout: Some((rate, seed)), distill: 0.0 }
+    }
+
+    /// Fused models learn from each other too: each one's cross_entropy
+    /// gradient gains `alpha` · KL(peers' mean ‖ its own) per row (deep
+    /// mutual learning; `tokens::cross_entropy_backward`). The loss values
+    /// stay plain CE.
+    pub fn with_distill(self, alpha: f32) -> Self {
+        Self { distill: alpha, ..self }
     }
 
     pub fn value(&self, v: DVar) -> &Handle {
@@ -246,7 +256,7 @@ impl<'p> DeviceTape<'p> {
             match op {
                 Op::CrossEntropy { logits, targets, fwd, vocab } => {
                     let r = self.nodes[logits].rows;
-                    let dl = cross_entropy_backward(&self.nodes[logits].value, &targets, &fwd, r, vocab, m.k);
+                    let dl = cross_entropy_backward(&self.nodes[logits].value, &targets, &fwd, r, vocab, m.k, self.distill);
                     self.add_grad(logits, dl);
                 }
                 Op::Embed { ids, t, vocab, tok_off, pos_off } => {

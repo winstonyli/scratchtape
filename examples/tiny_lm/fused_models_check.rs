@@ -7,7 +7,13 @@
 // Dropout masks differ from a solo run's (the hash sees a model's
 // elements at shifted indices), so with dropout only the statistics match.
 //
-//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum]
+// `alpha` > 0 makes the models learn from each other as well: deep mutual
+// learning (Zhang et al. 2018, arXiv 1706.00384), online codistillation
+// without staleness (Anil et al. 2018, arXiv 1804.03235). Each model's
+// loss gains alpha · KL(peers' mean prediction ‖ its own) per position,
+// the peers held constant (DeviceTape::with_distill).
+//
+//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha]
 //
 // Every 8000 windows it prints each model's held-out CE (training_recipe_check's
 // deterministic 371 windows), their mean, and the ensemble's: the CE of
@@ -80,7 +86,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum]");
+    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha]");
     let name = &args[1];
     let k: usize = args[2].parse().unwrap();
     let batch: usize = args[3].parse().unwrap();
@@ -93,6 +99,7 @@ fn main() {
     let dropout: f32 = arg(8, "0").parse().unwrap();
     let warmup_windows: usize = arg(9, "0").parse().unwrap();
     let momentum: f32 = arg(10, "0").parse().unwrap();
+    let alpha: f32 = arg(11, "0").parse().unwrap();
     let warmup = (warmup_windows / batch).max(1);
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
@@ -104,7 +111,7 @@ fn main() {
     // Model m's generator: its init, then its batches (training_recipe_check's order).
     let mut rngs: Vec<Rng> = (0..k as u64).map(|m| Rng::new(seed + m)).collect();
     let flat: Vec<f32> = rngs.iter_mut().flat_map(init).collect();
-    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum}", seed + k as u64 - 1);
+    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha}", seed + k as u64 - 1);
     println!("run {name}: pid {} {config} steps={steps}", std::process::id());
     let _lease = gpu_lease::hold(Kind::Shared, &format!("scratchtape fused_models_check {name}"), Duration::from_secs(4 * 3600));
     let dev = DeviceParams::upload_models(&flat, k);
@@ -151,11 +158,12 @@ fn main() {
             }
         }
         dev.zero_grads();
-        let mut dt = if dropout > 0.0 {
+        let dt = if dropout > 0.0 {
             DeviceTape::with_dropout(&dev, dropout, (seed as u32).wrapping_mul(0x85eb_ca6b) ^ step as u32)
         } else {
             DeviceTape::new(&dev)
         };
+        let mut dt = dt.with_distill(alpha);
         let (_, _, loss) = model_forward(&mut dt, &cfg, &input, &target, k * batch);
         dt.backward(loss);
         if let Some(ones) = &ones {
