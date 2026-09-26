@@ -324,9 +324,9 @@ mod tests {
         let (xh, th) = (upload(&x), upload_ids(&targets));
         let fwd = cross_entropy(&xh, &th, rows, vocab, k);
         let loss = read(&fwd.loss);
-        for m in 0..k {
+        for (m, &got) in loss[..k].iter().enumerate() {
             let want: f64 = (m * per..(m + 1) * per).map(|r| -p(r)[targets[r]].ln()).sum::<f64>() / per as f64;
-            assert!((loss[m] as f64 - want).abs() < 1e-5 * want, "model {m} loss {} vs {want}", loss[m]);
+            assert!((got as f64 - want).abs() < 1e-5 * want, "model {m} loss {got} vs {want}");
         }
         for a in [0.0f32, 0.7] {
             let dl = read(&cross_entropy_backward(&xh, &th, &fwd, rows, vocab, k, a));

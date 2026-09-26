@@ -574,16 +574,73 @@ other examples. The ops table leaves room for them later.
 
 ## Open questions
 
-- **Parked until batching is settled (2026-09-25): train K seeds at once
-  and let them interact.** Substrate: horizontal fusion, K models in the
-  same ~145 launches (HFTA, MLSys 2021, arXiv 2102.02344), since the step
-  is dispatch-bound and Windows time-slices separate processes. Then, in
-  order: codistillation / deep mutual learning (loss += a·KL(peers' mean
-  || own); Anil et al. 2018, Zhang et al. 2018), aimed at the overfitting
-  gap that decay and dropout barely moved; periodic weight averaging of
-  shared-init replicas (local SGD, DiLoCo arXiv 2311.08105). Baselines at
-  equal compute: an ensemble of K independent models, and one model with
-  K× the steps.
+- **K seeds at once, interacting: substrate built, experiment pending.**
+  See "Horizontal fusion and codistillation" below.
+
+## Horizontal fusion and codistillation (in progress, 2026-09-25)
+
+Why: the step is dispatch-bound (~145 launches whatever the batch) and
+Windows time-slices separate processes, so K models belong in the same
+launches (HFTA, MLSys 2021, arXiv 2102.02344). The aim is the overfitting
+gap that decay and dropout barely moved.
+
+Built (commits 9dea605, 3a78555):
+
+- `DeviceParams::upload_models(flat, k)`. Model m's params and grads sit
+  at m·stride, and activations hold K equal row slices.
+- Linears run as a K-batch matmul, and split-k works per matrix of a
+  batch. Reductions run per model on grid y, and cross-entropy returns
+  one mean per model.
+- `DeviceTape::with_distill(alpha)` adds deep mutual learning (Zhang et
+  al. 2018, arXiv 1706.00384; codistillation, Anil et al. 2018, arXiv
+  1804.03235): dlogits += α(p − q)/rows, where q is the peers' mean
+  prediction on the same row, held constant. Reported losses stay plain
+  CE.
+- Driver: `examples/tiny_lm/fused_models_check.rs`. It reports each
+  model's held-out CE, their mean and the ensemble's, and re-scores each
+  model alone at the end.
+
+Checks:
+
+- K = 1 is byte-identical to `training_recipe_check` (32000 windows,
+  full recipe).
+- `fused_models_match_separate` checks the fused step against separate
+  models: step-0 losses bit-equal, params within 1e-5 after 1 step at
+  real size.
+- A second real-size step drifted by ~1e-4. The cause is one ReLU tie
+  (block 1, FFN1 unit 130), not a bug.
+
+Throughput is training ms/step in wall time, measured with CPU `_Total`
+at or below ~20%, the eGPU free and Defender real-time protection off:
+
+| batch | K | ms/step | per model |
+|---|---|---|---|
+| 32 | 1 | 4.66–4.69 | 4.66–4.69 |
+| 32 | 2 | 7.38–7.63 | 3.69–3.81 |
+| 32 | 4 | 13.12 | 3.28 |
+| 32 | 8 | 28.99 | 3.62 |
+| 8 | 16 | 12.59–12.89 | 0.79 |
+| 8 | 1 | 2.13 (before batched split-k) | 2.13 |
+| 8 | 4 | 4.72 (before batched split-k) | 1.18 |
+
+Before batched split-k, K = 2 at batch 32 gained nothing (6.4 vs 6.1
+ms per model), because split-k was off for batch > 1.
+
+Next, in order:
+
+1. **Clean timings.** Batch 8 at K = 1 and 4 after batched split-k, and
+   a second round of batch 32 at K = 1 and 4.
+2. **Codistillation on the recipe.** Recipe: batch 32, lr 0.48, momentum
+   0.9, warmup 6400, weight decay 2e-4, dropout 0.3, 1M windows. Arms,
+   covering both equal-compute baselines:
+   - K = 4 at α = 0: seeds 1–4 trained independently, reporting
+     per-model and ensemble CE.
+   - K = 4 at α = 0.5 and α = 1.
+   - One model with 4× the steps (`training_recipe_check`, 4M windows).
+3. **Results into the README.** Throughput, codistillation results, and
+   related work: HFTA, Zhang 2018, Anil 2018, DiLoCo.
+4. **Later: weight averaging.** Periodically average replicas that share
+   an init (local SGD; DiLoCo, arXiv 2311.08105).
 
 ## CPU model: batched heads (done 2026-09-24)
 
