@@ -84,7 +84,7 @@ fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
 }
 
 fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 /// GPU dims uniform must be std140-ish aligned - padded to 16 bytes (4 u32s)

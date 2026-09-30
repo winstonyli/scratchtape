@@ -238,8 +238,8 @@ impl NdArray {
     }
 
     /// Elementwise sqrt. NaN on negative input (IEEE 754 passthrough, no
-    /// guard) - not reachable via Adam's use (v is an EMA of squares, always
-    /// >= 0, no cancellation possible), and adding a defensive check here
+    /// guard) - not reachable via Adam's use (v is an EMA of squares, never
+    /// negative, no cancellation possible), and adding a defensive check here
     /// would just be validating an invariant that already holds upstream.
     pub fn sqrt(&self) -> Self {
         Self {

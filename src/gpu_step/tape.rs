@@ -16,7 +16,7 @@
 use super::matmul::{Epilogue, MatRef, matmul};
 use super::rows::{LnOut, col_sum, layer_norm, layer_norm_backward, softmax, softmax_backward};
 use super::tokens::{CeOut, cross_entropy, cross_entropy_backward, embed, embed_backward, upload_ids};
-use super::{DeviceParams, EW_DIM, buf, client, k_fill};
+use super::{DeviceParams, EW_DIM, buf, client, cubes, k_fill};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
@@ -210,7 +210,7 @@ impl<'p> DeviceTape<'p> {
         let g = client().empty(len * 4);
         if !full_write {
             super::count_launch();
-            k_fill::launch(client(), CubeCount::Static((len as u32).div_ceil(EW_DIM), 1, 1), CubeDim::new_1d(EW_DIM), buf(&g, len), 0.0f32, len as u32);
+            k_fill::launch(client(), cubes(len), CubeDim::new_1d(EW_DIM), buf(&g, len), 0.0f32, len as u32);
         }
         self.nodes[v].grad = Some(g.clone());
         (g, !full_write)
@@ -234,7 +234,7 @@ impl<'p> DeviceTape<'p> {
             Some(dst) => {
                 let len = self.nodes[v].rows * self.nodes[v].cols;
                 super::count_launch();
-                k_add_into::launch(client(), CubeCount::Static((len as u32).div_ceil(EW_DIM), 1, 1), CubeDim::new_1d(EW_DIM), buf(dst, len), buf(&g, len), len as u32);
+                k_add_into::launch(client(), cubes(len), CubeDim::new_1d(EW_DIM), buf(dst, len), buf(&g, len), len as u32);
             }
         }
     }
@@ -272,7 +272,7 @@ impl<'p> DeviceTape<'p> {
                         let masked = client().empty(rows * cols * 4);
                         let len = rows * cols;
                         super::count_launch();
-                        k_relu_mask::launch(client(), CubeCount::Static((len as u32).div_ceil(EW_DIM), 1, 1), CubeDim::new_1d(EW_DIM), buf(&dz, len), buf(&self.nodes[i].value, len), buf(&masked, len), len as u32);
+                        k_relu_mask::launch(client(), cubes(len), CubeDim::new_1d(EW_DIM), buf(&dz, len), buf(&self.nodes[i].value, len), buf(&masked, len), len as u32);
                         dz = masked;
                     }
                     let out = cols;
@@ -451,7 +451,7 @@ pub fn dropout(x: &Handle, len: usize, rate: f32, seed: u32) -> Handle {
     let y = client().empty(len * 4);
     let threshold = (rate as f64 * 4294967296.0) as u32;
     super::count_launch();
-    k_dropout::launch(client(), CubeCount::Static((len as u32).div_ceil(EW_DIM), 1, 1), CubeDim::new_1d(EW_DIM), buf(x, len), buf(&y, len), seed, threshold, 1.0 / (1.0 - rate), len as u32);
+    k_dropout::launch(client(), cubes(len), CubeDim::new_1d(EW_DIM), buf(x, len), buf(&y, len), seed, threshold, 1.0 / (1.0 - rate), len as u32);
     y
 }
 

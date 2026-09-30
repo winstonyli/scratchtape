@@ -19,6 +19,11 @@ pub mod tokens;
 /// Units per cube for 1-D elementwise kernels.
 const EW_DIM: u32 = 256;
 
+/// Cubes for a 1-D elementwise kernel over `units` elements (EW_DIM units each).
+fn cubes(units: usize) -> CubeCount {
+    CubeCount::Static((units as u32).div_ceil(EW_DIM), 1, 1)
+}
+
 static CLIENT: OnceLock<Client> = OnceLock::new();
 
 /// Launches per queue submission (cubecl's default is 32). Each submit
@@ -239,14 +244,14 @@ impl DeviceParams {
     /// One launch: p -= lr * g over every parameter.
     pub fn sgd(&self, lr: f32) {
         count_launch();
-        k_sgd::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), lr, self.len as u32);
+        k_sgd::launch(client(), cubes(self.len), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), lr, self.len as u32);
     }
 
     /// One launch of heavy-ball momentum: v = mu * v + g, then p -= lr * v.
     /// `v` holds the velocity (`len` f32s, zero at the start of training).
     pub fn momentum(&self, lr: f32, mu: f32, v: &Handle) {
         count_launch();
-        k_momentum::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), buf(v, self.len), lr, mu, self.len as u32);
+        k_momentum::launch(client(), cubes(self.len), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), buf(v, self.len), lr, mu, self.len as u32);
     }
 
     /// One launch: p *= 1 - shrink * mask over every parameter (mask is
@@ -254,13 +259,13 @@ impl DeviceParams {
     /// rate wd is `decay(lr * wd, mask)` before `sgd(lr)`.
     pub fn decay(&self, shrink: f32, mask: &Handle) {
         count_launch();
-        k_decay::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(mask, self.len), shrink, self.len as u32);
+        k_decay::launch(client(), cubes(self.len), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(mask, self.len), shrink, self.len as u32);
     }
 
     /// One launch: g = 0.
     pub fn zero_grads(&self) {
         count_launch();
-        k_fill::launch(client(), self.cubes(), CubeDim::new_1d(EW_DIM), buf(&self.grads, self.len), 0.0f32, self.len as u32);
+        k_fill::launch(client(), cubes(self.len), CubeDim::new_1d(EW_DIM), buf(&self.grads, self.len), 0.0f32, self.len as u32);
     }
 
     /// Blocking readback (crosses USB4; for tests and checkpoints only).
@@ -268,9 +273,6 @@ impl DeviceParams {
         f32::from_bytes(&client().read_one(h.clone()).unwrap())[..self.len].to_vec()
     }
 
-    fn cubes(&self) -> CubeCount {
-        CubeCount::Static((self.len as u32).div_ceil(EW_DIM), 1, 1)
-    }
 }
 
 /// The first f32 of a buffer, blocking: a training step's one readback
@@ -323,9 +325,7 @@ fn k_fill(x: &mut [f32], v: f32, len: u32) {
 }
 
 #[cfg(test)]
-fn upload(v: &[f32]) -> Handle {
-    client().create_from_slice(f32::as_bytes(v))
-}
+use upload_f32 as upload;
 
 /// A whole buffer, blocking (crosses USB4; not per step).
 pub fn read(h: &Handle) -> Vec<f32> {

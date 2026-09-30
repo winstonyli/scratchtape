@@ -156,6 +156,12 @@ pub struct Tape {
     nodes: Vec<Node>,
 }
 
+impl Default for Tape {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Tape {
     pub fn new() -> Self {
         Self { nodes: Vec::new() }
@@ -175,6 +181,10 @@ impl Tape {
     /// real graph's size to inform a with_capacity hint, rather than guess.
     pub fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
     }
 
     /// Every node as (op name, parent indices, output element count), in
@@ -390,8 +400,8 @@ impl Tape {
     /// logits very negative, converging toward zero total weight instead of
     /// a forced-uniform distribution. Side benefit: also slightly more
     /// robust than plain softmax against the all-very-negative-logits case
-    /// - the +1 floors the denominator at 1, so it can't collapse toward
-    /// zero the way plain softmax's denominator can.
+    /// (the +1 floors the denominator at 1, so it can't collapse toward
+    /// zero the way plain softmax's denominator can).
     ///
     /// Overflow-safe form: softmax1(x) is exactly softmax over [x, 0] (a
     /// phantom key with logit 0 and zero value), so shift by
@@ -431,7 +441,7 @@ impl Tape {
 
     /// Mean cross-entropy loss over `logits` [N, vocab_size] against integer
     /// class labels. Composed entirely from existing ops (softmax, one-hot
-    /// * log, sum, scale) - no dedicated "select the true class's
+    /// times log, sum, scale) - no dedicated "select the true class's
     /// probability" op needed, since one-hot-multiply-then-sum achieves the
     /// same result using machinery that already exists. A small eps guards
     /// log(0) = -inf (a real risk once softmax's output can genuinely

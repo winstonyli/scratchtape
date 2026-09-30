@@ -1077,7 +1077,7 @@ mod tests {
         tape.backward(loss);
         let table_grad = tape.grad(out.table).unwrap();
         // Row 2 was looked up twice - its gradient should reflect both uses.
-        assert!(table_grad.data[2 * 3] > table_grad.data[0 * 3]);
+        assert!(table_grad.data[2 * 3] > table_grad.data[0]);
     }
 
     /// apply_grad_with::<Sgd> must compute EXACTLY what apply_grad already
@@ -1104,9 +1104,8 @@ mod tests {
         let out_b = layer_b.forward(&mut tape_b, x_b);
         let loss_b = tape_b.sum(out_b.y);
         tape_b.backward(loss_b);
-        let mut w_state = <Sgd as Optimizer>::new_state(&layer_b.w.shape);
-        let mut b_state = <Sgd as Optimizer>::new_state(&layer_b.b.shape);
-        layer_b.apply_grad_with(&tape_b, &out_b, &opt, &mut w_state, &mut b_state);
+        // Sgd's optimizer state is ().
+        layer_b.apply_grad_with(&tape_b, &out_b, &opt, &mut (), &mut ());
 
         assert_eq!(layer_a.w.data, layer_b.w.data);
         assert_eq!(layer_a.b.data, layer_b.b.data);

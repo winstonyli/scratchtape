@@ -1,16 +1,12 @@
 //! The two ops indexed by token id (milestone 2): Embed (token + position,
 //! summed) and CrossEntropy (fused softmax + NLL, mean over rows). Their
 //! reductions are ordered loops, not atomics, so they're deterministic.
-use super::{EW_DIM, Models, buf, client};
+use super::{EW_DIM, Models, buf, client, cubes};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 fn whole(h: &Handle) -> BufferArg {
     buf(h, h.size_in_used() as usize / 4)
-}
-
-fn cubes(units: usize) -> CubeCount {
-    CubeCount::Static((units as u32).div_ceil(EW_DIM), 1, 1)
 }
 
 /// Token ids or targets, as the u32 buffer the kernels index with.
