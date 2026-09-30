@@ -5,3 +5,6 @@
 # alphabet from 92 to 93 distinct bytes and invalidating every downstream
 # result computed from it).
 data/*.txt -text
+
+# Shell scripts must keep LF: autocrlf would break them under bash.
+*.sh text eol=lf
