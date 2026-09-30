@@ -644,6 +644,15 @@ Next, in order:
      per-model and ensemble CE.
    - K = 4 at α = 0.5 and α = 1.
    - One model with 4× the steps (`training_recipe_check`, 4M windows).
+   **Launched 2026-09-30 16:16** by `scripts/codist_driver.sh` (copy in
+   `runs/`; bash driver pid 35048, arms run in sequence, each under
+   its own process at Normal priority with a shared GPU lease). Logs:
+   `runs/codist_k4_a{0,0.5,1}.log` (1024000 windows, seeds 1–4, lr 0.48,
+   wd 2e-4, dropout 0.3, warmup 6400, momentum 0.9), then
+   `runs/gpu_long4m_drop0.3_wd2e-4_s1.log` (resumable: relaunch the same
+   command from the driver). Expected ~35 min total: K = 4 arms ~8 min
+   each, the 4M-window single model ~10 min. Comparison point:
+   `gpu_long1m_drop0.3_wd2e-4_s{1,2,3}` (seed 1: held-out 1.6834).
 3. **Results into the README.** Throughput, codistillation results, and
    related work: HFTA, Zhang 2018, Anil 2018, DiLoCo.
 4. **Later: weight averaging.** Periodically average replicas that share
