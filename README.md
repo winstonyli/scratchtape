@@ -1029,6 +1029,16 @@ because raw forgetting deltas hid a floor effect.
   might be offset by replay.
 - **CLS-ER-style two-speed memory** — fast and slow EMA copies of the
   model with a consistency loss (Arani et al. 2022).
+- **Parked: fold the copy-and-tweak example families (2026-09-30).**
+  `memory_tier_multigen*`, `memory_tier_reconsolidation*` and
+  `tiny_lm_scaled*` are the same experiment with one knob changed (corpus,
+  model size, budget, replay on/off). A parameterized runner would shrink
+  them, but every README number is a record of one of these runs, so each
+  family must be re-run and compared byte for byte before and after. The
+  cheap path is extracting only what's already identical (half-life
+  curation, corpus loading, phase splitting), one family at a time,
+  `multigen*` first; `common::curate` is the pattern. The full rewrite
+  isn't worth it unless more variants are planned.
 - **A persistent, on-device GPU training backend** — the current GPU
   kernel is correct but pays a full host round-trip per call, which is
   why it doesn't win at this model's scale. Scoped as its own
