@@ -620,16 +620,23 @@ at or below ~20%, the eGPU free and Defender real-time protection off:
 | 32 | 4 | 13.12 | 3.28 |
 | 32 | 8 | 28.99 | 3.62 |
 | 8 | 16 | 12.59–12.89 | 0.79 |
-| 8 | 1 | 2.13 (before batched split-k) | 2.13 |
-| 8 | 4 | 4.72 (before batched split-k) | 1.18 |
+| 8 | 1 | 1.97 (2.13 before batched split-k) | 1.97 |
+| 8 | 4 | 3.95 (4.72 before batched split-k) | 0.99 |
 
 Before batched split-k, K = 2 at batch 32 gained nothing (6.4 vs 6.1
 ms per model), because split-k was off for batch > 1.
 
 Next, in order:
 
-1. **Clean timings.** Batch 8 at K = 1 and 4 after batched split-k, and
-   a second round of batch 32 at K = 1 and 4.
+1. **Clean timings (done 2026-09-30).** Logs `runs/ftime2_*.log`, 48000
+   windows, lr 0.3, Defender off, no eGPU users at the pre-check, CPU
+   `_Total` 4–21% at each launch (other sessions were compiling, so
+   not always under the ~20% bar). Batch 8: K = 1 1.97 ms/step, K = 4
+   3.95 (0.99 per model), both after batched split-k. Batch 32, second
+   round: K = 1 4.67 (matches the first round's 4.66–4.69), K = 4 14.14
+   against 13.12 before; that one launched at 21% CPU and the stretch
+   median was 12.5, so read it as contended. The first stretch includes
+   JIT, so the median stretch is a little lower than each overall figure.
 2. **Codistillation on the recipe.** Recipe: batch 32, lr 0.48, momentum
    0.9, warmup 6400, weight decay 2e-4, dropout 0.3, 1M windows. Arms,
    covering both equal-compute baselines:
