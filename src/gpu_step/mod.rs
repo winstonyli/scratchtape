@@ -12,9 +12,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub mod matmul;
+mod profile;
 pub mod rows;
 pub mod tape;
 pub mod tokens;
+
+pub use profile::{host_profile_cut, host_profile_start, host_profile_take, profile_start, profile_take};
 
 /// Units per cube for 1-D elementwise kernels.
 const EW_DIM: u32 = 256;
@@ -45,115 +48,9 @@ fn count_launch() {
 #[track_caller]
 fn count_launch_as(tag: impl FnOnce() -> String) {
     LAUNCHES.fetch_add(1, Ordering::Relaxed);
-    let mut host = HOST.lock().unwrap();
-    if PROFILE.get().is_none() && host.is_none() {
-        return;
+    if profile::active() {
+        profile::mark_launch(std::panic::Location::caller(), tag());
     }
-    let at = std::panic::Location::caller();
-    let site = format!("{}:{} {}", at.file(), at.line(), tag());
-    if let Some(h) = host.as_mut() {
-        h.mark(Some(site.clone()));
-    }
-    if let Some(p) = PROFILE.get() {
-        p.lock().unwrap().mark(Some(site));
-    }
-}
-
-/// Host time per launch site, for finding where queueing a step goes: the
-/// time from one launch's `count_launch` to the next is charged to the
-/// first (its launch call, plus the host work before the next launch). Off
-/// unless `host_profile_start`. Includes building the site key, ~1 µs.
-static HOST: std::sync::Mutex<Option<HostProfile>> = std::sync::Mutex::new(None);
-
-#[derive(Default)]
-struct HostProfile {
-    open: Option<(String, std::time::Instant)>,
-    sites: std::collections::HashMap<String, (usize, f64)>,
-}
-
-impl HostProfile {
-    fn mark(&mut self, next: Option<String>) {
-        let now = std::time::Instant::now();
-        if let Some((site, t)) = self.open.take() {
-            let e = self.sites.entry(site).or_default();
-            e.0 += 1;
-            e.1 += (now - t).as_secs_f64();
-        }
-        self.open = next.map(|n| (n, now));
-    }
-}
-
-/// Starts charging host time to launch sites (see `HOST`).
-pub fn host_profile_start() {
-    *HOST.lock().unwrap() = Some(HostProfile::default());
-}
-
-/// Charges the open site up to now and stops charging until the next
-/// launch; call it before a blocking readback so the wait isn't charged.
-pub fn host_profile_cut() {
-    if let Some(h) = HOST.lock().unwrap().as_mut() {
-        h.mark(None);
-    }
-}
-
-/// (site, launches, total host s), most expensive first; stops the
-/// host profile.
-pub fn host_profile_take() -> Vec<(String, usize, f64)> {
-    let mut h = HOST.lock().unwrap().take().expect("host_profile_start first");
-    h.mark(None);
-    let mut v: Vec<_> = h.sites.into_iter().map(|(k, (n, t))| (k, n, t)).collect();
-    v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-    v
-}
-
-/// Per-launch-site GPU time from device timestamps, for finding slow
-/// kernels. Each launch runs in its own profile window (no host sync; the
-/// window only flushes the queue and brackets its compute pass with
-/// timestamp writes), charged to the line that launched it. Off unless
-/// `profile_start` is called. A sync-per-launch profiler was tried first
-/// and couldn't rank kernels: its ~0.5 ms round trip swamped them.
-static PROFILE: OnceLock<std::sync::Mutex<Profile>> = OnceLock::new();
-
-#[derive(Default)]
-struct Profile {
-    open: Option<(String, cubecl_runtime::client::ProfileWindow)>,
-    done: Vec<(String, cubecl::profile::ProfileDuration)>,
-}
-
-impl Profile {
-    fn mark(&mut self, next: Option<String>) {
-        if let Some((site, w)) = self.open.take() {
-            self.done.push((site, client().profile_end(w).unwrap()));
-        }
-        self.open = next.map(|n| (n, client().profile_start().unwrap()));
-    }
-}
-
-/// Starts charging GPU time to launch sites (see `PROFILE`). Panics if
-/// the device can't report timestamps.
-pub fn profile_start() {
-    let method = client().properties().timing_method;
-    assert_eq!(method, cubecl::profile::TimingMethod::Device, "no device timestamps");
-    PROFILE.get_or_init(Default::default);
-}
-
-/// Closes the open window and returns (site, launches, total GPU s),
-/// most expensive first; clears the tally. Windows that carried no
-/// measurement are counted as launches but add no time.
-pub fn profile_take() -> Vec<(String, usize, f64)> {
-    let mut p = PROFILE.get().expect("profile_start first").lock().unwrap();
-    p.mark(None);
-    let mut sites: std::collections::HashMap<String, (usize, f64)> = Default::default();
-    for (site, d) in p.done.drain(..) {
-        let e = sites.entry(site).or_default();
-        e.0 += 1;
-        if let Some(t) = pollster::block_on(d.resolve()) {
-            e.1 += t.duration().as_secs_f64();
-        }
-    }
-    let mut v: Vec<_> = sites.into_iter().map(|(k, (n, t))| (k, n, t)).collect();
-    v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-    v
 }
 
 /// The first discrete GPU, on Vulkan, or DX12 with `WGPU_BACKEND=dx12` (as

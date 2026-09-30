@@ -52,6 +52,8 @@ fn set_priority(h: Handle, class: u32) {
 }
 
 /// Child mode: spin `t` threads; exits after 300 s so it can't be orphaned.
+// The spinners never return, so the join loop never iterates past the first.
+#[allow(clippy::never_loop)]
 fn spin(t: usize) {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(300));
