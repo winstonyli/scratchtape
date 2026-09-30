@@ -32,14 +32,14 @@
 // bounded it at <=1.8x).
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
-use scratchtape::tape::{Tape, Var};
+use scratchtape::tape::Tape;
 use scratchtape::tensor::MATMUL_NANOS;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{ForwardOut, apply_grad, encode_bytes, sample_window};
+use common::{Model, apply_grad, encode_bytes, sample_window};
 
 const D_MODEL: usize = 128;
 const N_HEADS: usize = 8;
@@ -47,30 +47,6 @@ const D_FF: usize = 256;
 const SEQ_LEN: usize = 64;
 const N_BLOCKS: usize = 4;
 const VOCAB: usize = 256;
-
-struct Model {
-    token_emb: Embedding,
-    pos_emb: Embedding,
-    blocks: Vec<TransformerBlock>,
-    final_ln: LayerNorm,
-    output_proj: Linear,
-}
-
-fn forward(tape: &mut Tape, m: &Model, input_ids: &[usize], batch: usize) -> (Var, ForwardOut) {
-    let positions: Vec<usize> = (0..batch).flat_map(|_| 0..SEQ_LEN).collect();
-    let tok_out = m.token_emb.forward(tape, input_ids);
-    let pos_out = m.pos_emb.forward(tape, &positions);
-    let mut x = tape.add(tok_out.y, pos_out.y);
-    let mut block_outs = Vec::with_capacity(m.blocks.len());
-    for block in &m.blocks {
-        let out = block.forward_full(tape, x, batch, false);
-        x = out.y;
-        block_outs.push(out);
-    }
-    let ln_out = m.final_ln.forward(tape, x);
-    let proj_out = m.output_proj.forward(tape, ln_out.y);
-    (proj_out.y, ForwardOut { tok_out, pos_out, block_outs, ln_out, proj_out })
-}
 
 /// Elementwise ops a GPU backend could fuse into one kernel.
 fn is_ew(op: &str) -> bool {
@@ -176,7 +152,7 @@ fn main() {
             target.extend(t);
         }
         let mut tape = Tape::with_capacity(2000);
-        let (logits, _) = forward(&mut tape, &m, &input, batch);
+        let (logits, _) = m.forward(&mut tape, &input, batch, false);
         tape.cross_entropy(logits, &target);
         census(&tape);
         return;
@@ -204,7 +180,7 @@ fn main() {
         let mm0 = MATMUL_NANOS.load(Ordering::Relaxed);
         let t0 = Instant::now();
         let mut tape = Tape::with_capacity(2000);
-        let (logits, out) = forward(&mut tape, &m, &input, batch);
+        let (logits, out) = m.forward(&mut tape, &input, batch, false);
         let loss = tape.cross_entropy(logits, &target);
         let t1 = Instant::now();
         let mm1 = MATMUL_NANOS.load(Ordering::Relaxed);

@@ -111,13 +111,13 @@ use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, pack, read_f32, upload_f32};
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
-use scratchtape::tape::{Tape, Var};
+use scratchtape::tape::Tape;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{ForwardOut, apply_grad, encode_bytes, flatten_all, reconstruct, sample_window};
+use common::{Model, apply_grad, encode_bytes, flatten_all, reconstruct, sample_window};
 
 const D_MODEL: usize = 128;
 const N_HEADS: usize = 8;
@@ -125,46 +125,6 @@ const D_FF: usize = 256;
 const SEQ_LEN: usize = 64;
 const N_BLOCKS: usize = 4;
 const VOCAB: usize = 256;
-
-struct Model {
-    token_emb: Embedding,
-    pos_emb: Embedding,
-    blocks: Vec<TransformerBlock>,
-    final_ln: LayerNorm,
-    output_proj: Linear,
-}
-
-/// `input_ids` holds `batch` windows stacked row-wise; positions restart at
-/// 0 for each window (see tiny_lm_batched.rs).
-fn forward(tape: &mut Tape, m: &Model, input_ids: &[usize], batch: usize, softmax1: bool) -> (Var, ForwardOut) {
-    let positions: Vec<usize> = (0..batch).flat_map(|_| 0..SEQ_LEN).collect();
-    let tok_out = m.token_emb.forward(tape, input_ids);
-    let pos_out = m.pos_emb.forward(tape, &positions);
-    let mut x = tape.add(tok_out.y, pos_out.y);
-    let mut block_outs = Vec::with_capacity(m.blocks.len());
-    for block in &m.blocks {
-        let out = block.forward_full(tape, x, batch, softmax1);
-        x = out.y;
-        block_outs.push(out);
-    }
-    let ln_out = m.final_ln.forward(tape, x);
-    let proj_out = m.output_proj.forward(tape, ln_out.y);
-    (proj_out.y, ForwardOut { tok_out, pos_out, block_outs, ln_out, proj_out })
-}
-
-/// Mean CE over every non-overlapping 64-byte window of `corpus` - the
-/// same windowing ngram_baseline.rs and attention_uniformity_check.rs use.
-fn full_ce(m: &Model, corpus: &[usize], softmax1: bool) -> f32 {
-    let starts: Vec<usize> = (0..corpus.len() - SEQ_LEN).step_by(SEQ_LEN).collect();
-    let mut total = 0.0;
-    for &s in &starts {
-        let mut tape = Tape::new();
-        let (logits, _) = forward(&mut tape, m, &corpus[s..s + SEQ_LEN], 1, softmax1);
-        let loss = tape.cross_entropy(logits, &corpus[s + 1..s + SEQ_LEN + 1]);
-        total += tape.value(loss).data[0];
-    }
-    total / starts.len() as f32
-}
 
 /// full_ce on the device, from the parameters in `dev`. Windows go in
 /// chunks of up to 64: the row kernels launch one cube per softmax row
@@ -312,7 +272,7 @@ fn main() {
             };
             let (probe_ce, held) = match &dev {
                 Some(dev) => (device_ce(dev, &cfg, train_probe), device_ce(dev, &cfg, held_out)),
-                None => (full_ce(&m, train_probe, softmax1), full_ce(&m, held_out, softmax1)),
+                None => (m.full_ce(train_probe, SEQ_LEN, softmax1), m.full_ce(held_out, SEQ_LEN, softmax1)),
             };
             held_out_ce = held;
             println!("{step:>6} | {:>6} | {probe_ce:.4} | {held:.4} | {:.0}s | {ms_per_step}", step * batch, start.elapsed().as_secs_f32());
@@ -355,7 +315,7 @@ fn main() {
             continue;
         }
         let mut tape = Tape::with_capacity(2000);
-        let (logits, out) = forward(&mut tape, &m, &input, batch, softmax1);
+        let (logits, out) = m.forward(&mut tape, &input, batch, softmax1);
         let loss = tape.cross_entropy(logits, &target);
         if tape.value(loss).data[0].is_nan() {
             println!("diverged to NaN at step {step}");
@@ -373,7 +333,7 @@ fn main() {
     if gpu {
         // The device's CE against the CPU's on the final model: the same
         // numbers up to float summation order.
-        let cpu = full_ce(&m, held_out, softmax1);
+        let cpu = m.full_ce(held_out, SEQ_LEN, softmax1);
         println!("held-out CE of the final model on the CPU: {cpu:.4} (device {held_out_ce:.4})");
         assert!((cpu - held_out_ce).abs() < 1e-3, "device CE disagrees with the CPU's");
     }

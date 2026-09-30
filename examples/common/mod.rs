@@ -150,6 +150,50 @@ pub fn apply_grad(
     output_proj.apply_grad(tape, &out.proj_out, opt);
 }
 
+/// The byte-level transformer's parts, for examples that train and score it
+/// as one unit (the batched counterpart of `forward`/`eval_loss` above).
+pub struct Model {
+    pub token_emb: Embedding,
+    pub pos_emb: Embedding,
+    pub blocks: Vec<TransformerBlock>,
+    pub final_ln: LayerNorm,
+    pub output_proj: Linear,
+}
+
+impl Model {
+    /// `input_ids` holds `batch` equal windows stacked row-wise; positions
+    /// restart at 0 for each window (see tiny_lm_batched.rs).
+    pub fn forward(&self, tape: &mut Tape, input_ids: &[usize], batch: usize, softmax1: bool) -> (Var, ForwardOut) {
+        let positions: Vec<usize> = (0..batch).flat_map(|_| 0..input_ids.len() / batch).collect();
+        let tok_out = self.token_emb.forward(tape, input_ids);
+        let pos_out = self.pos_emb.forward(tape, &positions);
+        let mut x = tape.add(tok_out.y, pos_out.y);
+        let mut block_outs = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            let out = block.forward_full(tape, x, batch, softmax1);
+            x = out.y;
+            block_outs.push(out);
+        }
+        let ln_out = self.final_ln.forward(tape, x);
+        let proj_out = self.output_proj.forward(tape, ln_out.y);
+        (proj_out.y, ForwardOut { tok_out, pos_out, block_outs, ln_out, proj_out })
+    }
+
+    /// Mean CE over every non-overlapping `seq_len` window of `corpus` - the
+    /// same windowing ngram_baseline.rs and attention_uniformity_check.rs use.
+    pub fn full_ce(&self, corpus: &[usize], seq_len: usize, softmax1: bool) -> f32 {
+        let starts: Vec<usize> = (0..corpus.len() - seq_len).step_by(seq_len).collect();
+        let mut total = 0.0;
+        for &s in &starts {
+            let mut tape = Tape::new();
+            let (logits, _) = self.forward(&mut tape, &corpus[s..s + seq_len], 1, softmax1);
+            let loss = tape.cross_entropy(logits, &corpus[s + 1..s + seq_len + 1]);
+            total += tape.value(loss).data[0];
+        }
+        total / starts.len() as f32
+    }
+}
+
 /// Deterministic sliding-window sweep over the whole corpus (not random
 /// sampling) - used by every memory-tier example for a reproducible
 /// loss readout. `tiny_lm_corpus.rs` has its own separate randomly-

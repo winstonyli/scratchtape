@@ -27,14 +27,14 @@ use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, LAUNCHES, client, host_profile_cut, host_profile_start, host_profile_take, pack, profile_start, profile_take, read_f32};
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use scratchtape::optim::Sgd;
-use scratchtape::tape::{Tape, Var};
+use scratchtape::tape::Tape;
 use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{ForwardOut, apply_grad, encode_bytes, reconstruct, sample_window};
+use common::{Model, apply_grad, encode_bytes, reconstruct, sample_window};
 
 const D_MODEL: usize = 128;
 const N_HEADS: usize = 8;
@@ -45,48 +45,10 @@ const N_BLOCKS: usize = 4;
 const BATCH: usize = 8;
 const LR: f32 = 0.3;
 
-struct Model {
-    token_emb: Embedding,
-    pos_emb: Embedding,
-    blocks: Vec<TransformerBlock>,
-    final_ln: LayerNorm,
-    output_proj: Linear,
-}
-
-/// As training_recipe_check.rs.
-fn forward(tape: &mut Tape, m: &Model, input_ids: &[usize], batch: usize, softmax1: bool) -> (Var, ForwardOut) {
-    let positions: Vec<usize> = (0..batch).flat_map(|_| 0..SEQ_LEN).collect();
-    let tok_out = m.token_emb.forward(tape, input_ids);
-    let pos_out = m.pos_emb.forward(tape, &positions);
-    let mut x = tape.add(tok_out.y, pos_out.y);
-    let mut block_outs = Vec::with_capacity(m.blocks.len());
-    for block in &m.blocks {
-        let out = block.forward_full(tape, x, batch, softmax1);
-        x = out.y;
-        block_outs.push(out);
-    }
-    let ln_out = m.final_ln.forward(tape, x);
-    let proj_out = m.output_proj.forward(tape, ln_out.y);
-    (proj_out.y, ForwardOut { tok_out, pos_out, block_outs, ln_out, proj_out })
-}
-
-/// As training_recipe_check.rs: mean CE over every non-overlapping window.
-fn full_ce(m: &Model, corpus: &[usize], softmax1: bool) -> f32 {
-    let starts: Vec<usize> = (0..corpus.len() - SEQ_LEN).step_by(SEQ_LEN).collect();
-    let mut total = 0.0;
-    for &s in &starts {
-        let mut tape = Tape::new();
-        let (logits, _) = forward(&mut tape, m, &corpus[s..s + SEQ_LEN], 1, softmax1);
-        let loss = tape.cross_entropy(logits, &corpus[s + 1..s + SEQ_LEN + 1]);
-        total += tape.value(loss).data[0];
-    }
-    total / starts.len() as f32
-}
-
 /// One CPU SGD step; returns the loss.
 fn cpu_step(m: &mut Model, input: &[usize], target: &[usize], softmax1: bool, opt: &Sgd) -> f32 {
     let mut tape = Tape::with_capacity(2000);
-    let (logits, out) = forward(&mut tape, m, input, BATCH, softmax1);
+    let (logits, out) = m.forward(&mut tape, input, BATCH, softmax1);
     let loss = tape.cross_entropy(logits, target);
     tape.backward(loss);
     apply_grad(&tape, &out, &mut m.token_emb, &mut m.pos_emb, &mut m.blocks, &mut m.final_ln, &mut m.output_proj, opt);
@@ -152,8 +114,8 @@ fn main() {
             }
         }
         println!("mean training loss, last 20 steps: cpu {a_tail:.4}, nudged {b_tail:.4}");
-        println!("train-probe CE: cpu {:.4}, nudged {:.4}", full_ce(&m, train_probe, softmax1), full_ce(&m2, train_probe, softmax1));
-        println!("held-out CE:    cpu {:.4}, nudged {:.4}", full_ce(&m, held_out, softmax1), full_ce(&m2, held_out, softmax1));
+        println!("train-probe CE: cpu {:.4}, nudged {:.4}", m.full_ce(train_probe, SEQ_LEN, softmax1), m2.full_ce(train_probe, SEQ_LEN, softmax1));
+        println!("held-out CE:    cpu {:.4}, nudged {:.4}", m.full_ce(held_out, SEQ_LEN, softmax1), m2.full_ce(held_out, SEQ_LEN, softmax1));
         return;
     }
 
@@ -287,8 +249,8 @@ fn main() {
 
     let g = model_from_flat(&dev.read(&dev.params));
     println!("mean training loss, last 20 steps: cpu {cpu_tail:.4}, gpu {gpu_tail:.4}");
-    println!("train-probe CE: cpu {:.4}, gpu {:.4}", full_ce(&m, train_probe, softmax1), full_ce(&g, train_probe, softmax1));
-    println!("held-out CE:    cpu {:.4}, gpu {:.4}", full_ce(&m, held_out, softmax1), full_ce(&g, held_out, softmax1));
+    println!("train-probe CE: cpu {:.4}, gpu {:.4}", m.full_ce(train_probe, SEQ_LEN, softmax1), g.full_ce(train_probe, SEQ_LEN, softmax1));
+    println!("held-out CE:    cpu {:.4}, gpu {:.4}", m.full_ce(held_out, SEQ_LEN, softmax1), g.full_ce(held_out, SEQ_LEN, softmax1));
     let ((cb, cm), (gb, gm)) = (summary(t_cpu), summary(t_gpu));
     println!("step ms (best / median, steps 1..): cpu {cb:.1} / {cm:.1}, gpu {gb:.2} / {gm:.2}; speedup {:.1}x / {:.1}x", cb / gb, cm / gm);
     println!("gpu launches per step: {launches}");
