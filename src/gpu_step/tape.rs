@@ -347,9 +347,20 @@ impl Config {
     pub fn pos_off(&self) -> usize {
         self.vocab * self.d
     }
-    fn block_len(&self) -> usize {
+    /// Where a block's tensors start, given the block's own start `off`
+    /// (`TransformerBlock::to_flat` order: ln1, qkv, out_proj, ln2, ffn1,
+    /// ffn2).
+    fn block_offsets(&self, off: usize) -> BlockOffsets {
         let (d, f) = (self.d, self.d_ff);
-        2 * d + (d * 3 * d + 3 * d) + (d * d + d) + 2 * d + (d * f + f) + (f * d + d)
+        let qkv = off + 2 * d;
+        let out = qkv + d * 3 * d + 3 * d;
+        let ln2 = out + d * d + d;
+        let ffn1 = ln2 + 2 * d;
+        let ffn2 = ffn1 + d * f + f;
+        BlockOffsets { ln1: off, qkv, out, ln2, ffn1, ffn2, end: ffn2 + f * d + d }
+    }
+    fn block_len(&self) -> usize {
+        self.block_offsets(0).end
     }
     pub fn block_off(&self, i: usize) -> usize {
         self.pos_off() + self.t * self.d + i * self.block_len()
@@ -385,6 +396,17 @@ impl Config {
     }
 }
 
+/// Start of each tensor of one block in the flat buffer (`Config::block_offsets`).
+struct BlockOffsets {
+    ln1: usize,
+    qkv: usize,
+    out: usize,
+    ln2: usize,
+    ffn1: usize,
+    ffn2: usize,
+    end: usize,
+}
+
 /// One transformer block, as `TransformerBlock::forward_full` without the
 /// extras (QK-norm, gate, sinks are out of scope for v1). `off` is the
 /// block's `to_flat` start. 9 ops: attention reads Q, K and V as head
@@ -393,23 +415,19 @@ impl Config {
 pub fn block_forward(tape: &mut DeviceTape, cfg: &Config, x: DVar, off: usize, batch: usize) -> DVar {
     let (d, h, f) = (cfg.d, cfg.heads, cfg.d_ff);
     let dk = d / h;
-    let qkv_off = off + 2 * d;
-    let out_off = qkv_off + d * 3 * d + 3 * d;
-    let ln2_off = out_off + d * d + d;
-    let ffn1_off = ln2_off + 2 * d;
-    let ffn2_off = ffn1_off + d * f + f;
-    let ln1 = tape.layer_norm(x, off);
-    let qkv = tape.linear(ln1, qkv_off, 3 * d, false, None);
+    let o = cfg.block_offsets(off);
+    let ln1 = tape.layer_norm(x, o.ln1);
+    let qkv = tape.linear(ln1, o.qkv, 3 * d, false, None);
     let head = |col0| Layout::Heads { col0, heads: h, width: dk };
     let scores = tape.batched_matmul(qkv, head(0), qkv, head(d), batch * h, true, Layout::Stacked);
     let weights = tape.causal_softmax(scores, 1.0 / (dk as f32).sqrt(), cfg.softmax1);
     let merged = tape.batched_matmul(weights, Layout::Stacked, qkv, head(2 * d), batch * h, false, head(0));
     let merged = tape.dropout(merged);
-    let x1 = tape.linear(merged, out_off, d, false, Some(x));
-    let ln2 = tape.layer_norm(x1, ln2_off);
-    let hidden = tape.linear(ln2, ffn1_off, f, true, None);
+    let x1 = tape.linear(merged, o.out, d, false, Some(x));
+    let ln2 = tape.layer_norm(x1, o.ln2);
+    let hidden = tape.linear(ln2, o.ffn1, f, true, None);
     let hidden = tape.dropout(hidden);
-    tape.linear(hidden, ffn2_off, d, false, Some(x1))
+    tape.linear(hidden, o.ffn2, d, false, Some(x1))
 }
 
 /// The whole model: embedding, blocks, final LayerNorm, output projection,

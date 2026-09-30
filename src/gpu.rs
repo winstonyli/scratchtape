@@ -5,6 +5,10 @@
 //! yet - this module only proves the kernel is correct and measures it in
 //! isolation, matching how new capabilities (k-means, graph extraction) were
 //! built standalone before any integration.
+//!
+//! Superseded by `gpu_step` (the device-resident training step); kept for the
+//! per-dispatch overhead measurements the README cites (DX12 vs Vulkan,
+//! CPU-priority starvation), which run through `gpu_matmul`.
 
 use crate::tensor::NdArray;
 use std::sync::OnceLock;
