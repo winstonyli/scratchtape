@@ -435,8 +435,8 @@ impl Tape {
     /// probability" op needed, since one-hot-multiply-then-sum achieves the
     /// same result using machinery that already exists. A small eps guards
     /// log(0) = -inf (a real risk once softmax's output can genuinely
-    /// underflow to exact 0.0 over a real vocabulary) - cheap fix, not the
-    /// full max-subtraction-stable softmax, which is parked for later.
+    /// underflow to exact 0.0 over a real vocabulary). `softmax` is already
+    /// max-subtraction stable; that only prevents overflow, not underflow.
     pub fn cross_entropy(&mut self, logits: Var, targets: &[usize]) -> Var {
         let vocab_size = self.nodes[logits.idx].value.shape[1];
         let n = targets.len();

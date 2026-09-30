@@ -392,10 +392,10 @@ impl LayerNorm {
 
 /// Strictly upper-triangular -inf (j > i only - the diagonal stays
 /// unmasked so a position can always attend to itself, avoiding an
-/// all-masked row -> 0/0 -> NaN). Safe with this engine's softmax (which
-/// has no max-subtraction stability trick): exp(-inf) is an exact, finite
-/// 0.0 under IEEE 754, so -inf never survives past the Exp step - nothing
-/// downstream ever sees an infinity.
+/// all-masked row -> -inf - -inf = NaN in softmax's max subtraction). Safe
+/// with this engine's softmax: the row max is finite (the diagonal), and
+/// exp(-inf) is an exact, finite 0.0 under IEEE 754, so -inf never survives
+/// past the Exp step - nothing downstream ever sees an infinity.
 /// Tiled batch_size times down the rows: each batch chunk gets its own
 /// independent seq_len x seq_len causal pattern. This mask is added
 /// (exact-shape, no broadcast) directly to batched attention scores

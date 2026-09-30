@@ -445,7 +445,6 @@ fn k_add_into(dst: &mut [f32], src: &[f32], len: u32) {
     }
 }
 
-/// dz = dy where y > 0, else 0: ReLU's backward from its output.
 /// y = x / (1 - rate) where hash(seed, i) >= rate·2³², else 0; one
 /// launch. Applied to dy with the same seed, it is dropout's backward.
 pub fn dropout(x: &Handle, len: usize, rate: f32, seed: u32) -> Handle {
@@ -456,8 +455,8 @@ pub fn dropout(x: &Handle, len: usize, rate: f32, seed: u32) -> Handle {
     y
 }
 
-/// lowbias32 (Wellons) of i + seed·golden ratio: an independent-looking
-/// 32-bit value per (seed, i).
+/// `dropout`'s kernel. The mask bits are lowbias32 (Wellons) of
+/// i + seed·golden ratio: an independent-looking 32-bit value per (seed, i).
 #[cube(launch)]
 fn k_dropout(x: &[f32], y: &mut [f32], seed: u32, threshold: u32, scale: f32, len: u32) {
     let i = ABSOLUTE_POS;
@@ -476,6 +475,7 @@ fn k_dropout(x: &[f32], y: &mut [f32], seed: u32, threshold: u32, scale: f32, le
     }
 }
 
+/// dz = dy where y > 0, else 0: ReLU's backward from its output.
 #[cube(launch)]
 fn k_relu_mask(dy: &[f32], y: &[f32], dz: &mut [f32], len: u32) {
     let i = ABSOLUTE_POS;

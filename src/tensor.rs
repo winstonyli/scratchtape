@@ -257,8 +257,8 @@ impl NdArray {
 
     /// Elementwise natural log. -inf at exactly 0, NaN below 0 (IEEE 754
     /// passthrough) - cross-entropy's caller adds a small eps before this
-    /// to keep inputs away from exactly 0 (cheap guard, parked: a properly
-    /// max-subtraction-stable softmax would prevent needing it at all).
+    /// to keep inputs away from exactly 0 (softmax's max subtraction stops
+    /// overflow but not a probability underflowing to 0).
     pub fn log(&self) -> Self {
         Self {
             data: self.data.iter().map(|&x| x.ln()).collect(),
