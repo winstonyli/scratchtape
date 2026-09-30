@@ -644,7 +644,7 @@ Next, in order:
      per-model and ensemble CE.
    - K = 4 at α = 0.5 and α = 1.
    - One model with 4× the steps (`training_recipe_check`, 4M windows).
-   **Launched 2026-09-30 16:16** by `scripts/codist_driver.sh` (copy in
+   **Done 2026-09-30** (started 16:16, finished 16:49). Launched by `scripts/codist_driver.sh` (copy in
    `runs/`; bash driver pid 35048, arms run in sequence, each under
    its own process at Normal priority with a shared GPU lease). Logs:
    `runs/codist_k4_a{0,0.5,1}.log` (1024000 windows, seeds 1–4, lr 0.48,
@@ -653,8 +653,36 @@ Next, in order:
    command from the driver). Expected ~35 min total: K = 4 arms ~8 min
    each, the 4M-window single model ~10 min. Comparison point:
    `gpu_long1m_drop0.3_wd2e-4_s{1,2,3}` (seed 1: held-out 1.6834).
-3. **Results into the README.** Throughput, codistillation results, and
-   related work: HFTA, Zhang 2018, Anil 2018, DiLoCo.
+
+   **Result: mutual distillation hurt, at both α.** Held-out CE on the
+   371-window deterministic set, final stretch (each fused model
+   re-scored alone matched its fused score):
+
+   | arm | per-model | mean | ensemble | ms/step |
+   |---|---|---|---|---|
+   | K = 4, α = 0 | 1.681 1.673 1.697 1.694 | 1.686 | **1.548** | 13.61 (3.40/model) |
+   | K = 4, α = 0.5 | 1.784 1.777 1.785 1.785 | 1.783 | 1.727 | 13.35 |
+   | K = 4, α = 1 | 1.943 1.943 1.938 1.936 | 1.940 | 1.896 | 13.35 |
+   | 1 model, 4M windows | 1.7175 (train probe 0.943) | | | 4.63 |
+   | 1 model, 1M windows, seeds 1–3 | 1.683 1.680 1.696 | 1.686 | | |
+
+   - α = 0 fused equals the separate single-model runs (mean 1.686 vs
+     1.686), as it should: fusion changes the launch count, not the math.
+   - The peers' mean prediction is a worse target than the labels here:
+     per-model CE worsens monotonically with α, and the models collapse
+     toward each other, so the ensemble gain shrinks too (0.14 → 0.06 →
+     0.04 nats). The constraint acts as extra regularization on a model
+     that was already regularized by dropout 0.3 and decay.
+   - What did help: averaging four independently trained models, 1.686 →
+     1.548 (−0.14), for 4 × 3.40 ms of compute against the 4M-window
+     single model's 1.7175 (more steps overfit more).
+   - Not measured: train-probe CE for the fused arms (the log prints
+     held-out only), so "does α close the train/held-out gap" is answered
+     only indirectly, by held-out getting worse. Not tried: α < 0.5
+     (e.g. 0.1), or a warm-up of α from 0.
+3. **Results into the README (done 2026-09-30).** Throughput,
+   codistillation results, and related work: HFTA, Zhang 2018, Anil
+   2018, DiLoCo.
 4. **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 

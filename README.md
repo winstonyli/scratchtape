@@ -1013,6 +1013,28 @@ it means here.
   unpermutes. The CPU batched-heads plan mirrors the CUDA pipeline
   (`docs/gpu_step_design.md`, "Survey: alternatives to full batched heads").
 
+**Horizontal fusion and codistillation**
+- Wang et al. 2021, *Horizontally Fused Training Array* (HFTA, MLSys;
+  [arXiv 2102.02344](https://arxiv.org/abs/2102.02344)): fuse K
+  same-shape models into the same kernel launches. `DeviceParams::upload_models`
+  does this here. Measured on the dispatch-bound step (batch 8): K = 4 costs
+  3.95 ms/step against 1.97 for one model, 0.99 per model; at batch 32,
+  K = 4 is 13.1 ms (3.28 per model) against 4.67.
+- Zhang et al. 2018, *Deep Mutual Learning*
+  ([arXiv 1706.00384](https://arxiv.org/abs/1706.00384)) and Anil et al.
+  2018, *Large scale distributed neural network training through online
+  distillation* ([arXiv 1804.03235](https://arxiv.org/abs/1804.03235)):
+  each model also matches its peers' predictions
+  (`DeviceTape::with_distill`). **Here it hurt** (2026-09-30, batch 32,
+  lr 0.48, dropout 0.3, decay 2e-4, 1M windows, K = 4, held-out CE mean /
+  ensemble): α = 0 1.686 / 1.548, α = 0.5 1.783 / 1.727, α = 1 1.940 /
+  1.896. Independent seeds averaged beat every other arm, and one model
+  with 4× the steps reached 1.7175. Details and caveats in
+  `docs/gpu_step_design.md`.
+- Douillard et al. 2023, *DiLoCo* ([arXiv 2311.08105](https://arxiv.org/abs/2311.08105)):
+  replicas from one init train locally and periodically average weights.
+  Not tried; the next candidate for using the K models.
+
 **Sibling project: `humble-cortex`** (`../humble-cortex`, predictive
 coding in Rust). Its 95 checks overlap here in three places. First, every
 model is benchmarked against the simplest baseline for the task
