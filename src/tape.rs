@@ -639,500 +639,188 @@ impl Tape {
 mod tests {
     use super::*;
 
-    fn forward_loss(x: &NdArray, w_data: &[f32], b_data: &[f32], w_shape: Vec<usize>, b_shape: Vec<usize>) -> f32 {
-        let mut tape = Tape::new();
-        let xv = tape.leaf(x.clone());
-        let wv = tape.leaf(NdArray::new(w_data.to_vec(), w_shape));
-        let bv = tape.leaf(NdArray::new(b_data.to_vec(), b_shape));
-        let mm = tape.matmul(xv, wv);
-        let pred = tape.add(mm, bv);
-        let sq = tape.mul(pred, pred);
-        let loss = tape.sum(sq);
-        tape.value(loss).data[0]
+    /// Gold-standard autograd correctness check: for every element of every
+    /// input, the analytical gradient of the scalar loss `build` returns
+    /// (from backward()) must match a central difference of it. `build`
+    /// runs once per evaluation on fresh leaves, so a graph is written once.
+    /// Returns the analytical gradients, for checks beyond the match.
+    fn check_grads(inputs: &[(&[f32], &[usize])], build: impl Fn(&mut Tape, &[Var]) -> Var) -> Vec<Vec<f32>> {
+        let run = |vals: &[Vec<f32>]| {
+            let mut tape = Tape::new();
+            let vars: Vec<Var> = inputs.iter().zip(vals).map(|((_, shape), v)| tape.leaf(NdArray::new(v.clone(), shape.to_vec()))).collect();
+            let loss = build(&mut tape, &vars);
+            (tape, vars, loss)
+        };
+        let base: Vec<Vec<f32>> = inputs.iter().map(|(data, _)| data.to_vec()).collect();
+        let (mut tape, vars, loss) = run(&base);
+        tape.backward(loss);
+        let grads: Vec<Vec<f32>> = vars.iter().map(|&v| tape.grad(v).expect("no gradient reached an input").data.clone()).collect();
+        let eps = 1e-3;
+        for (k, g) in grads.iter().enumerate() {
+            for (i, analytical) in g.iter().enumerate() {
+                let loss_at = |delta: f32| {
+                    let mut vals = base.clone();
+                    vals[k][i] += delta;
+                    let (tape, _, loss) = run(&vals);
+                    tape.value(loss).data[0]
+                };
+                let numerical = (loss_at(eps) - loss_at(-eps)) / (2.0 * eps);
+                assert!((numerical - analytical).abs() < 1e-2, "input {k} grad[{i}] mismatch: numerical {numerical} vs analytical {analytical}");
+            }
+        }
+        grads
     }
 
-    /// Gold-standard autograd correctness check: analytical gradient (backward())
-    /// must match central-difference numerical gradient within tolerance.
+    #[test]
+    #[should_panic(expected = "mismatch")]
+    fn check_grads_catches_a_wrong_gradient() {
+        // The detached copy of x hides half of d(x * x)/dx from backward.
+        check_grads(&[(&[1.0, 2.0], &[2])], |tape, v| {
+            let detached = tape.leaf(tape.value(v[0]).clone());
+            let sq = tape.mul(v[0], detached);
+            tape.sum(sq)
+        });
+    }
+
     /// Exercises MatMul + broadcast Add + Mul(x,x) + Sum in one graph.
     #[test]
     fn backward_matches_finite_difference() {
-        let x = NdArray::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
-        let w0 = vec![0.5, -0.3, 0.2, 0.7];
-        let b0 = vec![0.1, -0.2];
-
-        let mut tape = Tape::new();
-        let xv = tape.leaf(x.clone());
-        let wv = tape.leaf(NdArray::new(w0.clone(), vec![2, 2]));
-        let bv = tape.leaf(NdArray::new(b0.clone(), vec![2]));
-        let mm = tape.matmul(xv, wv);
-        let pred = tape.add(mm, bv);
-        let sq = tape.mul(pred, pred);
-        let loss = tape.sum(sq);
-        tape.backward(loss);
-        let w_grad = tape.grad(wv).unwrap().clone();
-        let b_grad = tape.grad(bv).unwrap().clone();
-
-        let eps = 1e-3;
-        for i in 0..w0.len() {
-            let mut wp = w0.clone();
-            wp[i] += eps;
-            let mut wm = w0.clone();
-            wm[i] -= eps;
-            let numerical = (forward_loss(&x, &wp, &b0, vec![2, 2], vec![2])
-                - forward_loss(&x, &wm, &b0, vec![2, 2], vec![2]))
-                / (2.0 * eps);
-            assert!(
-                (numerical - w_grad.data[i]).abs() < 1e-2,
-                "w grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                w_grad.data[i]
-            );
-        }
-        for i in 0..b0.len() {
-            let mut bp = b0.clone();
-            bp[i] += eps;
-            let mut bm = b0.clone();
-            bm[i] -= eps;
-            let numerical = (forward_loss(&x, &w0, &bp, vec![2, 2], vec![2])
-                - forward_loss(&x, &w0, &bm, vec![2, 2], vec![2]))
-                / (2.0 * eps);
-            assert!(
-                (numerical - b_grad.data[i]).abs() < 1e-2,
-                "b grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                b_grad.data[i]
-            );
-        }
+        check_grads(&[(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), (&[0.5, -0.3, 0.2, 0.7], &[2, 2]), (&[0.1, -0.2], &[2])], |tape, v| {
+            let mm = tape.matmul(v[0], v[1]);
+            let pred = tape.add(mm, v[2]);
+            let sq = tape.mul(pred, pred);
+            tape.sum(sq)
+        });
     }
 
-    fn batched_matmul_loss(a_data: &[f32], b_data: &[f32], a_shape: Vec<usize>, b_shape: Vec<usize>, batch_size: usize, transpose_b: bool) -> f32 {
-        let mut tape = Tape::new();
-        let av = tape.leaf(NdArray::new(a_data.to_vec(), a_shape));
-        let bv = tape.leaf(NdArray::new(b_data.to_vec(), b_shape));
-        let c = tape.batched_matmul(av, bv, batch_size, transpose_b);
-        let sq = tape.mul(c, c);
-        let loss = tape.sum(sq);
-        tape.value(loss).data[0]
-    }
-
-    /// Gold-standard check for Tape::batched_matmul, both transpose_b
-    /// variants (the plain-C=A@B case used for weights@V, the C=A@Bᵀ case
-    /// used for Q@Kᵀ) - same discipline as every other new backward rule,
-    /// required before this op gets trusted in a real training loop.
+    /// Both transpose_b variants of Tape::batched_matmul (the plain C=A@B
+    /// case used for weights@V, the C=A@Bᵀ case used for Q@Kᵀ).
     #[test]
     fn batched_matmul_backward_matches_finite_difference() {
         for transpose_b in [false, true] {
             let batch_size = 2;
             let (m, k, n) = (2, 3, 2);
-            let a_shape = vec![batch_size * m, k];
-            let b_shape = if transpose_b { vec![batch_size * n, k] } else { vec![batch_size * k, n] };
+            let b_shape = if transpose_b { [batch_size * n, k] } else { [batch_size * k, n] };
             let a0: Vec<f32> = (0..batch_size * m * k).map(|i| 0.1 * (i as f32) - 0.5).collect();
             let b0: Vec<f32> = (0..b_shape[0] * b_shape[1]).map(|i| 0.05 * (i as f32) - 0.3).collect();
-
-            let mut tape = Tape::new();
-            let av = tape.leaf(NdArray::new(a0.clone(), a_shape.clone()));
-            let bv = tape.leaf(NdArray::new(b0.clone(), b_shape.clone()));
-            let c = tape.batched_matmul(av, bv, batch_size, transpose_b);
-            let sq = tape.mul(c, c);
-            let loss = tape.sum(sq);
-            tape.backward(loss);
-            let a_grad = tape.grad(av).unwrap().clone();
-            let b_grad = tape.grad(bv).unwrap().clone();
-
-            let eps = 1e-3;
-            for i in 0..a0.len() {
-                let mut ap = a0.clone();
-                ap[i] += eps;
-                let mut am = a0.clone();
-                am[i] -= eps;
-                let numerical = (batched_matmul_loss(&ap, &b0, a_shape.clone(), b_shape.clone(), batch_size, transpose_b)
-                    - batched_matmul_loss(&am, &b0, a_shape.clone(), b_shape.clone(), batch_size, transpose_b))
-                    / (2.0 * eps);
-                assert!(
-                    (numerical - a_grad.data[i]).abs() < 1e-2,
-                    "a grad[{i}] transpose_b={transpose_b} mismatch: numerical {numerical} vs analytical {}",
-                    a_grad.data[i]
-                );
-            }
-            for i in 0..b0.len() {
-                let mut bp = b0.clone();
-                bp[i] += eps;
-                let mut bm = b0.clone();
-                bm[i] -= eps;
-                let numerical = (batched_matmul_loss(&a0, &bp, a_shape.clone(), b_shape.clone(), batch_size, transpose_b)
-                    - batched_matmul_loss(&a0, &bm, a_shape.clone(), b_shape.clone(), batch_size, transpose_b))
-                    / (2.0 * eps);
-                assert!(
-                    (numerical - b_grad.data[i]).abs() < 1e-2,
-                    "b grad[{i}] transpose_b={transpose_b} mismatch: numerical {numerical} vs analytical {}",
-                    b_grad.data[i]
-                );
-            }
+            check_grads(&[(&a0, &[batch_size * m, k]), (&b0, &b_shape)], |tape, v| {
+                let c = tape.batched_matmul(v[0], v[1], batch_size, transpose_b);
+                let sq = tape.mul(c, c);
+                tape.sum(sq)
+            });
         }
     }
 
-    /// Same gold-standard check, exercising the full attention formula:
-    /// Transpose, MatMul, Scale, then Exp+SumLastAxis+Div (softmax) chained
-    /// together, then a final MatMul. Checks Q and K, which is where the
-    /// new ops (transpose into scores, softmax normalization) actually get
-    /// exercised - V's gradient is a plain MatMul backward, already covered
-    /// by the test above.
-    fn attention_loss(q_data: &[f32], k_data: &[f32], v_data: &[f32]) -> f32 {
-        let mut tape = Tape::new();
-        let q = tape.leaf(NdArray::new(q_data.to_vec(), vec![2, 3]));
-        let k = tape.leaf(NdArray::new(k_data.to_vec(), vec![2, 3]));
-        let v = tape.leaf(NdArray::new(v_data.to_vec(), vec![2, 3]));
-        let kt = tape.transpose(k);
-        let scores = tape.matmul(q, kt);
-        let scaled = tape.scale(scores, 1.0 / (3.0f32).sqrt());
-        let weights = tape.softmax(scaled);
-        let out = tape.matmul(weights, v);
-        let loss = tape.sum(out);
-        tape.value(loss).data[0]
-    }
-
+    /// The full attention formula: Transpose, MatMul, Scale, then
+    /// Exp+SumLastAxis+Div (softmax) chained together, then a final MatMul.
+    /// Q and K are where the new ops (transpose into scores, softmax
+    /// normalization) get exercised; V's gradient is a plain MatMul backward.
     #[test]
     fn attention_backward_matches_finite_difference() {
-        let q0 = vec![0.5, -0.3, 0.2, 0.7, 0.1, -0.4];
-        let k0 = vec![0.2, 0.4, -0.1, -0.3, 0.6, 0.2];
-        let v0 = vec![1.0, 0.5, -0.5, 0.2, 0.3, -0.1];
-
-        let mut tape = Tape::new();
-        let q = tape.leaf(NdArray::new(q0.clone(), vec![2, 3]));
-        let k = tape.leaf(NdArray::new(k0.clone(), vec![2, 3]));
-        let v = tape.leaf(NdArray::new(v0.clone(), vec![2, 3]));
-        let kt = tape.transpose(k);
-        let scores = tape.matmul(q, kt);
-        let scaled = tape.scale(scores, 1.0 / (3.0f32).sqrt());
-        let weights = tape.softmax(scaled);
-        let out = tape.matmul(weights, v);
-        let loss = tape.sum(out);
-        tape.backward(loss);
-        let q_grad = tape.grad(q).unwrap().clone();
-        let k_grad = tape.grad(k).unwrap().clone();
-
-        let eps = 1e-3;
-        for i in 0..q0.len() {
-            let mut qp = q0.clone();
-            qp[i] += eps;
-            let mut qm = q0.clone();
-            qm[i] -= eps;
-            let numerical = (attention_loss(&qp, &k0, &v0) - attention_loss(&qm, &k0, &v0)) / (2.0 * eps);
-            assert!(
-                (numerical - q_grad.data[i]).abs() < 1e-2,
-                "q grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                q_grad.data[i]
-            );
-        }
-        for i in 0..k0.len() {
-            let mut kp = k0.clone();
-            kp[i] += eps;
-            let mut km = k0.clone();
-            km[i] -= eps;
-            let numerical = (attention_loss(&q0, &kp, &v0) - attention_loss(&q0, &km, &v0)) / (2.0 * eps);
-            assert!(
-                (numerical - k_grad.data[i]).abs() < 1e-2,
-                "k grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                k_grad.data[i]
-            );
-        }
+        let q = [0.5, -0.3, 0.2, 0.7, 0.1, -0.4];
+        let k = [0.2, 0.4, -0.1, -0.3, 0.6, 0.2];
+        let v = [1.0, 0.5, -0.5, 0.2, 0.3, -0.1];
+        check_grads(&[(&q, &[2, 3]), (&k, &[2, 3]), (&v, &[2, 3])], |tape, x| {
+            let kt = tape.transpose(x[1]);
+            let scores = tape.matmul(x[0], kt);
+            let scaled = tape.scale(scores, 1.0 / (3.0f32).sqrt());
+            let weights = tape.softmax(scaled);
+            let out = tape.matmul(weights, x[2]);
+            tape.sum(out)
+        });
     }
 
     /// Two independent "heads" (own matmul each), concatenated, then a
-    /// shared loss - checks Concat's backward correctly routes gradient
-    /// back to each head's own input without cross-contamination.
-    fn concat_loss(a_data: &[f32], b_data: &[f32], wa: &[f32], wb: &[f32]) -> f32 {
-        let mut tape = Tape::new();
-        let a = tape.leaf(NdArray::new(a_data.to_vec(), vec![2, 2]));
-        let b = tape.leaf(NdArray::new(b_data.to_vec(), vec![2, 2]));
-        let wa_v = tape.leaf(NdArray::new(wa.to_vec(), vec![2, 3]));
-        let wb_v = tape.leaf(NdArray::new(wb.to_vec(), vec![2, 3]));
-        let out_a = tape.matmul(a, wa_v);
-        let out_b = tape.matmul(b, wb_v);
-        let cat = tape.concat(&[out_a, out_b]);
-        let loss = tape.sum(cat);
-        tape.value(loss).data[0]
-    }
-
+    /// shared loss - Concat's backward must route gradient back to each
+    /// head's own input without cross-contamination.
     #[test]
     fn concat_backward_matches_finite_difference() {
-        let a0 = vec![0.5, -0.3, 0.2, 0.7];
-        let b0 = vec![0.1, -0.2, 0.4, -0.5];
-        let wa = vec![0.2, 0.4, -0.1, -0.3, 0.6, 0.2];
-        let wb = vec![-0.4, 0.1, 0.3, 0.2, -0.2, 0.5];
-
-        let mut tape = Tape::new();
-        let a = tape.leaf(NdArray::new(a0.clone(), vec![2, 2]));
-        let b = tape.leaf(NdArray::new(b0.clone(), vec![2, 2]));
-        let wa_v = tape.leaf(NdArray::new(wa.clone(), vec![2, 3]));
-        let wb_v = tape.leaf(NdArray::new(wb.clone(), vec![2, 3]));
-        let out_a = tape.matmul(a, wa_v);
-        let out_b = tape.matmul(b, wb_v);
-        let cat = tape.concat(&[out_a, out_b]);
-        let loss = tape.sum(cat);
-        tape.backward(loss);
-        let a_grad = tape.grad(a).unwrap().clone();
-        let b_grad = tape.grad(b).unwrap().clone();
-
-        let eps = 1e-3;
-        for i in 0..a0.len() {
-            let mut ap = a0.clone();
-            ap[i] += eps;
-            let mut am = a0.clone();
-            am[i] -= eps;
-            let numerical = (concat_loss(&ap, &b0, &wa, &wb) - concat_loss(&am, &b0, &wa, &wb)) / (2.0 * eps);
-            assert!(
-                (numerical - a_grad.data[i]).abs() < 1e-2,
-                "a grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                a_grad.data[i]
-            );
-        }
-        for i in 0..b0.len() {
-            let mut bp = b0.clone();
-            bp[i] += eps;
-            let mut bm = b0.clone();
-            bm[i] -= eps;
-            let numerical = (concat_loss(&a0, &bp, &wa, &wb) - concat_loss(&a0, &bm, &wa, &wb)) / (2.0 * eps);
-            assert!(
-                (numerical - b_grad.data[i]).abs() < 1e-2,
-                "b grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                b_grad.data[i]
-            );
-        }
+        let (a, b) = ([0.5, -0.3, 0.2, 0.7], [0.1, -0.2, 0.4, -0.5]);
+        let (wa, wb) = ([0.2, 0.4, -0.1, -0.3, 0.6, 0.2], [-0.4, 0.1, 0.3, 0.2, -0.2, 0.5]);
+        check_grads(&[(&a, &[2, 2]), (&b, &[2, 2]), (&wa, &[2, 3]), (&wb, &[2, 3])], |tape, v| {
+            let out_a = tape.matmul(v[0], v[2]);
+            let out_b = tape.matmul(v[1], v[3]);
+            let cat = tape.concat(&[out_a, out_b]);
+            tape.sum(cat)
+        });
     }
 
     /// Deliberately uses a REPEATED index (2 looked up twice) - the one
     /// scenario where a scatter-overwrite bug would silently produce a
     /// wrong-but-plausible gradient instead of an obvious crash.
-    fn gather_loss(table_data: &[f32], indices: &[usize]) -> f32 {
-        let mut tape = Tape::new();
-        let table = tape.leaf(NdArray::new(table_data.to_vec(), vec![5, 3]));
-        let gathered = tape.gather(table, indices);
-        let sq = tape.mul(gathered, gathered);
-        let loss = tape.sum(sq);
-        tape.value(loss).data[0]
-    }
-
     #[test]
     fn gather_backward_matches_finite_difference_with_repeated_index() {
-        let table0: Vec<f32> = vec![
+        let table: Vec<f32> = vec![
             0.5, -0.3, 0.2, //
             0.1, 0.4, -0.6, //
             -0.2, 0.7, 0.3, //
             0.9, -0.1, 0.5, //
             -0.4, 0.2, 0.8,
         ];
-        let indices = [2usize, 0, 2, 4];
-
-        let mut tape = Tape::new();
-        let table = tape.leaf(NdArray::new(table0.clone(), vec![5, 3]));
-        let gathered = tape.gather(table, &indices);
-        let sq = tape.mul(gathered, gathered);
-        let loss = tape.sum(sq);
-        tape.backward(loss);
-        let table_grad = tape.grad(table).unwrap().clone();
-
-        let eps = 1e-3;
-        for i in 0..table0.len() {
-            let mut tp = table0.clone();
-            tp[i] += eps;
-            let mut tm = table0.clone();
-            tm[i] -= eps;
-            let numerical = (gather_loss(&tp, &indices) - gather_loss(&tm, &indices)) / (2.0 * eps);
-            assert!(
-                (numerical - table_grad.data[i]).abs() < 1e-2,
-                "table grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                table_grad.data[i]
-            );
-        }
+        let grads = check_grads(&[(&table, &[5, 3])], |tape, v| {
+            let gathered = tape.gather(v[0], &[2, 0, 2, 4]);
+            let sq = tape.mul(gathered, gathered);
+            tape.sum(sq)
+        });
         // Row 2 was looked up twice - its gradient must reflect BOTH uses
         // (2x what a single lookup would produce), not just one.
         assert!(
-            table_grad.data[6].abs() > 0.1 && table_grad.data[7].abs() > 0.1 && table_grad.data[8].abs() > 0.1,
+            grads[0][6..9].iter().all(|g| g.abs() > 0.1),
             "row 2's gradient looks like only one of its two lookups contributed: {:?}",
-            &table_grad.data[6..9]
+            &grads[0][6..9]
         );
     }
 
-    /// Exercises the full layer-norm-shaped chain: SumLastAxis -> Scale ->
-    /// Sub -> Mul -> SumLastAxis -> Scale -> Add(eps) -> Sqrt -> Div ->
-    /// Mul(gamma) -> Add(beta). Checks x, gamma, and beta - Sqrt is the
-    /// only genuinely new op in this chain, everything else was already
-    /// covered by earlier tests, but this confirms they compose correctly.
-    fn layer_norm_loss(x_data: &[f32], gamma_data: &[f32], beta_data: &[f32]) -> f32 {
-        let mut tape = Tape::new();
-        let x = tape.leaf(NdArray::new(x_data.to_vec(), vec![2, 3]));
-        let gamma = tape.leaf(NdArray::new(gamma_data.to_vec(), vec![1, 3]));
-        let beta = tape.leaf(NdArray::new(beta_data.to_vec(), vec![1, 3]));
-        let d = 3.0f32;
-        let sum = tape.sum_last_axis(x);
-        let mean = tape.scale(sum, 1.0 / d);
-        let centered = tape.sub(x, mean);
-        let sq = tape.mul(centered, centered);
-        let sum_sq = tape.sum_last_axis(sq);
-        let variance = tape.scale(sum_sq, 1.0 / d);
-        let eps_leaf = tape.leaf(NdArray::scalar(1e-5));
-        let variance_eps = tape.add(variance, eps_leaf);
-        let std_dev = tape.sqrt(variance_eps);
-        let normalized = tape.div(centered, std_dev);
-        let scaled = tape.mul(normalized, gamma);
-        let y = tape.add(scaled, beta);
-        let loss = tape.sum(y);
-        tape.value(loss).data[0]
-    }
-
+    /// The full layer-norm-shaped chain: SumLastAxis -> Scale -> Sub -> Mul
+    /// -> SumLastAxis -> Scale -> Add(eps) -> Sqrt -> Div -> Mul(gamma) ->
+    /// Add(beta). Checks x, gamma and beta - Sqrt is the only genuinely new
+    /// op here, but this confirms the rest compose correctly.
     #[test]
     fn layer_norm_backward_matches_finite_difference() {
-        let x0 = vec![0.5, -0.3, 1.2, 2.0, -1.0, 0.4];
-        let gamma0 = vec![1.2, 0.8, 1.5];
-        let beta0 = vec![0.1, -0.2, 0.05];
-
-        let mut tape = Tape::new();
-        let x = tape.leaf(NdArray::new(x0.clone(), vec![2, 3]));
-        let gamma = tape.leaf(NdArray::new(gamma0.clone(), vec![1, 3]));
-        let beta = tape.leaf(NdArray::new(beta0.clone(), vec![1, 3]));
-        let d = 3.0f32;
-        let sum = tape.sum_last_axis(x);
-        let mean = tape.scale(sum, 1.0 / d);
-        let centered = tape.sub(x, mean);
-        let sq = tape.mul(centered, centered);
-        let sum_sq = tape.sum_last_axis(sq);
-        let variance = tape.scale(sum_sq, 1.0 / d);
-        let eps_leaf = tape.leaf(NdArray::scalar(1e-5));
-        let variance_eps = tape.add(variance, eps_leaf);
-        let std_dev = tape.sqrt(variance_eps);
-        let normalized = tape.div(centered, std_dev);
-        let scaled = tape.mul(normalized, gamma);
-        let y = tape.add(scaled, beta);
-        let loss = tape.sum(y);
-        tape.backward(loss);
-        let x_grad = tape.grad(x).unwrap().clone();
-        let gamma_grad = tape.grad(gamma).unwrap().clone();
-        let beta_grad = tape.grad(beta).unwrap().clone();
-
-        let eps = 1e-3;
-        for i in 0..x0.len() {
-            let mut xp = x0.clone();
-            xp[i] += eps;
-            let mut xm = x0.clone();
-            xm[i] -= eps;
-            let numerical =
-                (layer_norm_loss(&xp, &gamma0, &beta0) - layer_norm_loss(&xm, &gamma0, &beta0)) / (2.0 * eps);
-            assert!(
-                (numerical - x_grad.data[i]).abs() < 1e-2,
-                "x grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                x_grad.data[i]
-            );
-        }
-        for i in 0..gamma0.len() {
-            let mut gp = gamma0.clone();
-            gp[i] += eps;
-            let mut gm = gamma0.clone();
-            gm[i] -= eps;
-            let numerical =
-                (layer_norm_loss(&x0, &gp, &beta0) - layer_norm_loss(&x0, &gm, &beta0)) / (2.0 * eps);
-            assert!(
-                (numerical - gamma_grad.data[i]).abs() < 1e-2,
-                "gamma grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                gamma_grad.data[i]
-            );
-        }
-        for i in 0..beta0.len() {
-            let mut bp = beta0.clone();
-            bp[i] += eps;
-            let mut bm = beta0.clone();
-            bm[i] -= eps;
-            let numerical =
-                (layer_norm_loss(&x0, &gamma0, &bp) - layer_norm_loss(&x0, &gamma0, &bm)) / (2.0 * eps);
-            assert!(
-                (numerical - beta_grad.data[i]).abs() < 1e-2,
-                "beta grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                beta_grad.data[i]
-            );
-        }
+        let x = [0.5, -0.3, 1.2, 2.0, -1.0, 0.4];
+        check_grads(&[(&x, &[2, 3]), (&[1.2, 0.8, 1.5], &[1, 3]), (&[0.1, -0.2, 0.05], &[1, 3])], |tape, v| {
+            let d = 3.0f32;
+            let sum = tape.sum_last_axis(v[0]);
+            let mean = tape.scale(sum, 1.0 / d);
+            let centered = tape.sub(v[0], mean);
+            let sq = tape.mul(centered, centered);
+            let sum_sq = tape.sum_last_axis(sq);
+            let variance = tape.scale(sum_sq, 1.0 / d);
+            let eps_leaf = tape.leaf(NdArray::scalar(1e-5));
+            let variance_eps = tape.add(variance, eps_leaf);
+            let std_dev = tape.sqrt(variance_eps);
+            let normalized = tape.div(centered, std_dev);
+            let scaled = tape.mul(normalized, v[1]);
+            let y = tape.add(scaled, v[2]);
+            tape.sum(y)
+        });
     }
 
-    fn cross_entropy_loss(logits_data: &[f32], targets: &[usize]) -> f32 {
-        let mut tape = Tape::new();
-        let logits = tape.leaf(NdArray::new(logits_data.to_vec(), vec![3, 4]));
-        let loss = tape.cross_entropy(logits, targets);
-        tape.value(loss).data[0]
-    }
-
-    /// Checks dL/d(logits) - cross_entropy composes softmax (already
-    /// covered elsewhere) with the two genuinely new pieces here (Log,
-    /// one-hot-then-sum-last-axis selection), so this is really a check
-    /// that Log's "needs the parent's value, not its own output" backward
-    /// rule is actually implemented correctly, not just documented that way.
+    /// dL/d(logits) - cross_entropy composes softmax (covered elsewhere)
+    /// with two new pieces (Log, one-hot-then-sum-last-axis selection), so
+    /// this checks that Log's "needs the parent's value, not its own
+    /// output" backward rule is implemented correctly, not just documented.
     #[test]
     fn cross_entropy_backward_matches_finite_difference() {
-        let logits0 = vec![
+        let logits = [
             0.5, -0.3, 1.2, 0.1, //
             -0.2, 0.8, 0.1, 0.4, //
             1.0, 0.2, -0.5, 0.3,
         ];
-        let targets = [2usize, 1, 0];
-
-        let mut tape = Tape::new();
-        let logits = tape.leaf(NdArray::new(logits0.clone(), vec![3, 4]));
-        let loss = tape.cross_entropy(logits, &targets);
-        tape.backward(loss);
-        let logits_grad = tape.grad(logits).unwrap().clone();
-
-        let eps = 1e-3;
-        for i in 0..logits0.len() {
-            let mut lp = logits0.clone();
-            lp[i] += eps;
-            let mut lm = logits0.clone();
-            lm[i] -= eps;
-            let numerical = (cross_entropy_loss(&lp, &targets) - cross_entropy_loss(&lm, &targets)) / (2.0 * eps);
-            assert!(
-                (numerical - logits_grad.data[i]).abs() < 1e-2,
-                "logits grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                logits_grad.data[i]
-            );
-        }
+        check_grads(&[(&logits, &[3, 4])], |tape, v| tape.cross_entropy(v[0], &[2, 1, 0]));
     }
 
-    fn max_last_axis_loss(x_data: &[f32]) -> f32 {
-        let mut tape = Tape::new();
-        let x = tape.leaf(NdArray::new(x_data.to_vec(), vec![2, 3]));
-        let m = tape.max_last_axis(x);
-        let sq = tape.mul(m, m);
-        let loss = tape.sum(sq);
-        tape.value(loss).data[0]
-    }
-
-    /// Gold-standard check for the new differentiable MaxLastAxis - same
-    /// discipline as every other backward rule here, required before it
-    /// gets trusted in a real training loop (differentiable_backward_chaining.rs's
-    /// planned end-to-end fine-tuning phase). Row 0's max is at index 2
-    /// (1.2), row 1's max is at index 0 (2.0) - both non-edge positions,
-    /// so this also confirms non-argmax entries correctly get exactly zero
-    /// gradient, not just that the argmax entry gets a nonzero one.
+    /// The differentiable MaxLastAxis. Row 0's max is at index 2 (1.2),
+    /// row 1's at index 0 (2.0) - both non-edge positions, so this also
+    /// confirms non-argmax entries get exactly zero gradient, not just that
+    /// the argmax entry gets a nonzero one.
     #[test]
     fn max_last_axis_backward_matches_finite_difference() {
-        let x0 = vec![0.5, -0.3, 1.2, 2.0, 0.1, -1.5];
-
-        let mut tape = Tape::new();
-        let x = tape.leaf(NdArray::new(x0.clone(), vec![2, 3]));
-        let m = tape.max_last_axis(x);
-        let sq = tape.mul(m, m);
-        let loss = tape.sum(sq);
-        tape.backward(loss);
-        let x_grad = tape.grad(x).unwrap().clone();
-
-        let eps = 1e-3;
-        for i in 0..x0.len() {
-            let mut xp = x0.clone();
-            xp[i] += eps;
-            let mut xm = x0.clone();
-            xm[i] -= eps;
-            let numerical = (max_last_axis_loss(&xp) - max_last_axis_loss(&xm)) / (2.0 * eps);
-            assert!(
-                (numerical - x_grad.data[i]).abs() < 1e-2,
-                "x grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                x_grad.data[i]
-            );
-        }
+        check_grads(&[(&[0.5, -0.3, 1.2, 2.0, 0.1, -1.5], &[2, 3])], |tape, v| {
+            let m = tape.max_last_axis(v[0]);
+            let sq = tape.mul(m, m);
+            tape.sum(sq)
+        });
     }
 
     /// softmax1 had no direct check, and its max-subtraction silently
