@@ -102,30 +102,32 @@ impl NdArray {
         }
     }
 
-    /// Sums along the last axis only, keeping it as size 1 (not dropped) -
-    /// so the result broadcasts back against the un-reduced tensor with the
-    /// existing broadcast_to machinery, no axis-insertion logic needed.
-    pub fn sum_last_axis(&self) -> Self {
+    /// Folds each row of the last axis with `f` from `init`, keeping that
+    /// axis as size 1 (not dropped) - so the result broadcasts back against
+    /// the un-reduced tensor with the existing broadcast_to machinery, no
+    /// axis-insertion logic needed. Each row folds in ascending order.
+    fn reduce_last_axis(&self, init: f32, f: impl Fn(f32, f32) -> f32) -> Self {
         let nd = self.shape.len();
-        assert!(nd >= 1, "sum_last_axis needs at least 1 dim");
+        assert!(nd >= 1, "reduce_last_axis needs at least 1 dim");
+        let width = self.shape[nd - 1];
         let mut out_shape = self.shape.clone();
         out_shape[nd - 1] = 1;
-        let mut out = vec![0.0f32; out_shape.iter().product()];
-        let total: usize = self.shape.iter().product();
-        let in_strides = strides_for(&self.shape);
-        let out_strides = strides_for(&out_shape);
-        for lin in 0..total {
-            let idx = unravel_index(lin, &in_strides[..nd]);
-            let mut out_idx = idx;
-            out_idx[nd - 1] = 0;
-            let out_lin = ravel_index(&out_idx[..nd], &out_strides[..nd]);
-            out[out_lin] += self.data[lin];
-        }
-        Self { data: out, shape: out_shape }
+        let data = if width == 0 {
+            vec![init; out_shape.iter().product()]
+        } else {
+            self.data.chunks_exact(width).map(|row| row.iter().fold(init, |acc, &x| f(acc, x))).collect()
+        };
+        Self { data, shape: out_shape }
     }
 
-    /// Max along the last axis only, keeping it as size 1 (mirrors
-    /// sum_last_axis exactly - same structure, tracks max instead of sum).
+    /// Sums along the last axis only, keeping it as size 1 (see
+    /// `reduce_last_axis`).
+    pub fn sum_last_axis(&self) -> Self {
+        self.reduce_last_axis(0.0, |a, x| a + x)
+    }
+
+    /// Max along the last axis only, keeping it as size 1 (see
+    /// `reduce_last_axis`).
     /// Deliberately non-differentiable, not a Tape op: softmax is
     /// shift-invariant (softmax(x) = softmax(x - c) for any per-row
     /// constant c), so the gradient contribution that would flow back
@@ -134,22 +136,7 @@ impl NdArray {
     /// (a leaf, in Tape::softmax) gives the exact correct gradient with no
     /// argmax-routing backward rule needed at all.
     pub fn max_last_axis(&self) -> Self {
-        let nd = self.shape.len();
-        assert!(nd >= 1, "max_last_axis needs at least 1 dim");
-        let mut out_shape = self.shape.clone();
-        out_shape[nd - 1] = 1;
-        let mut out = vec![f32::NEG_INFINITY; out_shape.iter().product()];
-        let total: usize = self.shape.iter().product();
-        let in_strides = strides_for(&self.shape);
-        let out_strides = strides_for(&out_shape);
-        for lin in 0..total {
-            let idx = unravel_index(lin, &in_strides[..nd]);
-            let mut out_idx = idx;
-            out_idx[nd - 1] = 0;
-            let out_lin = ravel_index(&out_idx[..nd], &out_strides[..nd]);
-            out[out_lin] = out[out_lin].max(self.data[lin]);
-        }
-        Self { data: out, shape: out_shape }
+        self.reduce_last_axis(f32::NEG_INFINITY, f32::max)
     }
 
     /// Concatenates along the last axis only - all other dims must match.
@@ -470,6 +457,17 @@ impl NdArray {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_axis_reductions_keep_the_axis() {
+        let a = NdArray::new(vec![1.0, -2.0, 3.0, 0.5, 4.0, -1.0], vec![2, 3]);
+        let (s, m) = (a.sum_last_axis(), a.max_last_axis());
+        assert_eq!((s.shape.clone(), s.data), (vec![2, 1], vec![2.0, 3.5]));
+        assert_eq!((m.shape.clone(), m.data), (vec![2, 1], vec![3.0, 4.0]));
+        let b = NdArray::new((0..12).map(|i| i as f32).collect(), vec![2, 2, 3]);
+        assert_eq!(b.sum_last_axis().data, vec![3.0, 12.0, 21.0, 30.0]);
+        assert_eq!(b.max_last_axis().shape, vec![2, 2, 1]);
+    }
 
     #[test]
     fn sqrt_is_elementwise() {
