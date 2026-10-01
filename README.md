@@ -1111,8 +1111,11 @@ because raw forgetting deltas hid a floor effect.
   On six Gutenberg novels (4.5 MB train, 7-gram 1.3567) the big model
   with K = 4 averaged + α = 0.1 at 4M windows reaches 1.3084; the small
   model plateaus ~1.41, and at 1M windows averaging does not help the big
-  model. Big K = 1 at 4M windows (running) separates averaging from
-  longer training; see docs/gpu_step_design.md, rounds 11–12.
+  model. The control, big K = 1 at 4M windows, reaches 1.2929 and beats
+  big K = 4 averaged at every checkpoint (1.3084 at 4M), so the novels6
+  win over the 7-gram comes from data and training, not averaging; the
+  averaged recipe above is a small-data, overfitting-regime result.
+  See docs/gpu_step_design.md, rounds 11–13.
 
 - **Replay + Fisher consolidation together** — humble-cortex found them
   synergistic. Here each was only tried alone, and Fisher's new-task cost

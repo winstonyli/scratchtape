@@ -1055,6 +1055,30 @@ Next, in order:
    log `runs/nov_big_k1_4m.log` and `runs/local_sgd_driver11.log`,
    ~9.6 ms/step × 128000 steps ≈ 20 min if the machine stays quiet
    (round 11's K = 1 big ran 11.5 ms/step). Resumable (`runs/nov_big_k1_4m.resume`).
+   **Result (finished 15:27, 33 min): big K = 1 reaches 1.2929, beating
+   big K = 4 averaged + α 0.1 (1.3084) at every checkpoint:**
+
+   | windows | big K = 1 | big K = 4 avg + α 0.1 |
+   |---|---|---|
+   | 1M | 1.4246 | 1.4435 |
+   | 2M | 1.3404 | 1.3608 |
+   | 3M | 1.3085 | 1.3259 |
+   | 4M | 1.2929 | 1.3084 |
+
+   So on this corpus the 4M win over the 7-gram (1.3567) comes from
+   data and training, not averaging; K = 1 is ~3× cheaper (~10 vs ~34
+   ms/step) and was still falling (−0.016 over the last 1M). Averaging
+   helped only the small model (1.4609 → 1.4443 at 1M), which plateaus
+   ~1.41. Reading, untested directly: averaging acts as a regularizer
+   that pays only when the model overfits (aesop, all_four), not on a
+   corpus the model cannot yet exhaust. The "averaged recipe" results of
+   rounds 1–10 should be read as "small data, overfitting regime".
+
+   **Round 13 (2026-10-01): big K = 1 at 8M windows** (where does it
+   flatten?). `scripts/local_sgd_driver12.sh`, run `nov_big_k1_8m`, pid
+   37188 (Normal), started 15:42, log `runs/nov_big_k1_8m.log` and
+   `runs/local_sgd_driver12.log`, ~10 ms/step × 256000 steps ≈ 45 min.
+   Resumable. Not yet run: a larger or lower-dropout model at K = 1.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
