@@ -612,8 +612,9 @@ Dropout 0.1's best beats no regularization by 0.093 on every seed (95%
 CI [0.049, 0.137]). The gap to the 7-gram falls from 0.15 to 0.02
 (final) or 0.008 (best), but it isn't crossed: 512k → 1M windows gains
 only ~0.005–0.02, a plateau. The final value sits 0.01–0.02 above the
-run's best, the noise of a constant lr, so an lr decay at the end is the
-next lever.
+run's best, the noise of a constant lr, so an lr decay at the end was the
+next lever. (Tried 2026-09-30, below: it made held-out worse. The 7-gram
+is crossed by averaging models instead.)
 
 **Update (2026-09-30): the 7-gram is crossed, by averaging K models.**
 `fused_models_check` trains K = 4 models in the same launches from one
@@ -1083,7 +1084,8 @@ it means here.
 coding in Rust). Its 95 checks overlap here in three places. First, every
 model is benchmarked against the simplest baseline for the task
 (persistence, OLS, backoff n-gram, kNN). scratchtape's tiny LMs had none
-until `ngram_baseline.rs`, which the current model doesn't clearly beat. Second, partial replay + consolidation
+until `ngram_baseline.rs`, which the early models didn't clearly beat
+(averaged fused models now do on aesop, 1.610 vs 1.655). Second, partial replay + consolidation
 compounded (37.6% / 41.2% alone, 54.0% combined, over 3 repeats), which is
 untested here. Third, retention is normalized by how much was learned,
 because raw forgetting deltas hid a floor effect.

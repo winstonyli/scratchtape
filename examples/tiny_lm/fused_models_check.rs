@@ -19,10 +19,13 @@
 // from seed's init and differ only in their batches. Momentum buffers stay
 // per model. `lr_decay_frac` > 0 decays the lr linearly to 0 over that fraction
 // of the steps at the end; the model size args default to the 128/8/256/4 model.
+// `groups` > 1 splits the K models into that many groups, each with its own
+// init (seed + 1000 g) that averages only within itself, so the groups can be
+// ensembled (needs shared_init = 1 and sync_every > 0).
 // `outer_lr` > 0 replaces the plain mean with DiLoCo's outer step
 // (Nesterov momentum `outer_mu` on the pseudo-gradient, DeviceParams::outer_step).
 //
-//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks]
+//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups]
 //
 // Every 8000 windows it prints each model's held-out CE (training_recipe_check's
 // deterministic 371 windows), their mean, and the ensemble's: the CE of
@@ -91,7 +94,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks]");
+    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups]");
     let name = &args[1];
     let k: usize = args[2].parse().unwrap();
     let batch: usize = args[3].parse().unwrap();
@@ -116,6 +119,8 @@ fn main() {
     let lr_decay_frac: f32 = arg(18, "0").parse().unwrap();
     let size = |i: usize, default: &str| -> usize { arg(i, default).parse().unwrap() };
     let cfg = Config { vocab: VOCAB, d: size(19, "128"), heads: size(20, "8"), d_ff: size(21, "256"), t: SEQ_LEN, n_blocks: size(22, "4"), softmax1: false };
+    let groups = size(23, "1");
+    assert!(k % groups == 0 && (groups == 1 || (shared_init && sync_every > 0 && outer_lr == 0.0)), "groups needs K % groups == 0, shared_init, sync_every and no outer step");
     let warmup = (warmup_windows / batch).max(1);
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
@@ -126,8 +131,8 @@ fn main() {
 
     // Model m's generator: its init, then its batches (training_recipe_check's order).
     let mut rngs: Vec<Rng> = (0..k as u64).map(|m| Rng::new(seed + m)).collect();
-    let flat: Vec<f32> = if shared_init { init(&mut Rng::new(seed), &cfg).repeat(k) } else { rngs.iter_mut().flat_map(|r| init(r, &cfg)).collect() };
-    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu} corpus={corpus_name} lr_decay_frac={lr_decay_frac} model d={} heads={} d_ff={} blocks={}", seed + k as u64 - 1, cfg.d, cfg.heads, cfg.d_ff, cfg.n_blocks);
+    let flat: Vec<f32> = if shared_init { (0..groups as u64).flat_map(|g| init(&mut Rng::new(seed + 1000 * g), &cfg).repeat(k / groups)).collect() } else { rngs.iter_mut().flat_map(|r| init(r, &cfg)).collect() };
+    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu} corpus={corpus_name} lr_decay_frac={lr_decay_frac} model d={} heads={} d_ff={} blocks={} groups={groups}", seed + k as u64 - 1, cfg.d, cfg.heads, cfg.d_ff, cfg.n_blocks);
     println!("run {name}: pid {} {config} steps={steps}", std::process::id());
     let _lease = gpu_lease::hold(Kind::Shared, &format!("scratchtape fused_models_check {name}"), Duration::from_secs(4 * 3600));
     let dev = DeviceParams::upload_models(&flat, k);
@@ -196,7 +201,7 @@ fn main() {
         if sync_every > 0 && ((step + 1) % sync_every == 0 || step + 1 == steps) {
             match &outer {
                 Some((anchor, v)) => dev.outer_step(anchor, v, outer_lr, outer_mu),
-                None => dev.average_models(),
+                None => dev.average_groups(k / groups),
             }
         }
     }

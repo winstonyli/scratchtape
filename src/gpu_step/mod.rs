@@ -168,9 +168,16 @@ impl DeviceParams {
     /// One launch: every model's parameters become the mean over the K
     /// models (local SGD's sync; momentum buffers are left alone).
     pub fn average_models(&self) {
+        self.average_groups(self.models.k);
+    }
+
+    /// One launch: the K models are split into consecutive groups of
+    /// `group`, and each model's parameters become its group's mean.
+    pub fn average_groups(&self, group: usize) {
         let Models { k, stride } = self.models;
+        assert!(group >= 1 && k.is_multiple_of(group), "{k} models don't split into groups of {group}");
         count_launch();
-        k_average_models::launch(client(), cubes(stride), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), stride as u32, k as u32);
+        k_average_models::launch(client(), cubes(stride), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), stride as u32, k as u32, group as u32);
     }
 
     /// One launch of DiLoCo's outer step (arXiv 2311.08105): with the mean
@@ -235,16 +242,18 @@ fn k_decay(p: &mut [f32], mask: &[f32], shrink: f32, len: u32) {
 }
 
 #[cube(launch)]
-fn k_average_models(p: &mut [f32], stride: u32, k: u32) {
+fn k_average_models(p: &mut [f32], stride: u32, k: u32, group: u32) {
     let i = ABSOLUTE_POS as u32;
     if i < stride {
-        let mut s = 0.0f32;
-        for m in 0..k {
-            s += p[(m * stride + i) as usize];
-        }
-        let mean = s / k as f32;
-        for m in 0..k {
-            p[(m * stride + i) as usize] = mean;
+        for g in 0..k / group {
+            let mut s = 0.0f32;
+            for m in 0..group {
+                s += p[((g * group + m) * stride + i) as usize];
+            }
+            let mean = s / group as f32;
+            for m in 0..group {
+                p[((g * group + m) * stride + i) as usize] = mean;
+            }
         }
     }
 }
@@ -305,6 +314,23 @@ mod tests {
             let mean = (flat[i] + flat[5 + i] + flat[10 + i]) / 3.0;
             for m in 0..3 {
                 assert!((got[m * 5 + i] - mean).abs() < 1e-4, "slot {m} param {i}: {} vs {mean}", got[m * 5 + i]);
+            }
+        }
+    }
+
+    /// Needs the discrete GPU. Four models in groups of two: each pair
+    /// averages, and the pairs stay apart.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn average_groups_keeps_groups_apart() {
+        let flat: Vec<f32> = (0..12).map(|i| (i * i) as f32).collect();
+        let dev = DeviceParams::upload_models(&flat, 4);
+        dev.average_groups(2);
+        let got = dev.read(&dev.params);
+        for i in 0..3 {
+            for (a, b) in [(0, 1), (2, 3)] {
+                let mean = (flat[a * 3 + i] + flat[b * 3 + i]) / 2.0;
+                assert!((got[a * 3 + i] - mean).abs() < 1e-4 && (got[b * 3 + i] - mean).abs() < 1e-4, "pair ({a},{b}) param {i}");
             }
         }
     }
