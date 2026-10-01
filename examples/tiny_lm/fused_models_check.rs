@@ -20,7 +20,7 @@
 // per model. `outer_lr` > 0 replaces the plain mean with DiLoCo's outer step
 // (Nesterov momentum `outer_mu` on the pseudo-gradient, DeviceParams::outer_step).
 //
-//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu]
+//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus]
 //
 // Every 8000 windows it prints each model's held-out CE (training_recipe_check's
 // deterministic 371 windows), their mean, and the ensemble's: the CE of
@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{encode_bytes, sample_window};
+use common::{corpus, encode_bytes, sample_window};
 
 const D_MODEL: usize = 128;
 const N_HEADS: usize = 8;
@@ -93,7 +93,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu]");
+    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus]");
     let name = &args[1];
     let k: usize = args[2].parse().unwrap();
     let batch: usize = args[3].parse().unwrap();
@@ -114,18 +114,19 @@ fn main() {
     assert!(sync_every == 0 || shared_init, "averaging models needs shared_init = 1");
     let outer_lr: f32 = arg(15, "0").parse().unwrap();
     let outer_mu: f32 = arg(16, "0.9").parse().unwrap();
+    let corpus_name = arg(17, "aesops_fables");
     let warmup = (warmup_windows / batch).max(1);
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
 
-    let full = encode_bytes(include_str!("../../data/aesops_fables.txt"));
+    let full = encode_bytes(corpus(&corpus_name));
     let split = (full.len() as f32 * 0.9) as usize;
     let (train, held_out) = full.split_at(split);
 
     // Model m's generator: its init, then its batches (training_recipe_check's order).
     let mut rngs: Vec<Rng> = (0..k as u64).map(|m| Rng::new(seed + m)).collect();
     let flat: Vec<f32> = if shared_init { init(&mut Rng::new(seed)).repeat(k) } else { rngs.iter_mut().flat_map(init).collect() };
-    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu}", seed + k as u64 - 1);
+    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu} corpus={corpus_name}", seed + k as u64 - 1);
     println!("run {name}: pid {} {config} steps={steps}", std::process::id());
     let _lease = gpu_lease::hold(Kind::Shared, &format!("scratchtape fused_models_check {name}"), Duration::from_secs(4 * 3600));
     let dev = DeviceParams::upload_models(&flat, k);

@@ -287,3 +287,16 @@ pub fn reconstruct(flat: &[f32], vocab_size: usize, d_model: usize, seq_len: usi
     assert_eq!(offset, flat.len(), "flat vector had leftover/missing floats - architecture mismatch");
     (token_emb, pos_emb, blocks, final_ln, output_proj)
 }
+
+/// One of the bundled corpora by file name without `.txt` (`aesops_fables`,
+/// `sherlock_holmes`, `leaves_of_grass`, `origin_of_species`).
+#[allow(dead_code)]
+pub fn corpus(name: &str) -> &'static str {
+    match name {
+        "aesops_fables" => include_str!("../../data/aesops_fables.txt"),
+        "sherlock_holmes" => include_str!("../../data/sherlock_holmes.txt"),
+        "leaves_of_grass" => include_str!("../../data/leaves_of_grass.txt"),
+        "origin_of_species" => include_str!("../../data/origin_of_species.txt"),
+        _ => panic!("unknown corpus {name}"),
+    }
+}

@@ -106,7 +106,7 @@ impl KneserNey {
 }
 
 fn main() {
-    let full = encode_bytes(include_str!("../../data/aesops_fables.txt"));
+    let full = encode_bytes(common::corpus(&std::env::args().nth(1).unwrap_or("aesops_fables".into())));
     let split = (full.len() as f32 * 0.9) as usize;
     let (train, held_out) = full.split_at(split);
     println!("train {} bytes, held-out {} bytes", train.len(), held_out.len());

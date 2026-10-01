@@ -801,6 +801,16 @@ Next, in order:
      alone move a 32000-step run by that much, so differences under
      ~0.01 here are noise. Best outer arm, lr 0.5 / mu 0.5, is 1.6404
      (−0.011, one seed); higher momentum hurts (1/0.9 is 1.695).
+
+   **Round 5 launched 2026-09-30 21:06** (`scripts/local_sgd_driver4.sh`,
+   bash pid 8514, log `runs/local_sgd_driver4.log`, ~30 min):
+   `fused_models_check` takes a corpus name (arg 17) and `ngram_baseline`
+   takes one as its first argument. Sherlock Holmes (54 KB train, 5955
+   bytes = 93 windows held-out, so noisy; 7-gram-family baseline 1.695 at
+   order 9, picked on held-out): K = 1, K = 4 independent, K = 4 averaged,
+   K = 4 averaged + α = 0.1, all 256000 windows. Aesop: α = 0.1 averaging
+   at H = 10 and 30. Not done: a larger model, whose sizes are constants
+   in the example and in kernel size tables.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
