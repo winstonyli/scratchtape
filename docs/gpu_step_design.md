@@ -768,6 +768,13 @@ Next, in order:
      mu 0.9 are the paper's, tuned for large models and long rounds).
    - α = 0.1 and averaging stack: 1.6149 with a smaller gap (0.63) than
      either alone (single seed). Best held-out CE of any run so far.
+
+   **Round 4 launched 2026-09-30 19:29** (`scripts/local_sgd_driver3.sh`,
+   bash pid 2033, log `runs/local_sgd_driver3.log`, 11 runs, ~100 min,
+   CPU contended): H = 100 with α = 0.1 at seeds 11 and 21; DiLoCo outer
+   sweep at H = 100 (lr/mu 1/0 as a check against the plain mean, 1/0.9,
+   0.5/0.5, 0.3/0.9, 1/0.5); α = 0.05 and 0.2 with averaging; K = 2 and
+   K = 8 with averaging and α = 0.1. Logs `runs/local_k*`, `runs/diloco_k4_h100_lr*`.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
