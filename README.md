@@ -647,7 +647,11 @@ diverges, so lr 0.05) did worse at the same 1M windows: 1.675 averaged,
 1.81 single, against 1.610 for the small one; 512k windows gave 1.664,
 256k 1.762 and dropout 0.5 1.794, so no setting tried rescued it. Two
 averaged groups of 4, ensembled, reach 1.568, short of 4 independent
-models' 1.548: averaging and ensembling don't stack.
+models' 1.548: averaging and ensembling don't stack. On all four bundled
+books (373 KB train, the last 10% of each held out, 7-gram 1.628) the
+recipe carries: one model 1.637, K = 4 averaged + α = 0.1 **1.579** at 1M
+windows and 1.568 at 2M, while the d = 256 model gets 1.642 single and
+1.597 averaged.
 
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention

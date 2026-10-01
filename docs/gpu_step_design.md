@@ -926,11 +926,34 @@ Next, in order:
    Corpus `all_four` = the four bundled books with the last 10% of
    *each* held out (373 KB train, 41 KB = 647 held-out windows, 7-gram
    1.6281 at order 7; aesop alone is unchanged at 1.6546).
-   **Round 8 launched 2026-10-01** (`scripts/local_sgd_driver7.sh`, log
+   **Round 8 (done 2026-10-01, 00:05–00:56)** (`scripts/local_sgd_driver7.sh`, log
    `runs/local_sgd_driver7.log`, relaunch the script to resume; ~55 min):
    small model K = 1, K = 4 averaged + α 0.1 at 1M and 2M windows, and
    the d = 256 model K = 1 and K = 4 averaged + α 0.1 (lr 0.05), 1M
-   windows.
+   windows. Final held-out on `all_four` (7-gram 1.6281), one seed;
+   "best" is the lowest mid-run value, picked on held-out:
+
+   | arm | final | best | train-probe | ms/step |
+   |---|---|---|---|---|
+   | small, K = 1 | 1.6372 | 1.6241 | 1.281 | 5.7 |
+   | small, K = 4 averaged + α 0.1, 1M windows | **1.5793** | 1.5786 | 1.229 | 13.6 |
+   | small, K = 4 averaged + α 0.1, 2M windows | **1.5675** | 1.5672 | 1.186 | 14.5 |
+   | big (d 256), K = 1, lr 0.05 | 1.6417 | 1.6302 | 1.097 | 9.5 |
+   | big, K = 4 averaged + α 0.1, lr 0.05 | 1.5969 | 1.5969 | 1.124 | 32.0 |
+
+   - The recipe carries to a 1.75× larger, mixed-style corpus: averaging
+     + α turns a model that loses to the 7-gram (1.637) into one that beats
+     it by 0.049 (1.579), and 2× the windows adds 0.012 more. Final equals
+     best here (no overfitting at 1M–2M windows on this corpus), unlike
+     aesop alone.
+   - The larger model still doesn't beat the small one (K = 4: 1.597 vs
+     1.579; K = 1: 1.642 vs 1.637), though the gap is smaller than on
+     aesop (1.675 vs 1.610) and it fits train better (1.12 vs 1.23); at
+     373 KB a 4× model is still more capacity than the data supports at
+     this lr/dropout. Not tried: the big model with 2M windows or lower
+     dropout.
+   - No run was interrupted, so resume wasn't exercised in the driver
+     (only in the kill test above).
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
