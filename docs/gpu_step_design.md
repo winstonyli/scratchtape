@@ -955,10 +955,38 @@ Next, in order:
    - No run was interrupted, so resume wasn't exercised in the driver
      (only in the kill test above).
 
-   **Round 9 launched 2026-10-01** (`scripts/local_sgd_driver8.sh`, log
+   **Round 9 (done 2026-10-01, 09:17–10:47)** (`scripts/local_sgd_driver8.sh`, log
    `runs/local_sgd_driver8.log`, relaunch to resume; ~95 min): on
    `all_four`, K = 1 and K = 4 averaged + α 0.1 at seeds 11 and 21 (1M
    windows); K = 4 at 4M windows; the d = 256 model K = 4 at 2M windows.
+   Final held-out on `all_four` (7-gram 1.6281):
+
+   | arm | seed 1 | seed 11 | seed 21 | mean |
+   |---|---|---|---|---|
+   | small K = 1, 1M windows | 1.6372 | 1.6252 | 1.6226 | **1.6283** |
+   | small K = 4 averaged + α 0.1, 1M | 1.5793 | 1.5849 | 1.5833 | **1.5825** |
+
+   | arm (seed 1) | final | train-probe |
+   |---|---|---|
+   | small K = 4 averaged + α 0.1, 2M windows | 1.5675 | 1.186 |
+   | same, 4M windows | 1.5638 | 1.168 |
+   | big (d 256) K = 4, 2M windows | 1.6288 | 0.823 |
+
+   - A single small model ties the 7-gram (mean 1.6283 vs 1.6281);
+     averaging + α beats it by 0.046 at every seed (1.579–1.585, spread
+     0.006).
+   - More windows: 1M 1.579 → 2M 1.5675 → 4M 1.5638. The gain roughly
+     halves each time while train-probe keeps falling (1.23 → 1.19 →
+     1.17), so the plateau is near 1.56.
+   - The big model at 2M windows overfits (final 1.629, train-probe
+     0.82) and is worse than at 1M (1.597). It does not catch the small
+     model on this corpus under any budget tried.
+   - Caveat on every "best" column above for averaged arms: mid-run
+     evaluations fall at arbitrary points of the 100-step averaging
+     period, so most score the *unaveraged* models (the 4M log's mid-run
+     rows read ~1.60 for individual models against 1.564 for the
+     averaged final). Only the final row, or a row at a step that is a
+     multiple of 100, is the averaged model. Read "final".
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 

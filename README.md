@@ -1099,6 +1099,16 @@ because raw forgetting deltas hid a floor effect.
 
 ## Open threads
 
+- **Averaged-model recipe: where it stops (2026-10-01).** On the four
+  bundled books, K = 4 averaged + α = 0.1 reaches 1.5825 (three seeds)
+  against the 7-gram's 1.6281 and a single model's 1.6283, and plateaus
+  near 1.56 by 4M windows. The d = 256 model never beat the small one
+  (best 1.597). Open: a much larger corpus (well past 373 KB) where a
+  bigger model might pay off, and why averaging beats one model with 4×
+  the batch (1.651 vs 1.755 on aesop). The train-probe suggests a
+  regularization effect, untested directly (e.g. against 4 batch-32
+  models with the same gradient noise but no averaging).
+
 - **Replay + Fisher consolidation together** — humble-cortex found them
   synergistic. Here each was only tried alone, and Fisher's new-task cost
   might be offset by replay.
