@@ -833,6 +833,19 @@ Next, in order:
    - Aesop: longer H is slightly better (10 → 100: 1.634 → 1.610), so
      H = 100 stays. Per-model data is already different in every arm
      (each model draws its own batches).
+
+   **Round 6 launched 2026-09-30 21:36** (`scripts/local_sgd_driver5.sh`,
+   bash pid 10199, log `runs/local_sgd_driver5.log`, ~80 min):
+   `fused_models_check` gained `lr_decay_frac` (linear to 0 over the last
+   fraction of steps) and model-size args (`d_model heads d_ff blocks`,
+   args 19–22; `Config` was already parametric). (A) Sherlock at 64k and
+   128k windows, K = 1 / 4 independent / 4 averaged / 4 averaged + α =
+   0.1. (B) aesop averaged + α = 0.1 with lr decay over the last 20% and
+   50%. (C) A 4× larger model (d 256, d_ff 512, 4 blocks, 8 heads, ~3.4M
+   parameters per model): lr 0.48 diverges to NaN by step 250 at lr 0.3
+   too, while 0.05 and 0.15 train (smoke, 400 steps: 2.41 / 2.53), so the
+   runs use lr 0.05 and 0.1; K = 1 and K = 4 averaged + α = 0.1 at each
+   (`runs/big_*`).
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 

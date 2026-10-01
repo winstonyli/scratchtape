@@ -17,10 +17,12 @@
 // steps and at the end (local SGD; the DiLoCo family, arXiv 2311.08105,
 // minus its outer optimizer). It needs `shared_init` = 1: all K models start
 // from seed's init and differ only in their batches. Momentum buffers stay
-// per model. `outer_lr` > 0 replaces the plain mean with DiLoCo's outer step
+// per model. `lr_decay_frac` > 0 decays the lr linearly to 0 over that fraction
+// of the steps at the end; the model size args default to the 128/8/256/4 model.
+// `outer_lr` > 0 replaces the plain mean with DiLoCo's outer step
 // (Nesterov momentum `outer_mu` on the pseudo-gradient, DeviceParams::outer_step).
 //
-//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus]
+//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks]
 //
 // Every 8000 windows it prints each model's held-out CE (training_recipe_check's
 // deterministic 371 windows), their mean, and the ensemble's: the CE of
@@ -40,22 +42,18 @@ use std::time::{Duration, Instant};
 mod common;
 use common::{corpus, encode_bytes, sample_window};
 
-const D_MODEL: usize = 128;
-const N_HEADS: usize = 8;
-const D_FF: usize = 256;
 const SEQ_LEN: usize = 64;
-const N_BLOCKS: usize = 4;
 const VOCAB: usize = 256;
 /// Held-out windows per model per evaluation launch.
 const EVAL_CHUNK: usize = 32;
 
 /// training_recipe_check's init, drawn from `rng` in the same order.
-fn init(rng: &mut Rng) -> Vec<f32> {
-    let token_emb = Embedding::new(rng, VOCAB, D_MODEL);
-    let pos_emb = Embedding::new(rng, SEQ_LEN, D_MODEL);
-    let blocks: Vec<_> = (0..N_BLOCKS).map(|_| TransformerBlock::new(rng, D_MODEL, N_HEADS, D_FF)).collect();
-    let final_ln = LayerNorm::new(D_MODEL);
-    let output_proj = Linear::new(rng, D_MODEL, VOCAB);
+fn init(rng: &mut Rng, cfg: &Config) -> Vec<f32> {
+    let token_emb = Embedding::new(rng, cfg.vocab, cfg.d);
+    let pos_emb = Embedding::new(rng, cfg.t, cfg.d);
+    let blocks: Vec<_> = (0..cfg.n_blocks).map(|_| TransformerBlock::new(rng, cfg.d, cfg.heads, cfg.d_ff)).collect();
+    let final_ln = LayerNorm::new(cfg.d);
+    let output_proj = Linear::new(rng, cfg.d, cfg.vocab);
     pack(&token_emb, &pos_emb, &blocks, &final_ln, &output_proj)
 }
 
@@ -93,7 +91,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus]");
+    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks]");
     let name = &args[1];
     let k: usize = args[2].parse().unwrap();
     let batch: usize = args[3].parse().unwrap();
@@ -115,6 +113,9 @@ fn main() {
     let outer_lr: f32 = arg(15, "0").parse().unwrap();
     let outer_mu: f32 = arg(16, "0.9").parse().unwrap();
     let corpus_name = arg(17, "aesops_fables");
+    let lr_decay_frac: f32 = arg(18, "0").parse().unwrap();
+    let size = |i: usize, default: &str| -> usize { arg(i, default).parse().unwrap() };
+    let cfg = Config { vocab: VOCAB, d: size(19, "128"), heads: size(20, "8"), d_ff: size(21, "256"), t: SEQ_LEN, n_blocks: size(22, "4"), softmax1: false };
     let warmup = (warmup_windows / batch).max(1);
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
@@ -125,12 +126,11 @@ fn main() {
 
     // Model m's generator: its init, then its batches (training_recipe_check's order).
     let mut rngs: Vec<Rng> = (0..k as u64).map(|m| Rng::new(seed + m)).collect();
-    let flat: Vec<f32> = if shared_init { init(&mut Rng::new(seed)).repeat(k) } else { rngs.iter_mut().flat_map(init).collect() };
-    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu} corpus={corpus_name}", seed + k as u64 - 1);
+    let flat: Vec<f32> = if shared_init { init(&mut Rng::new(seed), &cfg).repeat(k) } else { rngs.iter_mut().flat_map(|r| init(r, &cfg)).collect() };
+    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu} corpus={corpus_name} lr_decay_frac={lr_decay_frac} model d={} heads={} d_ff={} blocks={}", seed + k as u64 - 1, cfg.d, cfg.heads, cfg.d_ff, cfg.n_blocks);
     println!("run {name}: pid {} {config} steps={steps}", std::process::id());
     let _lease = gpu_lease::hold(Kind::Shared, &format!("scratchtape fused_models_check {name}"), Duration::from_secs(4 * 3600));
     let dev = DeviceParams::upload_models(&flat, k);
-    let cfg = Config { vocab: VOCAB, d: D_MODEL, heads: N_HEADS, d_ff: D_FF, t: SEQ_LEN, n_blocks: N_BLOCKS, softmax1: false };
     let ones = (weight_decay > 0.0).then(|| upload_f32(&vec![1.0; flat.len()]));
     let stride = flat.len() / k;
     let outer = (outer_lr > 0.0).then(|| (upload_f32(&flat[..stride]), upload_f32(&vec![0.0; stride])));
@@ -165,7 +165,10 @@ fn main() {
         if step == steps {
             break;
         }
-        let lr = lr * ((step + 1) as f32 / warmup as f32).min(1.0);
+        let mut lr = lr * ((step + 1) as f32 / warmup as f32).min(1.0);
+        if lr_decay_frac > 0.0 {
+            lr *= ((steps - step) as f32 / (lr_decay_frac * steps as f32)).min(1.0);
+        }
         let (mut input, mut target) = (Vec::with_capacity(k * batch * SEQ_LEN), Vec::with_capacity(k * batch * SEQ_LEN));
         for rng in &mut rngs {
             for _ in 0..batch {
