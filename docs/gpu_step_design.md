@@ -740,7 +740,7 @@ Next, in order:
    near the batch-32 single models (1.68–1.70) on fit but beats them
    on held-out. One seed each.
 
-   **Round 3 launched 2026-09-30 18:16** (`scripts/local_sgd_driver2.sh`,
+   **Round 3 (done 2026-09-30, 18:16–19:11)** (`scripts/local_sgd_driver2.sh`,
    bash pid 13349, driver log `runs/local_sgd_driver2.log`, ~55 min, CPU
    contended): `DeviceParams::outer_step` (DiLoCo outer Nesterov, test
    `outer_step_matches_host`) and `fused_models_check` args `outer_lr
@@ -749,7 +749,25 @@ Next, in order:
    seed 1's), the batch-128 single model at seeds 2 and 3
    (`gpu_b128_..._s{2,3}`), DiLoCo outer lr 0.7 / mu 0.9 at H = 100 and
    1000 (`diloco_k4_h*`), and H = 100 with α = 0.1
-   (`local_k4_h100_a0.1`).
+   (`local_k4_h100_a0.1`). Held-out / train-probe of the final (averaged)
+   model:
+
+   | arm | held-out | train-probe |
+   |---|---|---|
+   | H = 100 averaged, seeds 1 / 11 / 21 | 1.6512 / 1.6560 / 1.6464 (mean 1.651) | 0.912 / 0.909 / 0.909 |
+   | one model, batch 128, seeds 1 / 2 / 3 | 1.7531 / 1.7515 / 1.7598 (mean 1.755) | 0.784 / 0.791 / 0.787 |
+   | DiLoCo outer 0.7 / 0.9, H = 100 | 1.6721 | 0.892 |
+   | DiLoCo outer 0.7 / 0.9, H = 1000 | 1.6617 | 0.918 |
+   | H = 100 averaged + α = 0.1 | **1.6149** | 0.989 |
+
+   - Averaging beats the batch-128 single model by 0.10 nats at every
+     seed (spread within each arm ≤ 0.01), so the effect is real, not a
+     seed fluke.
+   - DiLoCo's outer optimizer was *worse* than the plain mean at both H
+     (1.672, 1.662 vs 1.651), at one seed and untuned (outer lr 0.7 and
+     mu 0.9 are the paper's, tuned for large models and long rounds).
+   - α = 0.1 and averaging stack: 1.6149 with a smaller gap (0.63) than
+     either alone (single seed). Best held-out CE of any run so far.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 

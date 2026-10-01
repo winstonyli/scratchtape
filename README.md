@@ -1040,7 +1040,10 @@ it means here.
   H = 100 and 1000, against 1.680–1.696 for single independently trained
   models. A single model with the same 4× data per step (batch 128,
   same steps) is worse, 1.753 held-out, so it isn't a large-batch effect.
-  One seed each.
+  Three seeds each: averaged 1.651 (1.646–1.656) against batch-128 1.755
+  (1.752–1.760). DiLoCo's outer Nesterov step (the paper's lr 0.7, mu
+  0.9, untuned) did worse than the plain mean (1.662–1.672). Averaging
+  plus α = 0.1 reached 1.615, the best held-out CE here (one seed).
 
 **Sibling project: `humble-cortex`** (`../humble-cortex`, predictive
 coding in Rust). Its 95 checks overlap here in three places. First, every
