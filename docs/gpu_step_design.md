@@ -988,7 +988,7 @@ Next, in order:
      averaged final). Only the final row, or a row at a step that is a
      multiple of 100, is the averaged model. Read "final".
 
-   **Round 10 launched 2026-10-01 10:51** (`scripts/local_sgd_driver9.sh`,
+   **Round 10 (done 2026-10-01, 10:51–11:25)** (`scripts/local_sgd_driver9.sh`,
    log `runs/local_sgd_driver9.log`, ~32 min): `fused_models_check` now
    evaluates averaged arms only right after a sync (so "best" is
    meaningful). Control for "is averaging just regularization/noise?":
@@ -996,6 +996,27 @@ Next, in order:
    to set against H = 100/1000 (1.651) and one model at batch 128 (1.755).
    H = 1 is near batch-128 SGD; if the curve runs smoothly from 1.755
    down to 1.651, the gain is the local-drift noise, not the model count.
+   Result (K = 4, α = 0, shared init, 1M windows, seed 1; held-out final
+   / train-probe):
+
+   | sync period H | held-out | train-probe |
+   |---|---|---|
+   | 1 | 1.7680 | 0.793 |
+   | 3 | 1.7632 | 0.794 |
+   | 10 | 1.7018 | 0.828 |
+   | 30 | 1.6807 | 0.866 |
+   | 100 (seeds 1/11/21) | 1.651 (1.646–1.656) | 0.91 |
+   | 1000 | 1.6513 | 0.956 |
+   | (one model, batch 128) | 1.755 (1.752–1.760) | 0.79 |
+
+   The curve is smooth and monotone: H = 1 reproduces the batch-128
+   model (1.768 vs 1.755; train-probe 0.79 both), and each longer period
+   fits train less and generalizes better, up to a plateau by H = 100.
+   So the gain comes from letting the models drift apart between syncs
+   (local-SGD noise acting as a regularizer), not from having four
+   models' data per step. A lead, not checked here: the literature on
+   "post-local SGD" (Lin et al., 2018) reports local SGD generalizing
+   better than large-batch SGD; look it up before citing.
 
    **Round 11 (2026-10-01): a corpus past 373 KB.** `novels6` = six
    Gutenberg novels (Frankenstein, Pride and Prejudice, A Tale of Two
