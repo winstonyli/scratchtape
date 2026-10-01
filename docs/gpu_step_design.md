@@ -882,6 +882,17 @@ Next, in order:
      1M windows and dropout 0.3 are too much for 4× the parameters on
      214 KB of text; a shorter run or stronger regularization is
      untested. Costs: big K = 4 is 34–35 ms/step (K = 1: 10.5).
+
+   **Round 7 launched 2026-09-30 22:54** (`scripts/local_sgd_driver6.sh`,
+   bash pid 13561, log `runs/local_sgd_driver6.log`, ~60 min):
+   `DeviceParams::average_groups` (test `average_groups_keeps_groups_apart`)
+   and `fused_models_check` arg `groups`. (1) The d = 256 model, K = 4
+   averaged + α = 0.1, lr 0.05: 256k windows, 512k windows, 512k windows
+   with dropout 0.5 (`runs/big_k4_w*`). (2) K = 8 as 2 groups of 4 (each
+   group has its own init, averages only within itself; the evaluation's
+   "ensemble" is then the groups' ensemble), α = 0 and 0.1
+   (`runs/groups_k8x2_*`). Note α distills across all 8 peers, groups
+   included.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
