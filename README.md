@@ -1108,6 +1108,11 @@ because raw forgetting deltas hid a floor effect.
   the batch (1.651 vs 1.755 on aesop). The train-probe suggests a
   regularization effect, untested directly (e.g. against 4 batch-32
   models with the same gradient noise but no averaging).
+  On six Gutenberg novels (4.5 MB train, 7-gram 1.3567) the big model
+  with K = 4 averaged + α = 0.1 at 4M windows reaches 1.3084; the small
+  model plateaus ~1.41, and at 1M windows averaging does not help the big
+  model. Big K = 1 at 4M windows (running) separates averaging from
+  longer training; see docs/gpu_step_design.md, rounds 11–12.
 
 - **Replay + Fisher consolidation together** — humble-cortex found them
   synergistic. Here each was only tried alone, and Fisher's new-task cost

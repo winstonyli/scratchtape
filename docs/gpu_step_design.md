@@ -1030,6 +1030,31 @@ Next, in order:
    the round-10 driver, rebuilds, runs resumably; log
    `runs/local_sgd_driver10.log`): small K = 1, small K = 4 averaged + α 0.1,
    big K = 1, big K = 4 (1M windows), then both K = 4 at 4M windows.
+   Ran 11:26–14:12 on the RX 9060 XT (Vulkan), no resumes. Final held-out
+   CE (nats/byte; K = 4 rows are the averaged model; 7-gram **1.3567**):
+
+   | run | windows | CE |
+   |---|---|---|
+   | small K = 1 | 1M | 1.4609 |
+   | small K = 4, H = 100, α 0.1 | 1M | 1.4443 |
+   | big K = 1 | 1M | 1.4246 |
+   | big K = 4, H = 100, α 0.1 | 1M | 1.4435 |
+   | small K = 4 | 4M | 1.4132 |
+   | big K = 4 | 4M | **1.3084** |
+
+   Readings: (1) at 1M windows averaging helps the small model (−0.017)
+   but not the big one (big K = 1 beats big K = 4 by 0.019), the reverse
+   of aesop and all_four. (2) Only big K = 4 at 4M crosses the 7-gram
+   (−0.048) and was still falling slowly (1.3088 → 1.3084 over the last
+   500 steps); the small model plateaus ~1.41. (3) The 4M win mixes three
+   changes (windows, K, averaging); round 12 isolates averaging.
+
+   **Round 12 (2026-10-01): big K = 1 at 4M windows**, the control for
+   the big K = 4 4M run. `scripts/local_sgd_driver11.sh`, run
+   `nov_big_k1_4m`, pid 32852 (Normal priority, GPU-bound), started 14:54,
+   log `runs/nov_big_k1_4m.log` and `runs/local_sgd_driver11.log`,
+   ~9.6 ms/step × 128000 steps ≈ 20 min if the machine stays quiet
+   (round 11's K = 1 big ran 11.5 ms/step). Resumable (`runs/nov_big_k1_4m.resume`).
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
