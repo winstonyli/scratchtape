@@ -7,3 +7,4 @@ memory_tier_replay.txt
 samply_profile.json*
 attention_uniformity_*.txt
 runs/
+data/gutenberg/

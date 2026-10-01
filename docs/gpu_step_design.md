@@ -996,6 +996,19 @@ Next, in order:
    to set against H = 100/1000 (1.651) and one model at batch 128 (1.755).
    H = 1 is near batch-128 SGD; if the curve runs smoothly from 1.755
    down to 1.651, the gain is the local-drift noise, not the model count.
+
+   **Round 11 (2026-10-01): a corpus past 373 KB.** `novels6` = six
+   Gutenberg novels (Frankenstein, Pride and Prejudice, A Tale of Two
+   Cities, Dracula, Great Expectations, Moby-Dick), fetched on request by
+   `scripts/fetch_gutenberg.sh` into the gitignored `data/gutenberg/`
+   (licence header/footer stripped; 5.04 MB; the tails of Dracula and
+   Pride and Prejudice carry publisher ads, which land in held-out). Last
+   10% of each book held out: 4.53 MB train, 504 KB = 7873 windows
+   held-out; 7-gram (order 7) **1.3567**. 1M windows is ~14 passes, so
+   less overfitting than before. `scripts/local_sgd_driver10.sh` (waits for
+   the round-10 driver, rebuilds, runs resumably; log
+   `runs/local_sgd_driver10.log`): small K = 1, small K = 4 averaged + α 0.1,
+   big K = 1, big K = 4 (1M windows), then both K = 4 at 4M windows.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
