@@ -644,7 +644,10 @@ for one model; α adds 0.007), so the effect needs a run length matched
 to the corpus. A final lr decay did not help on aesop (1.623–1.632 vs
 1.610: it overfits more), and a 4× larger model (d 256, d_ff 512; lr 0.48
 diverges, so lr 0.05) did worse at the same 1M windows: 1.675 averaged,
-1.81 single, against 1.610 for the small one.
+1.81 single, against 1.610 for the small one; 512k windows gave 1.664,
+256k 1.762 and dropout 0.5 1.794, so no setting tried rescued it. Two
+averaged groups of 4, ensembled, reach 1.568, short of 4 independent
+models' 1.548: averaging and ensembling don't stack.
 
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention

@@ -883,7 +883,7 @@ Next, in order:
      214 KB of text; a shorter run or stronger regularization is
      untested. Costs: big K = 4 is 34–35 ms/step (K = 1: 10.5).
 
-   **Round 7 launched 2026-09-30 22:54** (`scripts/local_sgd_driver6.sh`,
+   **Round 7 (done 2026-09-30, 22:54–23:54)** (`scripts/local_sgd_driver6.sh`,
    bash pid 13561, log `runs/local_sgd_driver6.log`, ~60 min):
    `DeviceParams::average_groups` (test `average_groups_keeps_groups_apart`)
    and `fused_models_check` arg `groups`. (1) The d = 256 model, K = 4
@@ -892,7 +892,30 @@ Next, in order:
    group has its own init, averages only within itself; the evaluation's
    "ensemble" is then the groups' ensemble), α = 0 and 0.1
    (`runs/groups_k8x2_*`). Note α distills across all 8 peers, groups
-   included.
+   included. Final held-out (train-probe), one seed:
+
+   | arm | held-out | train-probe |
+   |---|---|---|
+   | big, K = 4 averaged + α 0.1, lr 0.05, 256k windows, dropout 0.3 | 1.7622 | 1.356 |
+   | same, 512k windows | **1.6641** | 1.108 |
+   | same, 512k windows, dropout 0.5 | 1.7943 | 1.411 |
+   | K = 8 as 2 groups of 4, α 0: groups / ensemble | 1.644, 1.648 / 1.5734 | 0.909 / 0.880 |
+   | K = 8 as 2 groups of 4, α 0.1: groups / ensemble | 1.608, 1.623 / **1.5678** | 0.996, 0.990 / 0.967 |
+
+   - Larger model: 512k windows (1.664) is a little better than 1M
+     (1.675), still above the small model's 1.610. 256k is undertrained
+     (1.762) and dropout 0.5 underfits (1.794). So no setting tried here
+     lets 4× the parameters beat the small model on 214 KB of text.
+     Big K = 4 costs 33–34 ms/step.
+   - Groups: averaged groups' ensemble (1.573 at α 0, 1.568 at α 0.1)
+     beats any single averaged model (1.608–1.648) but not the plain
+     4-independent-model ensemble (1.548), at twice the inference cost of
+     one averaged model and 8 models of training. The gains do not stack:
+     averaging removes the variance that ensembling exploits. α = 0.1
+     helps the groups individually (1.646 → 1.616 mean) and the ensemble
+     only slightly (1.573 → 1.568), even with distillation across groups.
+     The best single deployable model stays K = 4 averaged + α 0.1
+     (1.610 over three seeds, one set of weights).
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
