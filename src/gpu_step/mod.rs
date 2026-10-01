@@ -173,6 +173,19 @@ impl DeviceParams {
         k_average_models::launch(client(), cubes(stride), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), stride as u32, k as u32);
     }
 
+    /// One launch of DiLoCo's outer step (arXiv 2311.08105): with the mean
+    /// of the K models as the new point, d = anchor - mean is a
+    /// pseudo-gradient; Nesterov momentum on it (v = mu v + d; anchor -=
+    /// lr (d + mu v)) moves the shared `anchor`, and every model is reset to
+    /// it. `anchor` holds one model's parameters (`stride` f32s, the shared
+    /// init at the start), `v` the outer velocity (`stride` f32s, zero at
+    /// the start). With lr = 1 and mu = 0 this is `average_models`.
+    pub fn outer_step(&self, anchor: &Handle, v: &Handle, lr: f32, mu: f32) {
+        let Models { k, stride } = self.models;
+        count_launch();
+        k_outer_step::launch(client(), cubes(stride), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(anchor, stride), buf(v, stride), stride as u32, k as u32, lr, mu);
+    }
+
     /// Blocking readback (crosses USB4; for tests and checkpoints only).
     pub fn read(&self, h: &Handle) -> Vec<f32> {
         f32::from_bytes(&client().read_one(h.clone()).unwrap())[..self.len].to_vec()
@@ -236,6 +249,26 @@ fn k_average_models(p: &mut [f32], stride: u32, k: u32) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cube(launch)]
+fn k_outer_step(p: &mut [f32], anchor: &mut [f32], v: &mut [f32], stride: u32, k: u32, lr: f32, mu: f32) {
+    let i = ABSOLUTE_POS as u32;
+    if i < stride {
+        let mut s = 0.0f32;
+        for m in 0..k {
+            s += p[(m * stride + i) as usize];
+        }
+        let d = anchor[i as usize] - s / k as f32;
+        let vel = mu * v[i as usize] + d;
+        v[i as usize] = vel;
+        let new = anchor[i as usize] - lr * (d + mu * vel);
+        anchor[i as usize] = new;
+        for m in 0..k {
+            p[(m * stride + i) as usize] = new;
+        }
+    }
+}
+
 #[cube(launch)]
 fn k_fill(x: &mut [f32], v: f32, len: u32) {
     let i = ABSOLUTE_POS;
@@ -273,6 +306,40 @@ mod tests {
             for m in 0..3 {
                 assert!((got[m * 5 + i] - mean).abs() < 1e-4, "slot {m} param {i}: {} vs {mean}", got[m * 5 + i]);
             }
+        }
+    }
+
+    /// Needs the discrete GPU. lr 1, mu 0 equals `average_models`; with
+    /// momentum, two steps match a host computation.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn outer_step_matches_host() {
+        let flat: Vec<f32> = (0..15).map(|i| ((i * 7 % 11) as f32) * 0.3 - 1.0).collect();
+        let (lr, mu) = (0.7f32, 0.9f32);
+        let mut dev = DeviceParams::upload_models(&flat, 3);
+        let init: Vec<f32> = flat[..5].to_vec();
+        let anchor = upload_f32(&init);
+        let v = upload_f32(&[0.0; 5]);
+        let (mut a, mut vel) = (init.clone(), vec![0.0f32; 5]);
+        let mut local = flat.clone();
+        for round in 0..2 {
+            dev.outer_step(&anchor, &v, lr, mu);
+            for i in 0..5 {
+                let mean = (local[i] + local[5 + i] + local[10 + i]) / 3.0;
+                let d = a[i] - mean;
+                vel[i] = mu * vel[i] + d;
+                a[i] -= lr * (d + mu * vel[i]);
+            }
+            let got = dev.read(&dev.params);
+            for m in 0..3 {
+                for i in 0..5 {
+                    assert!((got[m * 5 + i] - a[i]).abs() < 1e-5, "round {round} model {m} param {i}");
+                }
+            }
+            // perturb each model before the next round (host and device alike)
+            let bumped: Vec<f32> = got.iter().enumerate().map(|(j, x)| x + 0.1 * (j as f32 % 4.0 - 1.5)).collect();
+            local = bumped.clone();
+            dev = DeviceParams::upload_models(&bumped, 3);
         }
     }
 

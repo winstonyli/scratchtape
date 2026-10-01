@@ -17,9 +17,10 @@
 // steps and at the end (local SGD; the DiLoCo family, arXiv 2311.08105,
 // minus its outer optimizer). It needs `shared_init` = 1: all K models start
 // from seed's init and differ only in their batches. Momentum buffers stay
-// per model.
+// per model. `outer_lr` > 0 replaces the plain mean with DiLoCo's outer step
+// (Nesterov momentum `outer_mu` on the pseudo-gradient, DeviceParams::outer_step).
 //
-//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init]
+//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu]
 //
 // Every 8000 windows it prints each model's held-out CE (training_recipe_check's
 // deterministic 371 windows), their mean, and the ensemble's: the CE of
@@ -92,7 +93,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init]");
+    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu]");
     let name = &args[1];
     let k: usize = args[2].parse().unwrap();
     let batch: usize = args[3].parse().unwrap();
@@ -111,6 +112,8 @@ fn main() {
     let sync_every: usize = arg(13, "0").parse().unwrap();
     let shared_init = arg(14, "0") == "1";
     assert!(sync_every == 0 || shared_init, "averaging models needs shared_init = 1");
+    let outer_lr: f32 = arg(15, "0").parse().unwrap();
+    let outer_mu: f32 = arg(16, "0.9").parse().unwrap();
     let warmup = (warmup_windows / batch).max(1);
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
@@ -122,12 +125,14 @@ fn main() {
     // Model m's generator: its init, then its batches (training_recipe_check's order).
     let mut rngs: Vec<Rng> = (0..k as u64).map(|m| Rng::new(seed + m)).collect();
     let flat: Vec<f32> = if shared_init { init(&mut Rng::new(seed)).repeat(k) } else { rngs.iter_mut().flat_map(init).collect() };
-    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init}", seed + k as u64 - 1);
+    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu}", seed + k as u64 - 1);
     println!("run {name}: pid {} {config} steps={steps}", std::process::id());
     let _lease = gpu_lease::hold(Kind::Shared, &format!("scratchtape fused_models_check {name}"), Duration::from_secs(4 * 3600));
     let dev = DeviceParams::upload_models(&flat, k);
     let cfg = Config { vocab: VOCAB, d: D_MODEL, heads: N_HEADS, d_ff: D_FF, t: SEQ_LEN, n_blocks: N_BLOCKS, softmax1: false };
     let ones = (weight_decay > 0.0).then(|| upload_f32(&vec![1.0; flat.len()]));
+    let stride = flat.len() / k;
+    let outer = (outer_lr > 0.0).then(|| (upload_f32(&flat[..stride]), upload_f32(&vec![0.0; stride])));
     let velocity = (momentum > 0.0).then(|| upload_f32(&vec![0.0; flat.len()]));
     println!("columns: step | windows seen per model | held-out CE per model | mean | ensemble | elapsed | training ms/step since last row");
     std::fs::create_dir_all("runs").unwrap();
@@ -185,7 +190,10 @@ fn main() {
             None => dev.sgd(lr),
         }
         if sync_every > 0 && ((step + 1) % sync_every == 0 || step + 1 == steps) {
-            dev.average_models();
+            match &outer {
+                Some((anchor, v)) => dev.outer_step(anchor, v, outer_lr, outer_mu),
+                None => dev.average_models(),
+            }
         }
     }
     let training = start.elapsed() - evaluating;

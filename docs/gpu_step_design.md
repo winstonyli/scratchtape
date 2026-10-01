@@ -739,6 +739,17 @@ Next, in order:
    generalizes worse than the averaged one (1.651, 0.91), which sits
    near the batch-32 single models (1.68–1.70) on fit but beats them
    on held-out. One seed each.
+
+   **Round 3 launched 2026-09-30 18:16** (`scripts/local_sgd_driver2.sh`,
+   bash pid 13349, driver log `runs/local_sgd_driver2.log`, ~55 min, CPU
+   contended): `DeviceParams::outer_step` (DiLoCo outer Nesterov, test
+   `outer_step_matches_host`) and `fused_models_check` args `outer_lr
+   outer_mu`. Runs in order: H = 100 averaged at seeds 11 and 21
+   (`local_k4_h100_s{11,21}`; seeds chosen so data streams don't overlap
+   seed 1's), the batch-128 single model at seeds 2 and 3
+   (`gpu_b128_..._s{2,3}`), DiLoCo outer lr 0.7 / mu 0.9 at H = 100 and
+   1000 (`diloco_k4_h*`), and H = 100 with α = 0.1
+   (`local_k4_h100_a0.1`).
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
