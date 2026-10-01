@@ -194,7 +194,8 @@ fn main() {
             std::fs::rename(&tmp, &resume_path).unwrap();
             last_save = Instant::now();
         }
-        if step % eval_every == 0 || step == steps {
+        // With averaging, only evaluate right after a sync, where the models are the averaged one.
+        if (step % eval_every == 0 && (sync_every == 0 || step % sync_every == 0)) || step == steps {
             gpu_lease::pause_while_exclusive();
             let t = Instant::now();
             let ms_per_step = match step - segment.1 {

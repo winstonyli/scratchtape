@@ -987,6 +987,15 @@ Next, in order:
      rows read ~1.60 for individual models against 1.564 for the
      averaged final). Only the final row, or a row at a step that is a
      multiple of 100, is the averaged model. Read "final".
+
+   **Round 10 launched 2026-10-01 10:51** (`scripts/local_sgd_driver9.sh`,
+   log `runs/local_sgd_driver9.log`, ~32 min): `fused_models_check` now
+   evaluates averaged arms only right after a sync (so "best" is
+   meaningful). Control for "is averaging just regularization/noise?":
+   the sync-period curve at α = 0 on aesop, H = 1, 3, 10, 30 (`runs/hcurve_h*`),
+   to set against H = 100/1000 (1.651) and one model at batch 128 (1.755).
+   H = 1 is near batch-128 SGD; if the curve runs smoothly from 1.755
+   down to 1.651, the gain is the local-drift noise, not the model count.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
