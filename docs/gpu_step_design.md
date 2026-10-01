@@ -916,6 +916,21 @@ Next, in order:
      only slightly (1.573 → 1.568), even with distillation across groups.
      The best single deployable model stays K = 4 averaged + α 0.1
      (1.610 over three seeds, one set of weights).
+
+   **Resume + larger corpus (2026-10-01).** `fused_models_check` is now
+   resumable (arg 24 `checkpoint_secs`, default 600; `runs/<name>.resume`
+   holds step, per-model RNG states, parameters, momentum and outer-step
+   state as text, ~77 MB for K = 4). Checked: a K = 4 run with the outer
+   step, killed after ~20 s and resumed, wrote byte-identical
+   checkpoints to an uninterrupted run, and the resume file was removed.
+   Corpus `all_four` = the four bundled books with the last 10% of
+   *each* held out (373 KB train, 41 KB = 647 held-out windows, 7-gram
+   1.6281 at order 7; aesop alone is unchanged at 1.6546).
+   **Round 8 launched 2026-10-01** (`scripts/local_sgd_driver7.sh`, log
+   `runs/local_sgd_driver7.log`, relaunch the script to resume; ~55 min):
+   small model K = 1, K = 4 averaged + α 0.1 at 1M and 2M windows, and
+   the d = 256 model K = 1 and K = 4 averaged + α 0.1 (lr 0.05), 1M
+   windows.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 

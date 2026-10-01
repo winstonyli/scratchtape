@@ -22,10 +22,16 @@
 // `groups` > 1 splits the K models into that many groups, each with its own
 // init (seed + 1000 g) that averages only within itself, so the groups can be
 // ensembled (needs shared_init = 1 and sync_every > 0).
+// Resumable (LONG_RUNS.md): every `checkpoint_secs` (default 600) the step,
+// each model's RNG state, the parameters and the optimizer state go to
+// runs/<name>.resume; relaunching the same command continues from it, and a
+// killed-and-resumed run reproduces an uninterrupted one. The file is
+// removed once the final checkpoints are written. (The final "training ms/step"
+// then covers only the last launch.)
 // `outer_lr` > 0 replaces the plain mean with DiLoCo's outer step
 // (Nesterov momentum `outer_mu` on the pseudo-gradient, DeviceParams::outer_step).
 //
-//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups]
+//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups] [checkpoint_secs]
 //
 // Every 8000 windows it prints each model's held-out CE (training_recipe_check's
 // deterministic 371 windows), their mean, and the ensemble's: the CE of
@@ -43,7 +49,7 @@ use std::time::{Duration, Instant};
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{corpus, encode_bytes, sample_window};
+use common::{sample_window, split_corpus};
 
 const SEQ_LEN: usize = 64;
 const VOCAB: usize = 256;
@@ -94,7 +100,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups]");
+    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups] [checkpoint_secs]");
     let name = &args[1];
     let k: usize = args[2].parse().unwrap();
     let batch: usize = args[3].parse().unwrap();
@@ -125,9 +131,8 @@ fn main() {
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
 
-    let full = encode_bytes(corpus(&corpus_name));
-    let split = (full.len() as f32 * 0.9) as usize;
-    let (train, held_out) = full.split_at(split);
+    let (train, held_out) = split_corpus(&corpus_name);
+    let (train, held_out) = (&train[..], &held_out[..]);
 
     // Model m's generator: its init, then its batches (training_recipe_check's order).
     let mut rngs: Vec<Rng> = (0..k as u64).map(|m| Rng::new(seed + m)).collect();
@@ -135,18 +140,60 @@ fn main() {
     let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu} corpus={corpus_name} lr_decay_frac={lr_decay_frac} model d={} heads={} d_ff={} blocks={} groups={groups}", seed + k as u64 - 1, cfg.d, cfg.heads, cfg.d_ff, cfg.n_blocks);
     println!("run {name}: pid {} {config} steps={steps}", std::process::id());
     let _lease = gpu_lease::hold(Kind::Shared, &format!("scratchtape fused_models_check {name}"), Duration::from_secs(4 * 3600));
+    // Resume file: header "<config> | <step> <rng state per model>", then
+    // the parameters, then the velocity (momentum), then the outer anchor
+    // and velocity (outer step), one line each.
+    let checkpoint_secs: u64 = arg(24, "600").parse().unwrap();
+    let resume_path = format!("runs/{name}.resume");
+    let (mut flat, mut first) = (flat, 0);
+    let mut saved: std::vec::IntoIter<Vec<f32>> = vec![].into_iter();
+    if let Ok(text) = std::fs::read_to_string(&resume_path) {
+        let mut lines = text.trim_end().lines();
+        let (header, at) = lines.next().unwrap().split_once(" | ").unwrap();
+        assert_eq!(header, config, "{resume_path} is from a different config");
+        let mut at = at.split_whitespace();
+        first = at.next().unwrap().parse().unwrap();
+        for rng in rngs.iter_mut() {
+            *rng = Rng::new(at.next().unwrap().parse().unwrap());
+        }
+        let mut vecs: Vec<Vec<f32>> = lines.map(|l| l.split_whitespace().map(|x| x.parse().unwrap()).collect()).collect();
+        flat = vecs.remove(0);
+        saved = vecs.into_iter();
+        println!("resumed from {resume_path} at step {first}");
+    }
     let dev = DeviceParams::upload_models(&flat, k);
     let ones = (weight_decay > 0.0).then(|| upload_f32(&vec![1.0; flat.len()]));
     let stride = flat.len() / k;
-    let outer = (outer_lr > 0.0).then(|| (upload_f32(&flat[..stride]), upload_f32(&vec![0.0; stride])));
-    let velocity = (momentum > 0.0).then(|| upload_f32(&vec![0.0; flat.len()]));
+    let velocity = (momentum > 0.0).then(|| upload_f32(&saved.next().unwrap_or_else(|| vec![0.0; flat.len()])));
+    let outer = (outer_lr > 0.0).then(|| match (saved.next(), saved.next()) {
+        (Some(anchor), Some(v)) => (upload_f32(&anchor), upload_f32(&v)),
+        _ => (upload_f32(&flat[..stride]), upload_f32(&vec![0.0; stride])),
+    });
+    assert!(saved.next().is_none(), "{resume_path} has more state than this config uses");
     println!("columns: step | windows seen per model | held-out CE per model | mean | ensemble | elapsed | training ms/step since last row");
     std::fs::create_dir_all("runs").unwrap();
     let start = Instant::now();
     let mut evaluating = Duration::ZERO;
-    let mut segment = (Instant::now(), 0);
+    let mut segment = (Instant::now(), first);
     let mut last = (vec![], 0.0);
-    for step in 0..=steps {
+    let mut last_save = Instant::now();
+    for step in first..=steps {
+        // Save before this step's work; `step` is the next one to run.
+        if step > first && step < steps && last_save.elapsed().as_secs() >= checkpoint_secs {
+            let line = |v: Vec<f32>| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+            let states: Vec<String> = rngs.iter().map(|r| r.state().to_string()).collect();
+            let mut text = format!("{config} | {step} {}\n{}", states.join(" "), line(dev.read(&dev.params)));
+            if let Some(v) = &velocity {
+                text += &format!("\n{}", line(dev.read(v)));
+            }
+            if let Some((anchor, v)) = &outer {
+                text += &format!("\n{}\n{}", line(read(anchor)[..stride].to_vec()), line(read(v)[..stride].to_vec()));
+            }
+            let tmp = format!("{resume_path}.tmp");
+            std::fs::write(&tmp, text).unwrap();
+            std::fs::rename(&tmp, &resume_path).unwrap();
+            last_save = Instant::now();
+        }
         if step % eval_every == 0 || step == steps {
             gpu_lease::pause_while_exclusive();
             let t = Instant::now();
@@ -205,6 +252,7 @@ fn main() {
             }
         }
     }
+    let _ = std::fs::remove_file(&resume_path);
     let training = start.elapsed() - evaluating;
 
     // Train-probe: the first held-out-sized stretch of the training text, to

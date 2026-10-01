@@ -29,7 +29,6 @@ use std::collections::HashMap;
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::encode_bytes;
 
 const V: usize = 256;
 const SEQ_LEN: usize = 64;
@@ -106,9 +105,8 @@ impl KneserNey {
 }
 
 fn main() {
-    let full = encode_bytes(common::corpus(&std::env::args().nth(1).unwrap_or("aesops_fables".into())));
-    let split = (full.len() as f32 * 0.9) as usize;
-    let (train, held_out) = full.split_at(split);
+    let (train, held_out) = common::split_corpus(&std::env::args().nth(1).unwrap_or("aesops_fables".into()));
+    let (train, held_out) = (&train[..], &held_out[..]);
     println!("train {} bytes, held-out {} bytes", train.len(), held_out.len());
 
     let max_order = 10;

@@ -300,3 +300,19 @@ pub fn corpus(name: &str) -> &'static str {
         _ => panic!("unknown corpus {name}"),
     }
 }
+
+/// (train, held-out) bytes of a bundled corpus: the last 10% of the text
+/// is held out. `all_four` takes the last 10% of *each* of the four books,
+/// so the held-out set mixes all four styles.
+#[allow(dead_code)]
+pub fn split_corpus(name: &str) -> (Vec<usize>, Vec<usize>) {
+    let books: Vec<&str> = if name == "all_four" { ["aesops_fables", "leaves_of_grass", "origin_of_species", "sherlock_holmes"].iter().map(|n| corpus(n)).collect() } else { vec![corpus(name)] };
+    let (mut train, mut held_out) = (vec![], vec![]);
+    for book in books {
+        let full = encode_bytes(book);
+        let split = (full.len() as f32 * 0.9) as usize;
+        train.extend_from_slice(&full[..split]);
+        held_out.extend_from_slice(&full[split..]);
+    }
+    (train, held_out)
+}
