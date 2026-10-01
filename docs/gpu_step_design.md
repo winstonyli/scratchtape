@@ -683,7 +683,57 @@ Next, in order:
 3. **Results into the README (done 2026-09-30).** Throughput,
    codistillation results, and related work: HFTA, Zhang 2018, Anil
    2018, DiLoCo.
-4. **Later: weight averaging.** Periodically average replicas that share
+   **Profilers checked (2026-09-30):** `gpu_train_check 0 200 profile`
+   and `host` run and print per-site tables (GPU 2.32 ms/step, host
+   4.77 ms/step; the host run was under ~60–80% CPU from other sessions).
+
+   **Follow-ups (done 2026-09-30, 17:07–17:31)** (`scripts/codist_driver2.sh`,
+   bash pid 1121; logs `runs/codist2_k4_*.log`, driver log
+   `runs/codist_driver2.log`; ~25 min, CPU was contended by other
+   sessions so ms/step is not clean): `fused_models_check` now prints a
+   train-probe CE at the end and takes an α ramp (linear from 0 over N
+   windows). Arms: α = 0 (for the train-probe baseline), α = 0.1, α = 0.5
+   ramped over 512000 windows. Same recipe as above; train-probe is the
+   first held-out-sized stretch of the training text, final step:
+
+   | arm | held-out mean | ensemble | train-probe mean | ensemble |
+   |---|---|---|---|---|
+   | α = 0 | 1.686 | 1.548 | 1.035 | 0.962 |
+   | α = 0.1 | **1.650** | 1.558 | 1.100 | 1.042 |
+   | α = 0.5 ramped | 1.783 | 1.725 | 1.340 | 1.295 |
+
+   α = 0.1 is the one setting that helps: each model improves by 0.037
+   nats and the train/held-out gap narrows (0.65 → 0.55), but the models
+   agree more, so the ensemble is slightly worse (1.558 vs 1.548). A
+   ramp changes nothing at α = 0.5 (1.7825 vs 1.7827 constant). Ensemble
+   of independent seeds (1.548) is still the best held-out number; α = 0.1
+   gives the best single model from 4 fused models.
+4. **Weight averaging (local SGD, done 2026-09-30).**
+   `DeviceParams::average_models` (one launch, test
+   `average_models_means_every_slot`) and `fused_models_check` args
+   `sync_every_steps shared_init`. Arms from one shared init, K = 4, same
+   recipe: H = 0 (control: shared init, never averaged), 100, 1000 steps;
+   `scripts/local_sgd_driver.sh` (waiter pid 1421, starts after the
+   follow-ups finish, ran 17:32–17:56, logs `runs/local_k4_h*.log`). Simplest form:
+   plain parameter mean, no DiLoCo outer optimizer, momentum buffers left
+   per model.
+
+   | arm (shared init, K = 4) | held-out | train-probe |
+   |---|---|---|
+   | H = 0, never averaged: mean / ensemble | 1.693 / 1.553 | 1.035 / 0.963 |
+   | H = 100, averaged model | **1.6512** | 0.912 |
+   | H = 1000, averaged model | 1.6513 | 0.956 |
+
+   Shared init alone keeps the ensemble gain (1.553 vs 1.548), so the
+   models still diverge enough. Averaging gives one model at 1.651,
+   better than every independent single model (1.680–1.696) and equal
+   to α = 0.1's per-model 1.650, with a *lower* train loss rather than a
+   smaller gap (gap 0.74 at H = 100, 0.70 at H = 1000 vs 0.65
+   independent). H = 100 and 1000 reach the same held-out CE.
+   Caveats: this spends 4 models' compute (4 × batch 32 of data per step)
+   on one model, so the fair comparison is a single model at batch 128
+   with the same steps, not run; and one seed.
+   **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
 ## CPU model: batched heads (done 2026-09-24)

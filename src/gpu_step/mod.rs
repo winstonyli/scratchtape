@@ -165,6 +165,14 @@ impl DeviceParams {
         k_fill::launch(client(), cubes(self.len), CubeDim::new_1d(EW_DIM), buf(&self.grads, self.len), 0.0f32, self.len as u32);
     }
 
+    /// One launch: every model's parameters become the mean over the K
+    /// models (local SGD's sync; momentum buffers are left alone).
+    pub fn average_models(&self) {
+        let Models { k, stride } = self.models;
+        count_launch();
+        k_average_models::launch(client(), cubes(stride), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), stride as u32, k as u32);
+    }
+
     /// Blocking readback (crosses USB4; for tests and checkpoints only).
     pub fn read(&self, h: &Handle) -> Vec<f32> {
         f32::from_bytes(&client().read_one(h.clone()).unwrap())[..self.len].to_vec()
@@ -214,6 +222,21 @@ fn k_decay(p: &mut [f32], mask: &[f32], shrink: f32, len: u32) {
 }
 
 #[cube(launch)]
+fn k_average_models(p: &mut [f32], stride: u32, k: u32) {
+    let i = ABSOLUTE_POS as u32;
+    if i < stride {
+        let mut s = 0.0f32;
+        for m in 0..k {
+            s += p[(m * stride + i) as usize];
+        }
+        let mean = s / k as f32;
+        for m in 0..k {
+            p[(m * stride + i) as usize] = mean;
+        }
+    }
+}
+
+#[cube(launch)]
 fn k_fill(x: &mut [f32], v: f32, len: u32) {
     let i = ABSOLUTE_POS;
     if (i as u32) < len {
@@ -235,6 +258,23 @@ mod tests {
     use crate::nn::Rng;
     use crate::optim::Sgd;
     use crate::tensor::NdArray;
+
+    /// Needs the discrete GPU. Three models of 5 parameters average to
+    /// their elementwise mean, in every model's slot.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn average_models_means_every_slot() {
+        let flat: Vec<f32> = (0..15).map(|i| (i * i) as f32).collect();
+        let dev = DeviceParams::upload_models(&flat, 3);
+        dev.average_models();
+        let got = dev.read(&dev.params);
+        for i in 0..5 {
+            let mean = (flat[i] + flat[5 + i] + flat[10 + i]) / 3.0;
+            for m in 0..3 {
+                assert!((got[m * 5 + i] - mean).abs() < 1e-4, "slot {m} param {i}: {} vs {mean}", got[m * 5 + i]);
+            }
+        }
+    }
 
     /// Needs the discrete GPU, so it's opt-in: `cargo test -- --ignored`.
     /// One SGD launch over a packed model must equal `optim::Sgd` on the

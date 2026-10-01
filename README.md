@@ -1029,11 +1029,17 @@ it means here.
   lr 0.48, dropout 0.3, decay 2e-4, 1M windows, K = 4, held-out CE mean /
   ensemble): α = 0 1.686 / 1.548, α = 0.5 1.783 / 1.727, α = 1 1.940 /
   1.896. Independent seeds averaged beat every other arm, and one model
-  with 4× the steps reached 1.7175. Details and caveats in
+  with 4× the steps reached 1.7175. Follow-ups: α = 0.1 is the one
+  setting that helps per model (1.650 vs 1.686) at a small ensemble cost
+  (1.558), and ramping α changes nothing. Details and caveats in
   `docs/gpu_step_design.md`.
 - Douillard et al. 2023, *DiLoCo* ([arXiv 2311.08105](https://arxiv.org/abs/2311.08105)):
   replicas from one init train locally and periodically average weights.
-  Not tried; the next candidate for using the K models.
+  Tried in its simplest form (plain mean of the K models every H steps,
+  shared init, no outer optimizer): one model at held-out 1.651 for
+  H = 100 and 1000, against 1.680–1.696 for single independently trained
+  models. It uses 4× the data per step, so the fair baseline (one model,
+  batch 128) is still to run.
 
 **Sibling project: `humble-cortex`** (`../humble-cortex`, predictive
 coding in Rust). Its 95 checks overlap here in three places. First, every

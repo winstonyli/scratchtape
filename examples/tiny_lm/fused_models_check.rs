@@ -13,7 +13,13 @@
 // loss gains alpha · KL(peers' mean prediction ‖ its own) per position,
 // the peers held constant (DeviceTape::with_distill).
 //
-//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha]
+// `sync_every_steps` > 0 averages the K models' parameters every that many
+// steps and at the end (local SGD; the DiLoCo family, arXiv 2311.08105,
+// minus its outer optimizer). It needs `shared_init` = 1: all K models start
+// from seed's init and differ only in their batches. Momentum buffers stay
+// per model.
+//
+//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init]
 //
 // Every 8000 windows it prints each model's held-out CE (training_recipe_check's
 // deterministic 371 windows), their mean, and the ensemble's: the CE of
@@ -86,7 +92,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha]");
+    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init]");
     let name = &args[1];
     let k: usize = args[2].parse().unwrap();
     let batch: usize = args[3].parse().unwrap();
@@ -100,6 +106,11 @@ fn main() {
     let warmup_windows: usize = arg(9, "0").parse().unwrap();
     let momentum: f32 = arg(10, "0").parse().unwrap();
     let alpha: f32 = arg(11, "0").parse().unwrap();
+    // alpha rises linearly from 0 over this many windows (0: constant)
+    let ramp = (arg(12, "0").parse::<usize>().unwrap() / batch).max(1);
+    let sync_every: usize = arg(13, "0").parse().unwrap();
+    let shared_init = arg(14, "0") == "1";
+    assert!(sync_every == 0 || shared_init, "averaging models needs shared_init = 1");
     let warmup = (warmup_windows / batch).max(1);
     let steps = windows / batch;
     let eval_every = (8000 / batch).max(1);
@@ -110,8 +121,8 @@ fn main() {
 
     // Model m's generator: its init, then its batches (training_recipe_check's order).
     let mut rngs: Vec<Rng> = (0..k as u64).map(|m| Rng::new(seed + m)).collect();
-    let flat: Vec<f32> = rngs.iter_mut().flat_map(init).collect();
-    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha}", seed + k as u64 - 1);
+    let flat: Vec<f32> = if shared_init { init(&mut Rng::new(seed)).repeat(k) } else { rngs.iter_mut().flat_map(init).collect() };
+    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init}", seed + k as u64 - 1);
     println!("run {name}: pid {} {config} steps={steps}", std::process::id());
     let _lease = gpu_lease::hold(Kind::Shared, &format!("scratchtape fused_models_check {name}"), Duration::from_secs(4 * 3600));
     let dev = DeviceParams::upload_models(&flat, k);
@@ -163,7 +174,7 @@ fn main() {
         } else {
             DeviceTape::new(&dev)
         };
-        let mut dt = dt.with_distill(alpha);
+        let mut dt = dt.with_distill(alpha * ((step + 1) as f32 / ramp as f32).min(1.0));
         let (_, _, loss) = model_forward(&mut dt, &cfg, &input, &target, k * batch);
         dt.backward(loss);
         if let Some(ones) = &ones {
@@ -173,8 +184,17 @@ fn main() {
             Some(v) => dev.momentum(lr, momentum, v),
             None => dev.sgd(lr),
         }
+        if sync_every > 0 && ((step + 1) % sync_every == 0 || step + 1 == steps) {
+            dev.average_models();
+        }
     }
     let training = start.elapsed() - evaluating;
+
+    // Train-probe: the first held-out-sized stretch of the training text, to
+    // see the train/held-out gap per arm.
+    let (probe_each, probe_ens) = device_ce(&dev, &cfg, &train[..held_out.len()]);
+    let probe_s: Vec<String> = probe_each.iter().map(|c| format!("{c:.4}")).collect();
+    println!("train-probe CE per model {} | mean {:.4} | ensemble {probe_ens:.4}", probe_s.join(" "), probe_each.iter().sum::<f64>() / k as f64);
 
     // Each model alone, from its fused parameters: the fused evaluation's
     // check.
