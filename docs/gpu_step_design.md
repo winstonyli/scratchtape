@@ -769,12 +769,38 @@ Next, in order:
    - α = 0.1 and averaging stack: 1.6149 with a smaller gap (0.63) than
      either alone (single seed). Best held-out CE of any run so far.
 
-   **Round 4 launched 2026-09-30 19:29** (`scripts/local_sgd_driver3.sh`,
+   **Round 4 (done 2026-09-30, 19:29–21:02)** (`scripts/local_sgd_driver3.sh`,
    bash pid 2033, log `runs/local_sgd_driver3.log`, 11 runs, ~100 min,
    CPU contended): H = 100 with α = 0.1 at seeds 11 and 21; DiLoCo outer
    sweep at H = 100 (lr/mu 1/0 as a check against the plain mean, 1/0.9,
    0.5/0.5, 0.3/0.9, 1/0.5); α = 0.05 and 0.2 with averaging; K = 2 and
-   K = 8 with averaging and α = 0.1. Logs `runs/local_k*`, `runs/diloco_k4_h100_lr*`.
+   K = 8 with averaging and α = 0.1. Logs `runs/local_k*`, `runs/diloco_k4_h100_lr*`. Held-out / train-probe
+   of the averaged model, one seed unless noted:
+
+   | arm (H = 100, shared init) | held-out | train-probe |
+   |---|---|---|
+   | K = 4, α = 0.1, seeds 1 / 11 / 21 | 1.6149 / 1.6105 / 1.6054 (mean **1.610**) | 0.989 / 0.985 / 0.991 |
+   | K = 4, α = 0.05 | 1.6058 | 0.943 |
+   | K = 4, α = 0.2 | 1.6372 | 1.070 |
+   | K = 2, α = 0.1 | 1.6250 | 1.026 |
+   | K = 8, α = 0.1 | 1.6126 | 0.964 |
+   | DiLoCo outer lr 1 / mu 0 (should equal plain mean 1.6512) | 1.6561 | 0.917 |
+   | DiLoCo 1 / 0.9 | 1.6949 | 0.964 |
+   | DiLoCo 0.5 / 0.5 | 1.6404 | 0.906 |
+   | DiLoCo 0.3 / 0.9 | 1.6608 | 0.875 |
+   | DiLoCo 1 / 0.5 | 1.6613 | 0.920 |
+
+   - Averaging + α = 0.1 holds over three seeds: 1.610 (1.605–1.615),
+     against 1.651 averaging alone and 1.755 for one model at batch 128.
+   - α is flat between 0.05 and 0.1 and worse by 0.2 (1.637).
+   - K saturates at 4: K = 2 1.625, K = 4 1.610, K = 8 1.613.
+     K = 8 costs 32.6 ms/step (4.1 per model), so K = 4 is the sweet spot.
+   - DiLoCo's outer step doesn't clearly beat the plain mean. The check
+     arm (lr 1, mu 0), which is the plain mean up to float rounding,
+     landed 0.005 away from it (1.6561 vs 1.6512): rounding differences
+     alone move a 32000-step run by that much, so differences under
+     ~0.01 here are noise. Best outer arm, lr 0.5 / mu 0.5, is 1.6404
+     (−0.011, one seed); higher momentum hurts (1/0.9 is 1.695).
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 

@@ -1043,7 +1043,11 @@ it means here.
   Three seeds each: averaged 1.651 (1.646–1.656) against batch-128 1.755
   (1.752–1.760). DiLoCo's outer Nesterov step (the paper's lr 0.7, mu
   0.9, untuned) did worse than the plain mean (1.662–1.672). Averaging
-  plus α = 0.1 reached 1.615, the best held-out CE here (one seed).
+  plus α = 0.1 reached 1.610 over three seeds (1.605–1.615), the best
+  held-out CE here. K = 2 gave 1.625 and K = 8 1.613, so K = 4 is enough;
+  α is flat from 0.05 to 0.1 and worse at 0.2 (1.637). A sweep of the
+  outer step found nothing reliably better than the plain mean (best
+  1.640 at lr 0.5 / mu 0.5, within ~2× the 0.005 rounding noise).
 
 **Sibling project: `humble-cortex`** (`../humble-cortex`, predictive
 coding in Rust). Its 95 checks overlap here in three places. First, every
