@@ -954,6 +954,11 @@ Next, in order:
      dropout.
    - No run was interrupted, so resume wasn't exercised in the driver
      (only in the kill test above).
+
+   **Round 9 launched 2026-10-01** (`scripts/local_sgd_driver8.sh`, log
+   `runs/local_sgd_driver8.log`, relaunch to resume; ~95 min): on
+   `all_four`, K = 1 and K = 4 averaged + α 0.1 at seeds 11 and 21 (1M
+   windows); K = 4 at 4M windows; the d = 256 model K = 4 at 2M windows.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
