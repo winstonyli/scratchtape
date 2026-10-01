@@ -1038,8 +1038,9 @@ it means here.
   Tried in its simplest form (plain mean of the K models every H steps,
   shared init, no outer optimizer): one model at held-out 1.651 for
   H = 100 and 1000, against 1.680–1.696 for single independently trained
-  models. It uses 4× the data per step, so the fair baseline (one model,
-  batch 128) is still to run.
+  models. A single model with the same 4× data per step (batch 128,
+  same steps) is worse, 1.753 held-out, so it isn't a large-batch effect.
+  One seed each.
 
 **Sibling project: `humble-cortex`** (`../humble-cortex`, predictive
 coding in Rust). Its 95 checks overlap here in three places. First, every

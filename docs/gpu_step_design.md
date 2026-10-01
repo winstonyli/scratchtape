@@ -732,7 +732,13 @@ Next, in order:
    independent). H = 100 and 1000 reach the same held-out CE.
    Caveats: this spends 4 models' compute (4 × batch 32 of data per step)
    on one model, so the fair comparison is a single model at batch 128
-   with the same steps, not run; and one seed.
+   with the same steps (32000, lr 0.48, warmup 25600 windows = 200
+   steps, `runs/gpu_b128_drop0.3_wd2e-4_s1.log`, 484 s, 15.1 ms/step).
+   Result: held-out **1.7531**, train-probe 0.78. So averaging is not a
+   large-batch effect: the batch-128 model fits train far better and
+   generalizes worse than the averaged one (1.651, 0.91), which sits
+   near the batch-32 single models (1.68–1.70) on fit but beats them
+   on held-out. One seed each.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
