@@ -615,6 +615,30 @@ only ~0.005–0.02, a plateau. The final value sits 0.01–0.02 above the
 run's best, the noise of a constant lr, so an lr decay at the end is the
 next lever.
 
+**Update (2026-09-30): the 7-gram is crossed, by averaging K models.**
+`fused_models_check` trains K = 4 models in the same launches from one
+init, averages their parameters every 100 steps (local SGD) and adds
+mutual distillation with α = 0.1:
+
+```
+fused_models_check <name> 4 32 0.48 1024000 <seed> 0.0002 0.3 6400 0.9 0.1 0 100 1
+```
+
+(args: name K batch lr windows seed wd dropout warmup momentum α
+α-ramp sync-steps shared-init). Final held-out CE on aesop, three seeds:
+**1.610** (1.605–1.615), against the 7-gram's 1.655 and 1.686 for one
+model of the earlier recipe. Without α: 1.651; a single model with the
+same data per step (batch 128): 1.755. Costs 3.4 ms/step per model, all
+four in 13.5 ms. Sync period H = 10 / 30 / 100 gave 1.634 / 1.621 / 1.610
+(seed 1 for the first two). Experiments and caveats in
+`docs/gpu_step_design.md`, "Horizontal fusion and codistillation".
+It does not transfer cleanly to a small corpus: on `sherlock_holmes`
+(54 KB train, 93 held-out windows) at 256k windows the recipe overfits
+(single model: best 1.85 mid-run, final 2.04). Final held-out there:
+single 2.038, averaged 2.065, averaged + α 1.883, ensemble of 4
+independent models 1.727, against a 7-gram-family 1.695. α helps, plain
+averaging doesn't, and the windows count wasn't tuned for that corpus.
+
 **GNN over an extracted graph** — `gnn_byte_classification.rs`: the
 original is-vowel probe, message-passing over `tiny_lm.rs`'s attention
 graph on the tiny 172-byte corpus. Inconclusive there by a stated data

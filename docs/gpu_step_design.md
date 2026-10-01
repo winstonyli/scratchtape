@@ -802,7 +802,7 @@ Next, in order:
      ~0.01 here are noise. Best outer arm, lr 0.5 / mu 0.5, is 1.6404
      (−0.011, one seed); higher momentum hurts (1/0.9 is 1.695).
 
-   **Round 5 launched 2026-09-30 21:06** (`scripts/local_sgd_driver4.sh`,
+   **Round 5 (done 2026-09-30, 21:06–21:28)** (`scripts/local_sgd_driver4.sh`,
    bash pid 8514, log `runs/local_sgd_driver4.log`, ~30 min):
    `fused_models_check` takes a corpus name (arg 17) and `ngram_baseline`
    takes one as its first argument. Sherlock Holmes (54 KB train, 5955
@@ -810,7 +810,29 @@ Next, in order:
    order 9, picked on held-out): K = 1, K = 4 independent, K = 4 averaged,
    K = 4 averaged + α = 0.1, all 256000 windows. Aesop: α = 0.1 averaging
    at H = 10 and 30. Not done: a larger model, whose sizes are constants
-   in the example and in kernel size tables.
+  in the example and in kernel size tables.
+
+   | arm | held-out final | train-probe | notes |
+   |---|---|---|---|
+   | sherlock, K = 1 | 2.038 | 0.836 | best mid-run 1.848 |
+   | sherlock, K = 4 independent | mean 2.019, ensemble **1.727** | 0.842 | |
+   | sherlock, K = 4 averaged H = 100 | 2.065 | 0.614 | best mid-run 1.805 |
+   | sherlock, K = 4 averaged + α = 0.1 | **1.883** | 0.677 | best mid-run 1.767 |
+   | aesop, α = 0.1, H = 10 | 1.634 | 0.911 | |
+   | aesop, α = 0.1, H = 30 | 1.621 | 0.950 | |
+   | (H = 100, seeds 1/11/21 from round 4) | 1.610 | 0.988 | |
+
+   - Sherlock: every arm overfits at 256k windows (mid-run bests of
+     1.77–1.85 vs finals of 1.88–2.07; "best" is picked on held-out, so
+     optimistic). Only the 4-seed ensemble (1.727) gets near the
+     7-gram-family 1.695. α helps (−0.18 vs averaging alone, −0.15 vs
+     one model); plain averaging does not at this length. The run length
+     and dropout were not tuned for a corpus 4× smaller, and 93 windows
+     is a noisy test set, so read this as "does not transfer untuned",
+     not as a verdict.
+   - Aesop: longer H is slightly better (10 → 100: 1.634 → 1.610), so
+     H = 100 stays. Per-model data is already different in every arm
+     (each model draws its own batches).
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
