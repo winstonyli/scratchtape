@@ -834,7 +834,7 @@ Next, in order:
      H = 100 stays. Per-model data is already different in every arm
      (each model draws its own batches).
 
-   **Round 6 launched 2026-09-30 21:36** (`scripts/local_sgd_driver5.sh`,
+   **Round 6 (done 2026-09-30, 21:36–22:49)** (`scripts/local_sgd_driver5.sh`,
    bash pid 10199, log `runs/local_sgd_driver5.log`, ~80 min):
    `fused_models_check` gained `lr_decay_frac` (linear to 0 over the last
    fraction of steps) and model-size args (`d_model heads d_ff blocks`,
@@ -845,7 +845,43 @@ Next, in order:
    parameters per model): lr 0.48 diverges to NaN by step 250 at lr 0.3
    too, while 0.05 and 0.15 train (smoke, 400 steps: 2.41 / 2.53), so the
    runs use lr 0.05 and 0.1; K = 1 and K = 4 averaged + α = 0.1 at each
-   (`runs/big_*`).
+   (`runs/big_*`). Final held-out (train-probe); "best" is the lowest
+   mid-run value of the first model, picked on held-out, so optimistic:
+
+   | arm | final | best | train-probe |
+   |---|---|---|---|
+   | sherlock 64k, K = 1 | 1.877 | 1.877 | 1.544 |
+   | sherlock 64k, K = 4 independent (mean / ensemble) | 1.860 / 1.743 | | 1.555 |
+   | sherlock 64k, averaged | 1.805 | 1.805 | 1.430 |
+   | sherlock 64k, averaged + α 0.1 | **1.798** | 1.798 | 1.482 |
+   | sherlock 128k, K = 1 | 1.854 | 1.848 | 1.181 |
+   | sherlock 128k, K = 4 independent (mean / ensemble) | 1.864 / **1.683** | 1.822 | 1.185 |
+   | sherlock 128k, averaged | 1.858 | 1.805 | 0.994 |
+   | sherlock 128k, averaged + α 0.1 | 1.785 | 1.767 | 1.069 |
+   | aesop, averaged + α 0.1, lr decay last 20% | 1.6226 | 1.611 | 0.859 |
+   | aesop, averaged + α 0.1, lr decay last 50% | 1.6320 | 1.611 | 0.846 |
+   | big (d 256), K = 1, lr 0.05 | 1.8115 | 1.731 | 0.755 |
+   | big, K = 1, lr 0.1 | 1.9897 | 1.731 | 0.604 |
+   | big, K = 4 averaged + α 0.1, lr 0.05 | **1.6753** | 1.648 | 0.792 |
+   | big, K = 4 averaged + α 0.1, lr 0.1 | 1.7594 | 1.648 | 0.550 |
+
+   - Sherlock at 64k windows: averaging transfers (1.805 vs 1.877 for one
+     model, −0.07; α adds −0.007). At 128k it overfits and only α keeps
+     it ahead (1.785 vs 1.854 / 1.858). The 7-gram-family 1.695 is beaten
+     only by the independent ensemble at 128k (1.683), not by any
+     single averaged model. 93 held-out windows; one seed.
+   - Lr decay does not help: 1.623 / 1.632 against 1.610 without. The
+     decayed runs fit train better (0.85–0.86 vs 0.99) and generalize
+     slightly worse, so the final-vs-best gap here is overfitting, not lr
+     noise. (The README's "lr decay is the next lever" is answered: no.)
+   - Larger model: worse than the small one at this budget. One big
+     model overfits (1.81, train 0.76) and averaging recovers 0.14 nats
+     (1.675), still above the small model's 1.610. Lr 0.1 overfits more
+     than 0.05 (final 1.76 vs 1.68 averaged) though both reach 1.648 mid-run.
+     So averaging + α generalizes across model size in direction, but
+     1M windows and dropout 0.3 are too much for 4× the parameters on
+     214 KB of text; a shorter run or stronger regularization is
+     untested. Costs: big K = 4 is 34–35 ms/step (K = 1: 10.5).
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
