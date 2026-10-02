@@ -67,8 +67,8 @@ fn is_ew(op: &str) -> bool {
 ///   accumulating in place (+=), so extra-consumer adds disappear;
 ///   broadcast reduces stay; matmuls keep 2.
 /// - update: one launch per parameter leaf, or one multi-tensor launch.
-/// Gradients sent into leaves are counted separately, because constant
-/// leaves (one-hot targets, eps) need none on a real device tape.
+///   Gradients sent into leaves are counted separately, because constant
+///   leaves (one-hot targets, eps) need none on a real device tape.
 fn census(tape: &Tape) {
     let ops = tape.ops();
     let mut consumers = vec![0usize; ops.len()];

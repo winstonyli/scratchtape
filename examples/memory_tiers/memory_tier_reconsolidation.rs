@@ -169,10 +169,10 @@ fn main() {
     println!(
         "  phase 2 done ({:.1}s elapsed) - {} A-replay steps ({} early, {} late), {} B-fresh steps",
         start_time.elapsed().as_secs_f32(),
-        a_replay_early.n(&segments[0]) + a_replay_late.n(&segments[0]),
-        a_replay_early.n(&segments[0]),
-        a_replay_late.n(&segments[0]),
-        b_fresh_early.n(&segments[0]) + b_fresh_late.n(&segments[0]),
+        a_replay_early.n(segments[0]) + a_replay_late.n(segments[0]),
+        a_replay_early.n(segments[0]),
+        a_replay_late.n(segments[0]),
+        b_fresh_early.n(segments[0]) + b_fresh_late.n(segments[0]),
     );
 
     println!("\nper-segment mean squared gradient - phase1-A-baseline (last {baseline_window} steps) | A-replay early | A-replay late | B-fresh early | B-fresh late:");

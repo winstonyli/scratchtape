@@ -22,8 +22,8 @@ fn randn_like(rng: &mut Rng, shape: &[usize]) -> NdArray {
 /// OpenAI-ES (2017): estimate the loss gradient via population sampling
 /// instead of backprop. grad ~= (1/(2*N*sigma)) * sum((F(t+se)-F(t-se)) * e)
 /// - a Monte Carlo score-function estimator, not a true gradient, but used
-/// the same way in an update step. Antithetic pairs (+e/-e per sample)
-/// cancel odd-moment noise bias for free - no extra noise draws needed.
+///   the same way in an update step. Antithetic pairs (+e/-e per sample)
+///   cancel odd-moment noise bias for free - no extra noise draws needed.
 fn main() {
     let x_data = NdArray::new(vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], vec![4, 2]);
     let y_data = NdArray::new(vec![0.0, 1.0, 1.0, 0.0], vec![4, 1]);

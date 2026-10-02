@@ -1412,7 +1412,7 @@ fn main() {
     let combined_adj = build_adjacency(n_nodes, related);
 
     println!("\nknowledge-graph multi-hop query (bytes reachable within N hops, self excluded):");
-    for &target in &[b'a', b'\n', b'N', b'e'] {
+    for &target in b"a\nNe" {
         let Some(idx) = filtered_bytes.iter().position(|&b| b as u8 == target) else {
             continue;
         };

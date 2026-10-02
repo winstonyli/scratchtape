@@ -204,7 +204,7 @@ pub fn eval_loss(token_emb: &Embedding, pos_emb: &Embedding, blocks: &[Transform
     let mut total = 0.0f32;
     let mut count = 0usize;
     let mut start = 0;
-    while start + seq_len + 1 <= corpus.len() {
+    while start + seq_len < corpus.len() {
         let input = &corpus[start..start + seq_len];
         let target = &corpus[start + 1..start + seq_len + 1];
         let mut tape = Tape::new();

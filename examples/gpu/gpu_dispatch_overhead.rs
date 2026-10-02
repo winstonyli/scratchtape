@@ -124,7 +124,7 @@ fn main() {
         queue.submit(Some(enc.finish()));
         staging.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        let got: Vec<f32> = staging.slice(..).get_mapped_range().unwrap().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let got: Vec<f32> = staging.slice(..).get_mapped_range().unwrap().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
         let want = a.matmul(&b);
         let err = got.iter().zip(&want.data).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
         assert!(err < 1e-3, "queued dispatch disagrees with CPU: max err {err}");
