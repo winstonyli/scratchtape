@@ -32,6 +32,7 @@
 // (Nesterov momentum `outer_mu` on the pseudo-gradient, DeviceParams::outer_step).
 //
 //   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups] [checkpoint_secs]
+//   (any of them also as key=value, e.g. `... 4 32 0.05 windows=4096000 dropout=0.1 d_model=384`)
 //
 // Every 8000 windows (with averaging, only at sync points) it prints each
 // model's held-out CE over every non-overlapping 64-byte window of the
@@ -100,37 +101,121 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
     (each.iter().map(|s| s / n).collect(), ens / n)
 }
 
+/// The command-line parameters, in positional order, with defaults ("" = required).
+const PARAMS: [(&str, &str); 24] = [
+    ("name", ""),
+    ("k", ""),
+    ("batch", ""),
+    ("lr", ""),
+    ("windows", "64000"),
+    ("seed", "1"),
+    ("weight_decay", "0"),
+    ("dropout", "0"),
+    ("warmup_windows", "0"),
+    ("momentum", "0"),
+    ("alpha", "0"),
+    ("alpha_ramp_windows", "0"),
+    ("sync_every_steps", "0"),
+    ("shared_init", "0"),
+    ("outer_lr", "0"),
+    ("outer_mu", "0.9"),
+    ("corpus", "aesops_fables"),
+    ("lr_decay_frac", "0"),
+    ("d_model", "128"),
+    ("heads", "8"),
+    ("d_ff", "256"),
+    ("blocks", "4"),
+    ("groups", "1"),
+    ("checkpoint_secs", "600"),
+];
+
+/// Arguments after the program name: bare values fill PARAMS in order, `key=value` sets one by name
+/// (the two mix freely). Each parameter is set at most once; unknown keys and missing required ones panic.
+struct Params(std::collections::HashMap<&'static str, String>);
+
+impl Params {
+    fn parse(args: &[String]) -> Params {
+        let usage = || {
+            format!(
+                "usage: fused_models_check {}  (bare values in this order, or key=value)",
+                PARAMS.iter().map(|(n, d)| if d.is_empty() { format!("<{n}>") } else { format!("[{n}]") }).collect::<Vec<_>>().join(" ")
+            )
+        };
+        let mut set: std::collections::HashMap<&'static str, String> = Default::default();
+        let mut next = 0;
+        for arg in args {
+            let (name, value) = match arg.split_once('=') {
+                Some((key, value)) => (
+                    PARAMS
+                        .iter()
+                        .find(|(n, _)| *n == key)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "unknown parameter {key}
+{}",
+                                usage()
+                            )
+                        })
+                        .0,
+                    value,
+                ),
+                None => {
+                    let slot = PARAMS.get(next).unwrap_or_else(|| {
+                        panic!(
+                            "too many arguments
+{}",
+                            usage()
+                        )
+                    });
+                    next += 1;
+                    (slot.0, arg.as_str())
+                }
+            };
+            assert!(set.insert(name, value.to_string()).is_none(), "{name} given twice");
+        }
+        for (name, default) in PARAMS {
+            if !set.contains_key(name) {
+                assert!(
+                    !default.is_empty(),
+                    "missing {name}
+{}",
+                    usage()
+                );
+                set.insert(name, default.to_string());
+            }
+        }
+        Params(set)
+    }
+
+    fn get<T: std::str::FromStr>(&self, name: &str) -> T {
+        self.0[name].parse().unwrap_or_else(|_| panic!("bad value {:?} for {name}", self.0[name]))
+    }
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    assert!(
-        args.len() >= 5,
-        "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups] [checkpoint_secs]"
-    );
-    let name = &args[1];
-    let k: usize = args[2].parse().unwrap();
-    let batch: usize = args[3].parse().unwrap();
-    let lr: f32 = args[4].parse().unwrap();
-    let arg = |i: usize, default: &str| args.get(i).cloned().unwrap_or(default.into());
-    let windows: usize = arg(5, "64000").parse().unwrap();
-    let seed: u64 = arg(6, "1").parse().unwrap();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let p = Params::parse(&args);
+    let name: String = p.get("name");
+    let (k, batch, lr): (usize, usize, f32) = (p.get("k"), p.get("batch"), p.get("lr"));
+    let windows: usize = p.get("windows");
+    let seed: u64 = p.get("seed");
     assert!(seed != 0, "seed 0 is xorshift's fixed point");
-    let weight_decay: f32 = arg(7, "0").parse().unwrap();
-    let dropout: f32 = arg(8, "0").parse().unwrap();
-    let warmup_windows: usize = arg(9, "0").parse().unwrap();
-    let momentum: f32 = arg(10, "0").parse().unwrap();
-    let alpha: f32 = arg(11, "0").parse().unwrap();
+    let weight_decay: f32 = p.get("weight_decay");
+    let dropout: f32 = p.get("dropout");
+    let warmup_windows: usize = p.get("warmup_windows");
+    let momentum: f32 = p.get("momentum");
+    let alpha: f32 = p.get("alpha");
     // alpha rises linearly from 0 over this many windows (0: constant)
-    let ramp = (arg(12, "0").parse::<usize>().unwrap() / batch).max(1);
-    let sync_every: usize = arg(13, "0").parse().unwrap();
-    let shared_init = arg(14, "0") == "1";
+    let ramp = (p.get::<usize>("alpha_ramp_windows") / batch).max(1);
+    let sync_every: usize = p.get("sync_every_steps");
+    let shared_init = p.get::<String>("shared_init") == "1";
     assert!(sync_every == 0 || shared_init, "averaging models needs shared_init = 1");
-    let outer_lr: f32 = arg(15, "0").parse().unwrap();
-    let outer_mu: f32 = arg(16, "0.9").parse().unwrap();
-    let corpus_name = arg(17, "aesops_fables");
-    let lr_decay_frac: f32 = arg(18, "0").parse().unwrap();
-    let size = |i: usize, default: &str| -> usize { arg(i, default).parse().unwrap() };
-    let cfg = Config { vocab: VOCAB, d: size(19, "128"), heads: size(20, "8"), d_ff: size(21, "256"), t: SEQ_LEN, n_blocks: size(22, "4"), softmax1: false };
-    let groups = size(23, "1");
+    let outer_lr: f32 = p.get("outer_lr");
+    let outer_mu: f32 = p.get("outer_mu");
+    let corpus_name: String = p.get("corpus");
+    let lr_decay_frac: f32 = p.get("lr_decay_frac");
+    let cfg = Config { vocab: VOCAB, d: p.get("d_model"), heads: p.get("heads"), d_ff: p.get("d_ff"), t: SEQ_LEN, n_blocks: p.get("blocks"), softmax1: false };
+    let groups: usize = p.get("groups");
     assert!(k % groups == 0 && (groups == 1 || (shared_init && sync_every > 0 && outer_lr == 0.0)), "groups needs K % groups == 0, shared_init, sync_every and no outer step");
     let warmup = (warmup_windows / batch).max(1);
     let steps = windows / batch;
@@ -159,7 +244,7 @@ fn main() {
     // Resume file: header "<config> | <step> <rng state per model>", then
     // the parameters, then the velocity (momentum), then the outer anchor
     // and velocity (outer step), one line each.
-    let checkpoint_secs: u64 = arg(24, "600").parse().unwrap();
+    let checkpoint_secs: u64 = p.get("checkpoint_secs");
     let resume_path = format!("runs/{name}.resume");
     let (mut flat, mut first) = (flat, 0);
     let mut saved: std::vec::IntoIter<Vec<f32>> = vec![].into_iter();
