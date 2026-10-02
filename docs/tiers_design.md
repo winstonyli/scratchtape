@@ -1,7 +1,7 @@
 # Tiered AI: first cross-tier experiments
 
 Direction and tier map: README, "Direction: tiered AI". Related work: README, "Tiered and neuro-symbolic
-architectures". Status: step 0 and Experiment A built and measured (2026-10-02); Experiment B measured on a tune/test split.
+architectures". Status: step 0 and Experiment A built and measured (2026-10-02); Experiments A and B measured; Experiment B on the full held-out split.
 
 ## What exists and what does not
 
@@ -96,6 +96,34 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   tune -0.0215, test **-0.0212** (lexicon alone -0.0076 / -0.0053, knn alone at those settings -0.0160 / -0.0169):
   the tiers largely add. Cost: ~25 min per 31488-position subsample at 4 threads on a shared CPU (brute-force
   search, 1.92M x 256 per query), so a full-held-out run is out of reach without an index or the GPU.
+
+- **Experiment B on the GPU, full datastore and full held-out split.** The brute-force search moved to the
+  device (`src/gpu_step/knn.rs`: keys in 16384-key tiles, one matmul per tile giving transposed distances, a
+  top-k kernel keeping the `KMAX` = 128 nearest per query; unit test against a CPU brute force). The same 1.92M-key
+  query set that took ~25 min on the CPU takes 35 s (reproduces -0.0168 exactly). With all 4,534,720 train positions
+  as keys, tuned on offset 0 of stride 16 (`knn:128:0.4:25` best: -0.0265 vs -0.0168 at 1.92M keys/k=64), the
+  **full held-out split** (7872 windows, 503808 positions; `scripts/tier_full.sh`, `runs/tier_full.log`;
+  Gate 0 passed at 1.2408):
+
+  | Tier | CE | vs model |
+  |---|---|---|
+  | model alone | 1.2408 | |
+  | lexicon:0.3 | 1.2347 | -0.0061 |
+  | knn:32:0.4:25 | 1.2204 | -0.0205 |
+  | knn:64:0.4:25 | 1.2151 | -0.0257 |
+  | knn:128:0.3:25 | 1.2143 | -0.0265 |
+  | knn:128:0.4:25 | 1.2126 | -0.0283 |
+  | lexicon:0.3 + knn:128:0.3:25 | 1.2110 | -0.0298 |
+  | lexicon:0.3 + knn:128:0.4:25 | **1.2099** | **-0.0309** |
+
+  k is still improving at the cap (32 -> 64 -> 128: -0.0205, -0.0257, -0.0283), so the optimum is not bracketed.
+  Together the two CPU/RAM tiers move the model from 0.116 under the 7-gram to 0.147 under it.
+- **Which hidden state is the key (`runs/tier_tap*.log`; stride 16, offset 0, k = 128, temp re-tuned per tap
+  because distance scales differ):** block 1 output -0.0117, block 2 -0.0241, block 3 (final residual stream)
+  -0.0265. The gain grows with depth, so the memory is useful because the late representation is close to the
+  prediction, not only because nearby text is similar. Not separated: how much of the gain is the same
+  train-text continuation the model already fit (train-probe 1.1172 vs held-out 1.2408), which a datastore
+  built from data the model never trained on would answer.
 
 ## Order
 

@@ -3,7 +3,7 @@
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
 //             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [store=<train windows in the memory>]
-//             [threads=<search threads>] [tier=<spec> ...]
+//             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
 // spec is scored on its own, next to the plain model. Parts (add new ones by implementing `Tier` and a line in
@@ -24,6 +24,7 @@
 // Gate 0: the CE computed here from the logits must match the device's own row losses (1e-4) and, with
 // `expect=`, the number recorded for the checkpoint (to its 4 printed digits).
 use scratchtape::gpu_lease::{self, Kind};
+use scratchtape::gpu_step::knn::{KMAX, KnnStore};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, read};
 use std::cell::RefCell;
@@ -39,8 +40,6 @@ const SEQ_LEN: usize = 64;
 const VOCAB: usize = 256;
 /// Windows per forward launch.
 const CHUNK: usize = 32;
-/// Neighbours kept per query by the memory tier.
-const KMAX: usize = 64;
 
 /// What a tier sees at one position: the row within the chunk last passed to `prepare`, the window's input bytes
 /// up to and including this one, the byte it predicts, and the tapped hidden state (empty unless a tier asked).
@@ -160,64 +159,19 @@ impl Tier for Lexicon {
     }
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let mut s = [0f32; 8];
-    for (ca, cb) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
-        for j in 0..8 {
-            s[j] += ca[j] * cb[j];
-        }
-    }
-    s.iter().sum()
-}
-
-/// The datastore: `tap` hidden states of train positions and the bytes that followed them. Shared by all knn specs,
-/// which reuse one neighbour search per chunk.
+/// The datastore (`gpu_step::knn`): `tap` hidden states of train positions and the bytes that followed them.
+/// Shared by all knn specs, which reuse one neighbour search per chunk.
 struct Store {
-    keys: Vec<f32>,
-    norms: Vec<f32>,
-    vals: Vec<u8>,
-    d: usize,
-    threads: usize,
+    gpu: KnnStore,
     /// (chunk searched, per row the KMAX nearest (squared distance, value), ascending)
     found: RefCell<(Option<usize>, Vec<(f32, u8)>)>,
 }
 
 impl Store {
     fn prepare(&self, chunk: usize, hidden: &[f32], rows: usize) {
-        if self.found.borrow().0 == Some(chunk) {
-            return;
+        if self.found.borrow().0 != Some(chunk) {
+            *self.found.borrow_mut() = (Some(chunk), self.gpu.search(hidden, rows));
         }
-        let mut out = vec![(f32::INFINITY, 0u8); rows * KMAX];
-        let per = rows.div_ceil(self.threads);
-        let (keys, norms, vals, d) = (&self.keys, &self.norms, &self.vals, self.d);
-        std::thread::scope(|s| {
-            for (ti, out) in out.chunks_mut(per * KMAX).enumerate() {
-                s.spawn(move || {
-                    for (i, best) in out.chunks_mut(KMAX).enumerate() {
-                        let r = ti * per + i;
-                        let q = &hidden[r * d..(r + 1) * d];
-                        let qn = dot(q, q);
-                        let mut worst = f32::INFINITY;
-                        for (j, key) in keys.chunks_exact(d).enumerate() {
-                            let dist = norms[j] - 2.0 * dot(q, key);
-                            if dist < worst {
-                                let mut p = KMAX - 1;
-                                while p > 0 && best[p - 1].0 > dist {
-                                    best[p] = best[p - 1];
-                                    p -= 1;
-                                }
-                                best[p] = (dist, vals[j]);
-                                worst = best[KMAX - 1].0;
-                            }
-                        }
-                        for b in best.iter_mut() {
-                            b.0 = (b.0 + qn).max(0.0);
-                        }
-                    }
-                });
-            }
-        });
-        *self.found.borrow_mut() = (Some(chunk), out);
     }
 }
 
@@ -257,7 +211,7 @@ impl Tier for Knn {
     }
     fn report(&self) -> String {
         let n = self.positions.max(1) as f64;
-        format!("knn ({} keys): mean squared distance to nearest {:.1}, to k-th {:.1}", self.store.vals.len(), self.nearest / n, self.kth / n)
+        format!("knn ({} keys): mean squared distance to nearest {:.1}, to k-th {:.1}", self.store.gpu.len(), self.nearest / n, self.kth / n)
     }
 }
 
@@ -319,7 +273,7 @@ fn main() {
         let (k, v) = a.split_once('=').unwrap_or_else(|| panic!("expected key=value, got {a}"));
         match k {
             "tier" => specs.push(v.to_string()),
-            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "threads" => {
+            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -359,15 +313,14 @@ fn main() {
         let want = size("store", "15000");
         let total = (train.len() - 1) / SEQ_LEN;
         let starts: Vec<usize> = (0..want.min(total)).map(|i| i * total / want.min(total) * SEQ_LEN).collect();
-        let (mut keys, mut vals) = (vec![], vec![]);
+        let mut gpu = KnnStore::new(cfg.d, 16384);
         for chunk in starts.chunks(CHUNK) {
             let f = forward(&dev, &cfg, &train, chunk, tap, true);
-            keys.extend(f.hidden);
-            vals.extend(f.targets.iter().map(|&t| t as u8));
+            gpu.add(&f.hidden, &f.targets.iter().map(|&t| t as u8).collect::<Vec<_>>());
         }
-        let norms = keys.chunks_exact(cfg.d).map(|k| dot(k, k)).collect();
-        println!("memory: {} keys of {} floats from {} train windows (tap = block {tap})", vals.len(), cfg.d, starts.len());
-        Some(Rc::new(Store { keys, norms, vals, d: cfg.d, threads: size("threads", "6"), found: RefCell::new((None, vec![])) }))
+        gpu.finish();
+        println!("memory: {} keys of {} floats from {} train windows (tap = block {tap}), searched on the GPU", gpu.len(), cfg.d, starts.len());
+        Some(Rc::new(Store { gpu, found: RefCell::new((None, vec![])) }))
     } else {
         None
     };

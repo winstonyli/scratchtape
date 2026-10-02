@@ -11,6 +11,7 @@ use cubecl_runtime::runtime::Runtime;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub mod knn;
 pub mod matmul;
 mod profile;
 pub mod rows;
