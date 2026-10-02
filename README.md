@@ -1117,7 +1117,9 @@ because raw forgetting deltas hid a floor effect.
   averaged recipe above is a small-data, overfitting-regime result.
   Big K = 1 keeps improving to 1.2622 at 8M windows (0.095 under the
   7-gram), with gains shrinking to ~0.005 per extra 1M.
-  See docs/gpu_step_design.md, rounds 11–14.
+  Lowering dropout from 0.3 to 0.1 (carried over from the small-data
+  rounds) gives 1.2578 at 4M windows, better than 0.3 at 8M.
+  See docs/gpu_step_design.md, rounds 11–15.
 
 - **Replay + Fisher consolidation together** — humble-cortex found them
   synergistic. Here each was only tried alone, and Fisher's new-task cost

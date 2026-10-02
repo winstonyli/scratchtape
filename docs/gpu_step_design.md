@@ -1090,7 +1090,28 @@ Next, in order:
    too strong). `scripts/local_sgd_driver13.sh`, run
    `nov_big_k1_d0.1_4m`, pid 26248 (Normal), started 17:12, log
    `runs/nov_big_k1_d0.1_4m.log` and `runs/local_sgd_driver13.log`,
-   ~35 min. Resumable. Not yet run: a larger model at K = 1.
+   ~35 min. Resumable.
+   **Result (finished 17:44): 1.2578 at 4M windows**, 0.035 better than
+   dropout 0.3 (1.2929) and better than dropout 0.3 at 8M (1.2622):
+
+   | windows | dropout 0.1 | dropout 0.3 |
+   |---|---|---|
+   | 1M | 1.3349 | 1.4246 |
+   | 2M | 1.2870 | 1.3404 |
+   | 3M | 1.2684 | 1.3085 |
+   | 4M | 1.2578 | 1.2929 |
+
+   Train-probe 1.1526 (gap 0.105 vs 0.083 for dropout 0.3); last-1M gain
+   −0.011, so overfitting is starting. Dropout 0.3, carried over from the
+   small-data rounds, was too strong for novels6; the optimum may be
+   lower still.
+
+   **Round 15 (2026-10-01): dropout 0.0 and 0.05**, same setup.
+   `scripts/local_sgd_driver14.sh`, runs `nov_big_k1_d0_4m` (pid 22772,
+   started 18:14) then `nov_big_k1_d0.05_4m`, Normal priority, logs
+   `runs/<name>.log` and `runs/local_sgd_driver14.log`, ~35 min each
+   (~70 min total). Resumable. Not yet run: a larger model at K = 1
+   (d = 384), to follow the sweep.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
