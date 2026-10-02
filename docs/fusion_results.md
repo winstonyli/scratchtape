@@ -592,5 +592,13 @@ Next, in order:
    −0.004, −0.0045, −0.002): nearly flat, with the gap widening. d = 384
    at 4M (1.2457) is within 0.005 of this at half the windows; d = 384 at
    8M is not run.
+
+   **Round 18 (2026-10-02): d = 384 with dropout 0.15** (control: dropout
+   0.1 = 1.2457; the wider model's gap is 0.150, so it may want more).
+   `scripts/local_sgd_driver17.sh`, run `nov_d384_k1_d0.15_4m`, pid 36384
+   (Normal, RX 9060 XT Vulkan), started 09:10, log
+   `runs/nov_d384_k1_d0.15_4m.log` and `runs/local_sgd_driver17.log`,
+   ~19–21 ms/step × 128000 ≈ 45 min (CPU load ~40% from other sessions at
+   launch). Resumable.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
