@@ -581,5 +581,12 @@ Next, in order:
    ~10 ms/step × 256000 steps ≈ 45–70 min. CPU load 54% at launch from
    other sessions (affects ms/step only); Defender real-time off.
    Resumable.
+   **Result (finished 01:03, 72 min): 1.2408 at 8M windows**, 0.116 under
+   the 7-gram and 0.021 better than dropout 0.3 at 8M (1.2622); train-probe
+   1.1172 (gap 0.124, up from 0.105 at 4M). Held-out CE by 1M windows:
+   4M 1.2578, 5M 1.2518, 6M 1.2475, 7M 1.2430, 8M 1.2408 (gains −0.006,
+   −0.004, −0.0045, −0.002): nearly flat, with the gap widening. d = 384
+   at 4M (1.2457) is within 0.005 of this at half the windows; d = 384 at
+   8M is not run.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
