@@ -16,16 +16,24 @@ notebook; this README is the map, not a replacement for it.
 
 ## Direction: tiered AI
 
-The project's driving goal is a tiered memory architecture for pushing
-model capability: tier 1 the live weights (kept device-resident, which is
-why `gpu_step/` exists), tier 2 a bounded replay buffer, tier 3 disk
-checkpoints of weights plus buffer (resumable across processes), and a
-slow consolidation tier (Fisher/EWC tried; CLS-ER-style fast/slow copies
-untried). Experiments are chosen by what they say about the tiers: the
-averaged-weights recipe is a candidate slow tier, and the `novels6`
-corpus (six novels as phases) is the real-scale test of the memory-tier
-results, which so far are toy-scale or Aesop-quarters (see "Continual
-learning / memory tiers" below and `examples/memory_tiers/`).
+The overarching idea (the user's, 2026-10-02): each tier of the system
+should roughly correspond to a hardware level and/or a neuroscience
+role.
+
+| Tier | Hardware | Role (as stated) |
+|---|---|---|
+| Gradient-trained models | GPU | the learned, statistical tier (the transformer LM; `gpu_step/`) |
+| Knowledge representation and reasoning (KR&R) | CPU | symbolic structure and rule-based reasoning (the KR&R line in `tiny_lm_corpus.rs`, `differentiable_reasoning/`) |
+| Working memory | registers / cache | what is held and manipulated right now |
+| Long-term memory and notes | RAM / disk | what is stored and retrieved later |
+
+The mapping is a design principle, not a finished design: how the tiers
+talk to each other, and which neuroscience correspondences to commit to,
+are open. Existing work by tier: the transformer and its GPU-resident
+step (tier 1); the symbolic-structure and reasoning examples (tier 2);
+replay buffers, checkpoints and consolidation in `examples/memory_tiers/`
+(the long-term side, so far at toy or Aesop-quarters scale). Experiments
+are chosen by what they say about the tiers and how they connect.
 
 ## Quick start
 
