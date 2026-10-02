@@ -600,5 +600,11 @@ Next, in order:
    `runs/nov_d384_k1_d0.15_4m.log` and `runs/local_sgd_driver17.log`,
    ~19–21 ms/step × 128000 ≈ 45 min (CPU load ~40% from other sessions at
    launch). Resumable.
+   **Result:** held-out **1.2413** (d = 384, dropout 0.15, 4M windows) vs
+   1.2457 at dropout 0.1; train-probe 1.1163 vs 1.0961 (gap 0.125 vs
+   0.150). So the wider model does want more dropout, and it now matches
+   the d = 256 dropout-0.1 run at 8M windows (1.2408) with half the
+   windows. 3597 s, ~18.5 ms/step (the CPU was shared). Untried: d = 384
+   at dropout 0.15 for 8M windows, and dropout 0.2.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).

@@ -1199,10 +1199,10 @@ because raw forgetting deltas hid a floor effect.
   A dropout sweep at 4M windows puts the optimum at 0.1 (0.05 is within
   noise, 0.0 overfits).
   Widening to d = 384 gives 1.2457 at 4M windows (0.012 better, ~1.9×
-  the step cost).
+  the step cost); with dropout 0.15 it reaches 1.2413 (round 18).
   At dropout 0.1 the big model reaches 1.2408 at 8M windows (0.116 under
   the 7-gram), nearly flat past 6M.
-  See docs/fusion_results.md, rounds 11–17.
+  See docs/fusion_results.md, rounds 11–18.
 
 - **Replay + Fisher consolidation together** — humble-cortex found them
   synergistic. Here each was only tried alone, and Fisher's new-task cost
