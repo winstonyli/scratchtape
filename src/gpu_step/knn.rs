@@ -72,9 +72,21 @@ impl KnnStore {
 
     /// For each of `rows` queries (row-major [rows, d]) the `KMAX` nearest keys, ascending: (squared L2 distance, value).
     pub fn search(&self, queries: &[f32], rows: usize) -> Vec<(f32, u8)> {
+        self.search_masked(queries, rows, None)
+    }
+
+    /// `search`, but query r may only match keys j (in the order they were added) with j < `always` or
+    /// lo_r <= j < hi_r, for `mask = Some((ranges, always))`, ranges[r] = (lo_r, hi_r). With fewer than `KMAX` allowed
+    /// keys the list ends in (infinity, 0) entries. This is how a memory is made causal: a query sees only keys older than it.
+    pub fn search_masked(&self, queries: &[f32], rows: usize, mask: Option<(&[(u32, u32)], u32)>) -> Vec<(f32, u8)> {
         assert!(self.pending_vals.is_empty(), "call finish() before search");
         assert!(self.len() >= KMAX, "need at least {KMAX} keys");
         assert_eq!(queries.len(), rows * self.d);
+        let (ranges, always) = match mask {
+            Some((ranges, always)) => (ranges.to_vec(), always),
+            None => (vec![(0, u32::MAX); rows], 0),
+        };
+        assert_eq!(ranges.len(), rows);
         let mut out = Vec::with_capacity(rows * KMAX);
         for q0 in (0..rows).step_by(QBLOCK) {
             let q = QBLOCK.min(rows - q0);
@@ -83,6 +95,9 @@ impl KnnStore {
             let best_d = upload_f32(&vec![f32::INFINITY; q * KMAX]);
             let best_v = upload_f32(&vec![0.0f32; q * KMAX]);
             let dist = client().empty(self.tile * q * 4);
+            let lo = client().create_from_slice(u32::as_bytes(&ranges[q0..q0 + q].iter().map(|r| r.0).collect::<Vec<_>>()));
+            let hi = client().create_from_slice(u32::as_bytes(&ranges[q0..q0 + q].iter().map(|r| r.1).collect::<Vec<_>>()));
+            let mut base = 0usize;
             for t in &self.tiles {
                 let (a, b, o) = (MatRef::new(&t.keys), MatRef { trans: true, ..MatRef::new(&qh) }, MatRef::new(&dist));
                 matmul(a, b, o, 1, t.len, self.d, q, Epilogue::default());
@@ -90,8 +105,9 @@ impl KnnStore {
                     super::count_launch();
                     let n = SLICE.min(t.len - j0);
                     #[rustfmt::skip]
-                    k_topk::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * q), buf(&t.norms, t.len), buf(&t.vals, t.len), buf(&best_d, q * KMAX), buf(&best_v, q * KMAX), q as u32, j0 as u32, n as u32);
+                    k_topk::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * q), buf(&t.norms, t.len), buf(&t.vals, t.len), buf(&best_d, q * KMAX), buf(&best_v, q * KMAX), buf(&lo, q), buf(&hi, q), always, q as u32, (base + j0) as u32, j0 as u32, n as u32);
                 }
+                base += t.len;
             }
             let (bd, bv) = (read(&best_d), read(&best_v));
             for r in 0..q {
@@ -106,17 +122,28 @@ impl KnnStore {
 }
 
 /// Merges one tile into each query's running top list (`best_*`, ascending, `KM` per query). `d` is the
-/// tile's transposed matmul output: d[j * q + qi] = q·key_j; this launch covers keys j0..j0 + len.
+/// tile's transposed matmul output: d[j * q + qi] = q·key_j; this launch covers the tile's keys j0..j0 + len, whose
+/// store-wide indices start at gj0 (keys outside a query's allowed ranges count as infinitely far).
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
-fn k_topk(d: &[f32], norms: &[f32], vals: &[f32], best_d: &mut [f32], best_v: &mut [f32], q: u32, j0: u32, len: u32) {
+fn k_topk(d: &[f32], norms: &[f32], vals: &[f32], best_d: &mut [f32], best_v: &mut [f32], lo: &[u32], hi: &[u32], always: u32, q: u32, gj0: u32, j0: u32, len: u32) {
     let qi = ABSOLUTE_POS as u32;
     if qi < q {
         let base = qi * KM;
         let mut worst = best_d[(base + KM - 1) as usize];
+        let (lo_q, hi_q) = (lo[qi as usize], hi[qi as usize]);
         for jj in 0..len {
             let j = j0 + jj;
-            let dist = norms[j as usize] - 2.0 * d[(j * q + qi) as usize];
+            let g = gj0 + jj;
+            let mut dist = norms[j as usize] - 2.0 * d[(j * q + qi) as usize];
+            if g >= always {
+                if g < lo_q {
+                    dist = f32::INFINITY;
+                }
+                if g >= hi_q {
+                    dist = f32::INFINITY;
+                }
+            }
             if dist < worst {
                 // Insert at the rank of `dist` (the number of kept entries not above it), shifting the tail down.
                 let mut p = 0u32;
@@ -167,6 +194,36 @@ mod tests {
                 let gap = |a: usize, b: usize| (all[a].0 - all[b].0).abs() > 1e-3 * (1.0 + all[a].0);
                 if (j == 0 || gap(j, j - 1)) && (j + 1 == n || gap(j, j + 1)) {
                     assert_eq!(g.1, all[j].1, "query {r} rank {j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn masked_search_respects_ranges() {
+        let (d, n, rows) = (24, 1000, 40);
+        let mut rng = Rng::new(11);
+        let keys: Vec<f32> = (0..n * d).map(|_| rng.next_gaussian()).collect();
+        let vals: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let queries: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
+        let mut store = KnnStore::new(d, 300);
+        store.add(&keys, &vals);
+        store.finish();
+        // Keys below 100 are always allowed; query r also sees [lo_r, hi_r), some with fewer than KMAX allowed keys.
+        let ranges: Vec<(u32, u32)> = (0..rows).map(|r| (200 + (r as u32 * 17) % 400, 300 + (r as u32 * 29) % 700)).collect();
+        let got = store.search_masked(&queries, rows, Some((&ranges, 100)));
+        for r in 0..rows {
+            let q = &queries[r * d..(r + 1) * d];
+            let mut all: Vec<(f32, u8)> = (0..n)
+                .filter(|&i| (i as u32) < 100 || (i as u32 >= ranges[r].0 && (i as u32) < ranges[r].1))
+                .map(|i| (keys[i * d..(i + 1) * d].iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum(), vals[i]))
+                .collect();
+            all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            for j in 0..KMAX {
+                let g = got[r * KMAX + j];
+                match all.get(j) {
+                    Some(c) => assert!((g.0 - c.0).abs() < 1e-3 * (1.0 + c.0), "query {r} rank {j}: gpu {} vs cpu {}", g.0, c.0),
+                    None => assert!(g.0.is_infinite(), "query {r} rank {j}: expected no neighbour, got {}", g.0),
                 }
             }
         }

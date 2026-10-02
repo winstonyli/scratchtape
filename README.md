@@ -35,7 +35,11 @@ settled novels6 model (held-out 1.2408 nats/byte) a CPU word-lexicon tier gives
 positions (searched on the GPU, `gpu_step/knn.rs`) gives -0.0291 (k = 256), a
 word-bigram CPU tier -0.0161, and the three together 1.2053 (-0.0356). The
 memory's gain is document-specific: unseen text of the same books helps most
-(-0.036 from a 472k-key memory), text of other books hurts. Existing work by tier: the transformer and its GPU-resident
+(-0.036 from a 472k-key memory), text of other books hurts. Caveat: the standard
+score gives early window positions almost no context; with every byte given at
+least 32 bytes (`warm=32`) the model alone is 1.1778, and then lexicon + word
+bigram + a past-only in-document memory reach 1.1311 (-0.0467), of which the
+memory is -0.0425 (the CPU tiers alone -0.0201). Existing work by tier: the transformer and its GPU-resident
 step (tier 1); the symbolic-structure and reasoning examples (tier 2);
 replay buffers, checkpoints and consolidation in `examples/memory_tiers/`
 (the long-term side, so far at toy or Aesop-quarters scale). Experiments

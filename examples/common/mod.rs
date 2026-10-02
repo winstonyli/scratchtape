@@ -301,12 +301,9 @@ pub fn corpus(name: &str) -> &'static str {
     }
 }
 
-/// (train, held-out) bytes of a bundled corpus: the last 10% of the text
-/// is held out. `all_four` and `novels6` take the last 10% of *each* book,
-/// so the held-out set mixes all the books.
-#[allow(dead_code)]
-pub fn split_corpus(name: &str) -> (Vec<usize>, Vec<usize>) {
-    let books: Vec<String> = match name {
+/// The texts of a bundled corpus, one per book.
+fn books(name: &str) -> Vec<String> {
+    match name {
         "all_four" => ["aesops_fables", "leaves_of_grass", "origin_of_species", "sherlock_holmes"].iter().map(|n| corpus(n).to_string()).collect(),
         // Fetched by scripts/fetch_gutenberg.sh into the gitignored data/gutenberg/.
         "novels6" => ["frankenstein", "pride_and_prejudice", "tale_of_two_cities", "dracula", "great_expectations", "moby_dick"]
@@ -314,13 +311,32 @@ pub fn split_corpus(name: &str) -> (Vec<usize>, Vec<usize>) {
             .map(|n| std::fs::read_to_string(format!("data/gutenberg/{n}.txt")).unwrap_or_else(|e| panic!("data/gutenberg/{n}.txt: {e} (run scripts/fetch_gutenberg.sh)")))
             .collect(),
         _ => vec![corpus(name).to_string()],
-    };
+    }
+}
+
+/// (train, held-out) bytes of a bundled corpus: the last 10% of the text
+/// is held out. `all_four` and `novels6` take the last 10% of *each* book,
+/// so the held-out set mixes all the books.
+#[allow(dead_code)]
+pub fn split_corpus(name: &str) -> (Vec<usize>, Vec<usize>) {
     let (mut train, mut held_out) = (vec![], vec![]);
-    for book in books {
+    for book in books(name) {
         let full = encode_bytes(&book);
         let split = (full.len() as f32 * 0.9) as usize;
         train.extend_from_slice(&full[..split]);
         held_out.extend_from_slice(&full[split..]);
     }
     (train, held_out)
+}
+
+/// Where each book's held-out text starts inside `split_corpus`'s held-out vector.
+#[allow(dead_code)]
+pub fn held_out_docs(name: &str) -> Vec<usize> {
+    let (mut starts, mut at) = (vec![], 0);
+    for book in books(name) {
+        let full = encode_bytes(&book);
+        starts.push(at);
+        at += full.len() - (full.len() as f32 * 0.9) as usize;
+    }
+    starts
 }

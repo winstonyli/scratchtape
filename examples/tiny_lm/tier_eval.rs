@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal] [warm=<t0>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -17,11 +17,21 @@
 //                   previous word, backing off to order 0 where that has none) give a next-letter / end-of-word
 //                   distribution q (the end mass is spread over non-letter bytes in the model's own proportions);
 //                   p' = (1-lambda) * p + lambda * q.
+//                   Flags after a third ':' : `h` reads CONTEXT (256) bytes of preceding text instead of only the 64-byte window,
+//                   so a word cut by the window's start is seen whole (a CPU-side working memory the model lacks); `f` also
+//                   predicts the FIRST letter of the next word (between words) from the words that followed the previous
+//                   word. `lexicon:<eps>:h` takes the `h` flag too.
 //   knn:<k>:<lambda>:<temp>
 //                   the memory tier (kNN-LM style): keys are `tap` hidden states of `store` evenly spaced TRAIN
 //                   windows run through the frozen model, values their next bytes; the k nearest keys (squared L2)
 //                   give p_knn(b) ~ sum exp(-(d - d_nearest)/temp) over neighbours with value b (k <= 64);
 //                   p' = (1-lambda) * p + lambda * p_knn.
+// `warm=<t0>` scores each byte only at window position >= t0 (windows then start every 64 - t0 bytes), so the model
+// always has at least t0 bytes of context: the plain protocol (warm 0) gives the early positions of every window almost
+// none, which a tier reading longer context (the `h` flag) can exploit; `warm=32` is the control for that.
+// `memory=causal` makes the memory a past-only in-document one: the train keys plus ALL held-out windows (in order), where
+// a query in window w sees the train keys and only those held-out windows before w in the same book (`store` counts
+// train windows; 0 for no train keys). `stride`/`offset`/`part` still choose what is scored.
 // `store_from` chooses the memory's contents: `train` (default; `store` evenly spaced train windows), `held` (every
 // held-out window NOT scored, i.e. whose index is not offset mod stride, which needs stride > 1: text the model never
 // trained on, but from the same books as the scored windows, some of it adjacent), or `both`.
@@ -47,18 +57,22 @@ use std::time::Duration;
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::split_corpus;
+use common::{held_out_docs, split_corpus};
 
 const SEQ_LEN: usize = 64;
 const VOCAB: usize = 256;
 /// Windows per forward launch.
 const CHUNK: usize = 32;
+/// Bytes of preceding text the CPU tiers may read with the `h` flag (the model itself sees only its 64-byte window).
+const CONTEXT: usize = 256;
 
 /// What a tier sees at one position: the row within the chunk last passed to `prepare`, the window's input bytes
 /// up to and including this one, the byte it predicts, and the tapped hidden state (empty unless a tier asked).
 struct Ctx<'a> {
     row: usize,
     window: &'a [usize],
+    /// Up to CONTEXT bytes of the text up to and including this position, reaching back past the window's start.
+    context: &'a [usize],
     target: usize,
     #[allow(dead_code)] // for tiers that read the hidden state directly rather than via a store
     hidden: &'a [f32],
@@ -68,8 +82,9 @@ trait Tier {
     fn needs_hidden(&self) -> bool {
         false
     }
-    /// Called once per forward chunk, before its rows are adjusted, with the tapped hidden states (if needed).
-    fn prepare(&mut self, _chunk: usize, _hidden: &[f32], _rows: usize) {}
+    /// Called once per forward chunk, before its rows are adjusted, with the tapped hidden states (if needed) and the
+    /// chunk's window starts in the held-out text.
+    fn prepare(&mut self, _chunk: usize, _hidden: &[f32], _rows: usize, _starts: &[usize]) {}
     /// Rewrites the next-byte distribution `probs` (sums to 1) in place.
     fn adjust(&mut self, ctx: &Ctx, probs: &mut [f64]);
     /// A line of tier-specific statistics, printed after a scoring pass.
@@ -100,6 +115,7 @@ struct Lexicon {
     prefixes: HashSet<Vec<u8>>,
     words: HashSet<Vec<u8>>,
     eps: f64,
+    hist: bool,
     positions: usize,
     constrained: usize,
     top1_rejected: usize,
@@ -107,7 +123,7 @@ struct Lexicon {
 }
 
 impl Lexicon {
-    fn new(train: &[usize], eps: f64) -> Lexicon {
+    fn new(train: &[usize], eps: f64, hist: bool) -> Lexicon {
         let (mut prefixes, mut words) = (HashSet::new(), HashSet::new());
         for word in word_list(train) {
             for n in 1..=word.len() {
@@ -115,7 +131,7 @@ impl Lexicon {
             }
             words.insert(word);
         }
-        Lexicon { prefixes, words, eps, positions: 0, constrained: 0, top1_rejected: 0, top1_fixed: 0 }
+        Lexicon { prefixes, words, eps, hist, positions: 0, constrained: 0, top1_rejected: 0, top1_fixed: 0 }
     }
 }
 
@@ -123,8 +139,9 @@ impl Tier for Lexicon {
     fn adjust(&mut self, ctx: &Ctx, probs: &mut [f64]) {
         self.positions += 1;
         // The current word so far, only if a boundary precedes it inside the window.
-        let Some(boundary) = ctx.window.iter().rposition(|&b| !is_letter(b)) else { return };
-        let word: Vec<u8> = ctx.window[boundary + 1..].iter().map(|&b| b as u8).collect();
+        let seq = if self.hist { ctx.context } else { ctx.window };
+        let Some(boundary) = seq.iter().rposition(|&b| !is_letter(b)) else { return };
+        let word: Vec<u8> = seq[boundary + 1..].iter().map(|&b| b as u8).collect();
         if word.is_empty() {
             return;
         }
@@ -176,11 +193,14 @@ impl Tier for Lexicon {
 struct Words {
     order: usize,
     lambda: f64,
+    hist: bool,
+    first: bool,
     unigram: Vec<(Vec<u8>, u32)>,
     after: std::collections::HashMap<Vec<u8>, Vec<(Vec<u8>, u32)>>,
     positions: usize,
     applied: usize,
     applied_bigram: usize,
+    applied_first: usize,
 }
 
 fn sorted_counts(m: std::collections::HashMap<Vec<u8>, u32>) -> Vec<(Vec<u8>, u32)> {
@@ -190,7 +210,7 @@ fn sorted_counts(m: std::collections::HashMap<Vec<u8>, u32>) -> Vec<(Vec<u8>, u3
 }
 
 impl Words {
-    fn new(train: &[usize], order: usize, lambda: f64) -> Words {
+    fn new(train: &[usize], order: usize, lambda: f64, hist: bool, first: bool) -> Words {
         use std::collections::HashMap;
         assert!(order <= 1, "words:<order 0|1>:<lambda>");
         let list = word_list(train);
@@ -204,7 +224,18 @@ impl Words {
                 *bi.entry(pair[0].clone()).or_default().entry(pair[1].clone()).or_default() += 1;
             }
         }
-        Words { order, lambda, unigram: sorted_counts(uni), after: bi.into_iter().map(|(k, v)| (k, sorted_counts(v))).collect(), positions: 0, applied: 0, applied_bigram: 0 }
+        Words {
+            order,
+            lambda,
+            hist,
+            first,
+            unigram: sorted_counts(uni),
+            after: bi.into_iter().map(|(k, v)| (k, sorted_counts(v))).collect(),
+            positions: 0,
+            applied: 0,
+            applied_bigram: 0,
+            applied_first: 0,
+        }
     }
 
     /// Over the list's words that extend `prefix`: counts of the next letter, of words ending exactly there, and
@@ -228,13 +259,14 @@ impl Words {
 impl Tier for Words {
     fn adjust(&mut self, ctx: &Ctx, probs: &mut [f64]) {
         self.positions += 1;
-        let Some(boundary) = ctx.window.iter().rposition(|&b| !is_letter(b)) else { return };
-        let prefix: Vec<u8> = ctx.window[boundary + 1..].iter().map(|&b| b as u8).collect();
-        if prefix.is_empty() {
+        let seq = if self.hist { ctx.context } else { ctx.window };
+        let Some(boundary) = seq.iter().rposition(|&b| !is_letter(b)) else { return };
+        let prefix: Vec<u8> = seq[boundary + 1..].iter().map(|&b| b as u8).collect();
+        if prefix.is_empty() && !self.first {
             return;
         }
         // The word before the current one: the last letter run ending at or before the boundary.
-        let before = &ctx.window[..=boundary];
+        let before = &seq[..=boundary];
         let prev: Vec<u8> = match before.iter().rposition(|&b| is_letter(b)) {
             Some(end) => {
                 let start = before[..=end].iter().rposition(|&b| !is_letter(b)).map_or(0, |i| i + 1);
@@ -253,6 +285,19 @@ impl Tier for Words {
             }
         }
         let (letters, end, total) = found.unwrap_or_else(|| Words::extend(&self.unigram, &prefix));
+        if prefix.is_empty() {
+            // Between words: the model keeps its split between letters and other bytes; the words that followed the
+            // previous word redistribute the letter part over first letters.
+            let letter_mass: f64 = (0..VOCAB).filter(|&b| is_letter(b)).map(|b| probs[b]).sum();
+            if total <= 0.0 || letter_mass <= 0.0 {
+                return;
+            }
+            self.applied_first += 1;
+            for b in (0..VOCAB).filter(|&b| is_letter(b)) {
+                probs[b] = (1.0 - self.lambda) * probs[b] + self.lambda * letter_mass * letters[b] / total;
+            }
+            return;
+        }
         let non_letter: f64 = (0..VOCAB).filter(|&b| !is_letter(b)).map(|b| probs[b]).sum();
         if total <= 0.0 || non_letter <= 0.0 {
             return;
@@ -265,7 +310,16 @@ impl Tier for Words {
     }
 
     fn report(&self) -> String {
-        format!("words (order {}): applied at {}/{} positions ({} from the bigram list)", self.order, self.applied, self.positions, self.applied_bigram)
+        format!(
+            "words (order {}{}{}): applied inside words at {}, between words at {} of {} positions ({} from the bigram list)",
+            self.order,
+            if self.hist { ", long context" } else { "" },
+            if self.first { ", first letters" } else { "" },
+            self.applied,
+            self.applied_first,
+            self.positions,
+            self.applied_bigram
+        )
     }
 }
 
@@ -273,15 +327,35 @@ impl Tier for Words {
 /// Shared by all knn specs, which reuse one neighbour search per chunk.
 struct Store {
     gpu: KnnStore,
+    causal: Option<Causal>,
     /// (chunk searched, per row the KMAX nearest (squared distance, value), ascending)
     found: RefCell<(Option<usize>, Vec<(f32, u8)>)>,
 }
 
+/// Makes the memory causal: the first `n_train` keys (train windows) are always visible, and of the held-out windows
+/// (all of them, in order, after the train keys) a query in window w sees only those before w in its own book.
+struct Causal {
+    n_train: usize,
+    /// First held-out window of the book that window w belongs to.
+    first_window: Vec<usize>,
+}
+
 impl Store {
-    fn prepare(&self, chunk: usize, hidden: &[f32], rows: usize) {
-        if self.found.borrow().0 != Some(chunk) {
-            *self.found.borrow_mut() = (Some(chunk), self.gpu.search(hidden, rows));
+    fn prepare(&self, chunk: usize, hidden: &[f32], rows: usize, starts: &[usize]) {
+        if self.found.borrow().0 == Some(chunk) {
+            return;
         }
+        let ranges: Option<(Vec<(u32, u32)>, u32)> = self.causal.as_ref().map(|c| {
+            let r = (0..rows)
+                .map(|r| {
+                    let w = starts[r / SEQ_LEN] / SEQ_LEN;
+                    ((c.n_train + c.first_window[w] * SEQ_LEN) as u32, (c.n_train + w * SEQ_LEN) as u32)
+                })
+                .collect();
+            (r, c.n_train as u32)
+        });
+        let found = self.gpu.search_masked(hidden, rows, ranges.as_ref().map(|(r, a)| (r.as_slice(), *a)));
+        *self.found.borrow_mut() = (Some(chunk), found);
     }
 }
 
@@ -299,12 +373,17 @@ impl Tier for Knn {
     fn needs_hidden(&self) -> bool {
         true
     }
-    fn prepare(&mut self, chunk: usize, hidden: &[f32], rows: usize) {
-        self.store.prepare(chunk, hidden, rows);
+    fn prepare(&mut self, chunk: usize, hidden: &[f32], rows: usize, starts: &[usize]) {
+        self.store.prepare(chunk, hidden, rows, starts);
     }
     fn adjust(&mut self, ctx: &Ctx, probs: &mut [f64]) {
         let found = self.store.found.borrow();
         let nb = &found.1[ctx.row * KMAX..ctx.row * KMAX + self.k];
+        // A causal memory can have fewer than k keys to offer (the start of a book): use those, or leave p alone.
+        let nb = &nb[..nb.iter().take_while(|n| n.0.is_finite()).count()];
+        if nb.is_empty() {
+            return;
+        }
         let mut knn = [0f64; VOCAB];
         let mut total = 0.0;
         for &(dist, v) in nb {
@@ -317,7 +396,7 @@ impl Tier for Knn {
         }
         self.positions += 1;
         self.nearest += nb[0].0 as f64;
-        self.kth += nb[self.k - 1].0 as f64;
+        self.kth += nb[nb.len() - 1].0 as f64;
     }
     fn report(&self) -> String {
         let n = self.positions.max(1) as f64;
@@ -331,10 +410,16 @@ fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>) -> Vec<Box
         .map(|part| {
             let (kind, arg) = part.split_once(':').unwrap_or((part, ""));
             match kind {
-                "lexicon" => Box::new(Lexicon::new(train, arg.parse().unwrap_or_else(|_| panic!("lexicon:<eps>, got {part}")))) as Box<dyn Tier>,
+                "lexicon" => {
+                    let (eps, flags) = arg.split_once(':').unwrap_or((arg, ""));
+                    let eps = eps.parse().unwrap_or_else(|_| panic!("lexicon:<eps>[:h], got {part}"));
+                    Box::new(Lexicon::new(train, eps, flags.contains('h'))) as Box<dyn Tier>
+                }
                 "words" => {
-                    let (order, lambda) = arg.split_once(':').unwrap_or_else(|| panic!("words:<order>:<lambda>, got {part}"));
-                    Box::new(Words::new(train, order.parse().unwrap(), lambda.parse().unwrap())) as Box<dyn Tier>
+                    let a: Vec<&str> = arg.split(':').collect();
+                    assert!(a.len() >= 2 && a.len() <= 3, "words:<order>:<lambda>[:<flags h f>], got {part}");
+                    let flags = a.get(2).copied().unwrap_or("");
+                    Box::new(Words::new(train, a[0].parse().unwrap(), a[1].parse().unwrap(), flags.contains('h'), flags.contains('f'))) as Box<dyn Tier>
                 }
                 "knn" => {
                     let a: Vec<f64> = arg.split(':').map(|x| x.parse().unwrap_or_else(|_| panic!("knn:<k>:<lambda>:<temp>, got {part}"))).collect();
@@ -387,7 +472,7 @@ fn main() {
         let (k, v) = a.split_once('=').unwrap_or_else(|| panic!("expected key=value, got {a}"));
         match k {
             "tier" => specs.push(v.to_string()),
-            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" => {
+            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -400,6 +485,9 @@ fn main() {
     assert!(tap < cfg.n_blocks, "tap must be a block index below {}", cfg.n_blocks);
     let stride = size("stride", "1");
     assert!(stride >= 1 && (stride == 1 || !opt.contains_key("expect")), "stride >= 1, and `expect` needs stride 1");
+    let warm = size("warm", "0");
+    assert!(warm < SEQ_LEN && (warm == 0 || !opt.contains_key("expect")), "warm < {SEQ_LEN}, and `expect` needs warm 0");
+    let unit = SEQ_LEN - warm;
     let offset = size("offset", "0");
     assert!(offset < stride, "offset must be below stride");
     let part = |k: &str| -> (usize, usize) {
@@ -434,9 +522,14 @@ fn main() {
 
     let store = if specs.iter().any(|s| s.contains("knn")) {
         let want = size("store", "15000");
-        let from = get("store_from", "train");
+        let causal = match get("memory", "flat").as_str() {
+            "flat" => false,
+            "causal" => true,
+            m => panic!("memory is flat or causal, got {m}"),
+        };
+        let from = if causal { "both".to_string() } else { get("store_from", "train") };
         assert!(["train", "held", "both"].contains(&from.as_str()), "store_from is train, held or both");
-        assert!(from == "train" || stride > 1, "store_from=held needs stride > 1 so some held-out windows are left unscored");
+        assert!(from == "train" || causal || stride > 1, "store_from=held needs stride > 1 so some held-out windows are left unscored");
         let mut gpu = KnnStore::new(cfg.d, 16384);
         let (mut n_train, mut n_held) = (0, 0);
         let mut load = |data: &[usize], starts: &[usize]| {
@@ -445,7 +538,7 @@ fn main() {
                 gpu.add(&f.hidden, &f.targets.iter().map(|&t| t as u8).collect::<Vec<_>>());
             }
         };
-        if from != "held" {
+        if from != "held" && want > 0 {
             let total = (train.len() - 1) / SEQ_LEN;
             let starts: Vec<usize> = (0..want.min(total)).map(|i| i * total / want.min(total) * SEQ_LEN).collect();
             load(&train, &starts);
@@ -453,14 +546,20 @@ fn main() {
         }
         if from != "train" {
             let windows = (held_out.len() - 1) / SEQ_LEN;
-            let unscored: Vec<usize> = (0..windows).filter(|i| i % stride != offset && i * spart_n / windows == spart_i).map(|i| i * SEQ_LEN).collect();
-            let starts: Vec<usize> = (0..want.min(unscored.len())).map(|i| unscored[i * unscored.len() / want.min(unscored.len())]).collect();
+            let unscored: Vec<usize> = (0..windows).filter(|i| causal || (i % stride != offset && i * spart_n / windows == spart_i)).map(|i| i * SEQ_LEN).collect();
+            let starts: Vec<usize> = if causal { unscored } else { (0..want.min(unscored.len())).map(|i| unscored[i * unscored.len() / want.min(unscored.len())]).collect() };
             load(&held_out, &starts);
             n_held = starts.len();
         }
         gpu.finish();
         println!("memory: {} keys of {} floats from {n_train} train + {n_held} unscored held-out windows (tap = block {tap}), searched on the GPU", gpu.len(), cfg.d);
-        Some(Rc::new(Store { gpu, found: RefCell::new((None, vec![])) }))
+        let causal = causal.then(|| {
+            let docs = held_out_docs(&corpus);
+            let windows = (held_out.len() - 1) / SEQ_LEN;
+            let first_window = (0..windows).map(|w| docs[docs.partition_point(|&b| b <= w * SEQ_LEN) - 1].div_ceil(SEQ_LEN)).collect();
+            Causal { n_train: n_train * SEQ_LEN, first_window }
+        });
+        Some(Rc::new(Store { gpu, causal, found: RefCell::new((None, vec![])) }))
     } else {
         None
     };
@@ -470,21 +569,26 @@ fn main() {
     let (mut ce_model, mut ce_device) = (0.0f64, 0.0f64);
     let mut ce_tier = vec![0.0f64; tiers.len()];
     let n_win = (held_out.len() - 1) / SEQ_LEN;
-    let starts: Vec<usize> = (offset * SEQ_LEN..held_out.len() - SEQ_LEN).step_by(SEQ_LEN * stride).filter(|s| s / SEQ_LEN * part_n / n_win == part_i).collect();
+    let starts: Vec<usize> = (offset * unit..held_out.len() - SEQ_LEN).step_by(unit * stride).filter(|s| s / SEQ_LEN * part_n / n_win == part_i).collect();
     for (ci, chunk) in starts.chunks(CHUNK).enumerate() {
         let f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden);
         let rows = f.ids.len();
         for tier in tiers.iter_mut().flatten() {
-            tier.prepare(ci, &f.hidden, rows);
+            tier.prepare(ci, &f.hidden, rows, chunk);
         }
         for r in 0..rows {
             let t = r % SEQ_LEN;
+            if t < warm {
+                continue;
+            }
             let window = &f.ids[r - t..=r];
+            let abs = chunk[r / SEQ_LEN] + t;
+            let context = &held_out[(abs + 1).saturating_sub(CONTEXT)..=abs];
             let probs = softmax(&f.logits[r * VOCAB..(r + 1) * VOCAB]);
             ce_model -= probs[f.targets[r]].ln();
             ce_device += f.row_loss[r] as f64;
             let hid = if need_hidden { &f.hidden[r * cfg.d..(r + 1) * cfg.d] } else { &[][..] };
-            let ctx = Ctx { row: r, window, target: f.targets[r], hidden: hid };
+            let ctx = Ctx { row: r, window, context, target: f.targets[r], hidden: hid };
             for (i, spec_tiers) in tiers.iter_mut().enumerate() {
                 let mut p = probs.clone();
                 for tier in spec_tiers.iter_mut() {
@@ -494,7 +598,7 @@ fn main() {
             }
         }
     }
-    let n = (starts.len() * SEQ_LEN) as f64;
+    let n = (starts.len() * unit) as f64;
     let (ce_model, ce_device) = (ce_model / n, ce_device / n);
     println!("checkpoint {ckpt}: {} windows (stride {stride}, offset {offset}, part {part_i}/{part_n}), {} positions; tap = block {tap}", starts.len(), n as usize);
     println!("model alone: CE {ce_model:.4} (device row losses {ce_device:.4})");

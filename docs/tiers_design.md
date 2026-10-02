@@ -175,6 +175,45 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   `Failed to map buffer` / `Parent device is lost` panics). The kernel now takes 1024-key slices per launch; the
   unit test is unchanged.
 
+- **Protocol caveat (found after the rows above; read this before comparing numbers).** The standard held-out score
+  gives position t of each 64-byte window only t bytes of context, so early positions are scored almost blind.
+  `tier_eval warm=32` scores every byte with at least 32 bytes of context (`runs/tier_warm.log`): the **model alone
+  is 1.1764, not 1.2408**. Consequences: (1) the `h` flag (CPU tiers reading 256 preceding bytes) looked like a big
+  win under the standard protocol (`runs/tier_ctx.log`: lexicon:0.3:h -0.0217, words:1:0.35:h -0.0395, lexicon+words
+  -0.0463) but is **nothing under `warm=32`** (lexicon -0.0066 with or without `h`; words -0.0174 vs -0.0159 with
+  `h`): it only compensated for the missing context. The `f` flag (first-letter prediction between words) did not help
+  either way (-0.0137 vs -0.0161 without it). (2) The kNN memory is **not** an artifact: its gain is slightly larger
+  under `warm=32` (-0.0328 vs -0.0276 on the same subsample, `runs/tier_warm_knn.log`). (3) Every "vs model" number
+  in the earlier rows is valid only for the standard protocol; the 7-gram's 1.3567 is scored the same windowed way
+  (`ngram_baseline.rs`), so that comparison is like for like, but model + tiers on the fair protocol has no 7-gram
+  number yet.
+- **Causal in-document memory (`memory=causal`; `runs/tier_causal*.log`, `tier_full3_causal.log`).** The memory is
+  the train keys plus the held-out windows before the scored one in the same book (past-only; GPU search masks each
+  query's allowed key ranges, `KnnStore::search_masked`, unit-tested against a CPU brute force). On the `warm=32`
+  subsample (model 1.1844): train keys only -0.0328; **train + past same-book windows -0.0448**; past same-book
+  windows alone (503k keys) -0.0201 (its best temp 40 is interior; the mean neighbour distance is 93 vs 36, so the
+  memory is sparse). So a deployable in-document memory adds about 0.012 on top of train keys.
+- **d = 384 (round 18 checkpoint, 1.2413; `runs/tier_d384_flat.log`).** Gate 0 passed. Lexicon -0.0063, words:1
+  -0.0152 (standard protocol). Memory under `warm=32` (model 1.1817 on the subsample): best -0.0324 at lambda 0.5,
+  temp 30 (the lambda grid's top), against -0.0328 for d = 256 (model 1.1844): the memory's gain does not depend
+  much on the model width, and the d = 384 absolute score is slightly better (1.1493 vs 1.1516).
+- **Fair-protocol full runs (`warm=32`, every other held-out window = 251904 positions, 4.5M train keys; scripts/
+  tier_full3.sh; settings tuned on stride-16 offset 0):**
+
+  | Tiers | CE | vs model (1.1778) |
+  |---|---|---|
+  | lexicon:0.3 | 1.1712 | -0.0066 |
+  | words:1:0.25 | 1.1601 | -0.0177 |
+  | lexicon + words | 1.1578 | -0.0201 |
+  | flat memory knn:256:0.4:25 | 1.1462 | -0.0316 |
+  | lexicon + words + flat memory | 1.1393 | -0.0386 |
+  | causal memory knn:256:0.5:15 | 1.1353 | -0.0425 |
+  | words + causal memory | 1.1318 | -0.0461 |
+  | lexicon + words + causal memory | **1.1311** | **-0.0467** |
+
+  The memory is the largest single tier, the causal in-document memory beats the flat one by 0.011, and the CPU
+  tiers add about 0.004-0.007 on top of the memory.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
