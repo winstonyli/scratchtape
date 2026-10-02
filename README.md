@@ -1121,6 +1121,8 @@ because raw forgetting deltas hid a floor effect.
   rounds) gives 1.2578 at 4M windows, better than 0.3 at 8M.
   A dropout sweep at 4M windows puts the optimum at 0.1 (0.05 is within
   noise, 0.0 overfits).
+  Widening to d = 384 gives 1.2457 at 4M windows (0.012 better, ~1.9×
+  the step cost).
   See docs/gpu_step_design.md, rounds 11–16.
 
 - **Replay + Fisher consolidation together** — humble-cortex found them

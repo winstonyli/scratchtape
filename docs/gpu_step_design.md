@@ -1130,7 +1130,20 @@ Next, in order:
    1.2578. `scripts/local_sgd_driver15.sh`, run `nov_d384_k1_4m`, pid
    26428 (Normal), started 19:49, log `runs/nov_d384_k1_4m.log` and
    `runs/local_sgd_driver15.log`, ~19 ms/step × 128000 ≈ 41 min.
-   Resumable. Not yet run: dropout 0.1 at 8M windows.
+   Resumable.
+   **Result (finished 20:44, 55 min): 1.2457**, 0.012 better than d = 256
+   (1.2578) and 0.111 under the 7-gram, at ~1.9× the time per step:
+
+   | windows | d = 384 | d = 256 | lead |
+   |---|---|---|---|
+   | 1M | 1.3092 | 1.3349 | 0.026 |
+   | 2M | 1.2677 | 1.2870 | 0.019 |
+   | 3M | 1.2557 | 1.2684 | 0.013 |
+   | 4M | 1.2457 | 1.2578 | 0.012 |
+
+   Train-probe 1.0961 (gap 0.150 vs 0.105): the wider model overfits more,
+   so capacity pays a little. lr 0.05 looked stable (not retuned). Not yet
+   run: d = 384 or dropout 0.1 at 8M windows; dropout 0.15 on d = 384.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
