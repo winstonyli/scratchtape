@@ -1047,6 +1047,43 @@ it means here.
   0.12 at scale). Sinks were driven by the training objective as much as
   the architecture. A caution for mechanisms tested at this scale.
 
+**Tiered and neuro-symbolic architectures** (surveyed 2026-10-02; abstracts or
+paper sections re-fetched, the Nature paper via the DeepMind post)
+- Sumers, Yao, Narasimhan, Griffiths 2023, *Cognitive Architectures for
+  Language Agents* ([arXiv 2309.02427](https://arxiv.org/abs/2309.02427)):
+  CoALA organizes language agents with cognitive-science and symbolic-AI
+  ideas. Its section 4.1 splits memory into working memory (the active
+  state of the current decision cycle) and long-term memory (episodic,
+  semantic, procedural). The closest published map to our working-memory
+  and long-term tiers.
+- Packer et al. 2023, *MemGPT: Towards LLMs as Operating Systems*
+  ([arXiv 2310.08560](https://arxiv.org/abs/2310.08560)): virtual context
+  management moves data between a fast context and slower external storage
+  like RAM and disk. The same hardware analogy as our cache vs RAM/disk
+  tiers, applied at the prompt level rather than inside the model.
+- Trinh et al. 2024, *Solving olympiad geometry without human
+  demonstrations* (Nature; [DeepMind post](https://deepmind.google/discover/blog/alphageometry-an-olympiad-level-ai-system-for-geometry/)):
+  AlphaGeometry pairs a language model that proposes constructions with a
+  symbolic deduction engine that does the rigorous steps; 25 of 30 olympiad
+  problems. A working GPU-neural plus CPU-symbolic split, which is our
+  tier 1 and tier 2.
+- Manhaeve et al. 2018, *DeepProbLog*
+  ([arXiv 1805.10872](https://arxiv.org/abs/1805.10872), NeurIPS 2018):
+  neural predicates inside a probabilistic logic program, trained end to
+  end. The tightly coupled alternative to AlphaGeometry's propose-and-check
+  loop.
+- Khandelwal et al. 2020, *Generalization through Memorization: Nearest
+  Neighbor Language Models* ([arXiv 1911.00172](https://arxiv.org/abs/1911.00172),
+  ICLR 2020): interpolates a language model with a nearest-neighbor
+  datastore of past contexts, no extra training; swapping the datastore
+  adapts to a new domain. An external long-term store behind the model.
+- Wu et al. 2022, *Memorizing Transformers*
+  ([arXiv 2203.08913](https://arxiv.org/abs/2203.08913), ICLR 2022): kNN
+  lookup into a non-differentiable memory of past (key, value) pairs;
+  gains continue up to 262K tokens of memory, and new functions or theorems
+  are usable at test time without retraining. Memory the model reads but
+  does not train through.
+
 **Continual learning / memory tiers**
 - McClelland, McNaughton & O'Reilly 1995 (complementary learning
   systems); Kirkpatrick et al. 2017 (EWC); Zenke et al. 2017 (Synaptic
