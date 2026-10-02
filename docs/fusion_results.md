@@ -571,6 +571,15 @@ Next, in order:
 
    Train-probe 1.0961 (gap 0.150 vs 0.105): the wider model overfits more,
    so capacity pays a little. lr 0.05 looked stable (not retuned). Not yet
-   run: d = 384 or dropout 0.1 at 8M windows; dropout 0.15 on d = 384.
+   run: d = 384 at 8M windows; dropout 0.15 on d = 384.
+
+   **Round 17 (2026-10-01): dropout 0.1 at 8M windows**, big K = 1 on
+   novels6 (controls: dropout 0.1 at 4M 1.2578; dropout 0.3 at 8M
+   1.2622). `scripts/local_sgd_driver16.sh`, run `nov_big_k1_d0.1_8m`,
+   pid 36024 (Normal, RX 9060 XT Vulkan), started 23:51, log
+   `runs/nov_big_k1_d0.1_8m.log` and `runs/local_sgd_driver16.log`,
+   ~10 ms/step × 256000 steps ≈ 45–70 min. CPU load 54% at launch from
+   other sessions (affects ms/step only); Defender real-time off.
+   Resumable.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
