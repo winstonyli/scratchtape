@@ -32,8 +32,10 @@ talk to each other, and which neuroscience correspondences to commit to,
 are open. First cross-tier results (`tier_eval`, `docs/tiers_design.md`): on the
 settled novels6 model (held-out 1.2408 nats/byte) a CPU word-lexicon tier gives
 -0.0061, a RAM kNN memory over the final residual stream of all 4.5M train
-positions (searched on the GPU, `gpu_step/knn.rs`) gives -0.0283, and the two
-together 1.2099 (-0.0309), still improving with more neighbours. Existing work by tier: the transformer and its GPU-resident
+positions (searched on the GPU, `gpu_step/knn.rs`) gives -0.0291 (k = 256), a
+word-bigram CPU tier -0.0161, and the three together 1.2053 (-0.0356). The
+memory's gain is document-specific: unseen text of the same books helps most
+(-0.036 from a 472k-key memory), text of other books hurts. Existing work by tier: the transformer and its GPU-resident
 step (tier 1); the symbolic-structure and reasoning examples (tier 2);
 replay buffers, checkpoints and consolidation in `examples/memory_tiers/`
 (the long-term side, so far at toy or Aesop-quarters scale). Experiments

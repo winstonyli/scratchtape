@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [store=<train windows in the memory>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -11,11 +11,24 @@
 //   lexicon:<eps>   the symbolic CPU tier: a word list from the TRAIN split masks next bytes that cannot continue
 //                   or end a known word; p' = (1-eps) * renorm(masked p) + eps * p. It only constrains a position
 //                   once the window has shown a word boundary (the start of a window may cut a word).
+//   words:<order>:<lambda>
+//                   a second CPU tier, word statistics from the TRAIN split: inside a word, the words that extend
+//                   the current prefix (order 0: all train words by frequency; order 1: words that followed the
+//                   previous word, backing off to order 0 where that has none) give a next-letter / end-of-word
+//                   distribution q (the end mass is spread over non-letter bytes in the model's own proportions);
+//                   p' = (1-lambda) * p + lambda * q.
 //   knn:<k>:<lambda>:<temp>
 //                   the memory tier (kNN-LM style): keys are `tap` hidden states of `store` evenly spaced TRAIN
 //                   windows run through the frozen model, values their next bytes; the k nearest keys (squared L2)
 //                   give p_knn(b) ~ sum exp(-(d - d_nearest)/temp) over neighbours with value b (k <= 64);
 //                   p' = (1-lambda) * p + lambda * p_knn.
+// `store_from` chooses the memory's contents: `train` (default; `store` evenly spaced train windows), `held` (every
+// held-out window NOT scored, i.e. whose index is not offset mod stride, which needs stride > 1: text the model never
+// trained on, but from the same books as the scored windows, some of it adjacent), or `both`.
+// `part=i/n` scores only the i-th of n equal contiguous parts of the held-out text, and `store_part=i/n` limits the
+// held-out windows that `store_from=held|both` may use to that part. The held-out text is the last 10% of each book in
+// turn, so parts 0/2 and 1/2 of novels6 are (mostly) different books: a memory from the other part is unseen by the model
+// AND from other documents, separating "never trained on" from "adjacent to the scored text".
 // `tap` picks which block's output the tiers get as the position's hidden state (default: the last block, i.e. the
 // final residual stream before the final LayerNorm). With `stride` > 1 the model alone is scored on the same
 // subsample, so tiers are always compared to the plain model on identical positions (Gate 0's `expect` needs stride 1). `offset` picks which of the `stride` interleaved subsamples, so tuning and
@@ -159,6 +172,103 @@ impl Tier for Lexicon {
     }
 }
 
+/// Words (letters/apostrophes) from the train split with counts, as sorted lists for prefix lookup.
+struct Words {
+    order: usize,
+    lambda: f64,
+    unigram: Vec<(Vec<u8>, u32)>,
+    after: std::collections::HashMap<Vec<u8>, Vec<(Vec<u8>, u32)>>,
+    positions: usize,
+    applied: usize,
+    applied_bigram: usize,
+}
+
+fn sorted_counts(m: std::collections::HashMap<Vec<u8>, u32>) -> Vec<(Vec<u8>, u32)> {
+    let mut v: Vec<_> = m.into_iter().collect();
+    v.sort();
+    v
+}
+
+impl Words {
+    fn new(train: &[usize], order: usize, lambda: f64) -> Words {
+        use std::collections::HashMap;
+        assert!(order <= 1, "words:<order 0|1>:<lambda>");
+        let list = word_list(train);
+        let mut uni: HashMap<Vec<u8>, u32> = HashMap::new();
+        for w in &list {
+            *uni.entry(w.clone()).or_default() += 1;
+        }
+        let mut bi: HashMap<Vec<u8>, HashMap<Vec<u8>, u32>> = HashMap::new();
+        if order == 1 {
+            for pair in list.windows(2) {
+                *bi.entry(pair[0].clone()).or_default().entry(pair[1].clone()).or_default() += 1;
+            }
+        }
+        Words { order, lambda, unigram: sorted_counts(uni), after: bi.into_iter().map(|(k, v)| (k, sorted_counts(v))).collect(), positions: 0, applied: 0, applied_bigram: 0 }
+    }
+
+    /// Over the list's words that extend `prefix`: counts of the next letter, of words ending exactly there, and
+    /// the total.
+    fn extend(list: &[(Vec<u8>, u32)], prefix: &[u8]) -> ([f64; VOCAB], f64, f64) {
+        let mut letters = [0f64; VOCAB];
+        let (mut end, mut total) = (0.0, 0.0);
+        let from = list.partition_point(|(w, _)| w.as_slice() < prefix);
+        for (w, c) in list[from..].iter().take_while(|(w, _)| w.starts_with(prefix)) {
+            total += *c as f64;
+            if w.len() == prefix.len() {
+                end += *c as f64;
+            } else {
+                letters[w[prefix.len()] as usize] += *c as f64;
+            }
+        }
+        (letters, end, total)
+    }
+}
+
+impl Tier for Words {
+    fn adjust(&mut self, ctx: &Ctx, probs: &mut [f64]) {
+        self.positions += 1;
+        let Some(boundary) = ctx.window.iter().rposition(|&b| !is_letter(b)) else { return };
+        let prefix: Vec<u8> = ctx.window[boundary + 1..].iter().map(|&b| b as u8).collect();
+        if prefix.is_empty() {
+            return;
+        }
+        // The word before the current one: the last letter run ending at or before the boundary.
+        let before = &ctx.window[..=boundary];
+        let prev: Vec<u8> = match before.iter().rposition(|&b| is_letter(b)) {
+            Some(end) => {
+                let start = before[..=end].iter().rposition(|&b| !is_letter(b)).map_or(0, |i| i + 1);
+                before[start..=end].iter().map(|&b| b as u8).collect()
+            }
+            None => vec![],
+        };
+        let mut found = None;
+        if self.order == 1 && !prev.is_empty() {
+            if let Some(list) = self.after.get(&prev) {
+                let e = Words::extend(list, &prefix);
+                if e.2 > 0.0 {
+                    found = Some(e);
+                    self.applied_bigram += 1;
+                }
+            }
+        }
+        let (letters, end, total) = found.unwrap_or_else(|| Words::extend(&self.unigram, &prefix));
+        let non_letter: f64 = (0..VOCAB).filter(|&b| !is_letter(b)).map(|b| probs[b]).sum();
+        if total <= 0.0 || non_letter <= 0.0 {
+            return;
+        }
+        self.applied += 1;
+        for b in 0..VOCAB {
+            let q = if is_letter(b) { letters[b] / total } else { end / total * probs[b] / non_letter };
+            probs[b] = (1.0 - self.lambda) * probs[b] + self.lambda * q;
+        }
+    }
+
+    fn report(&self) -> String {
+        format!("words (order {}): applied at {}/{} positions ({} from the bigram list)", self.order, self.applied, self.positions, self.applied_bigram)
+    }
+}
+
 /// The datastore (`gpu_step::knn`): `tap` hidden states of train positions and the bytes that followed them.
 /// Shared by all knn specs, which reuse one neighbour search per chunk.
 struct Store {
@@ -222,6 +332,10 @@ fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>) -> Vec<Box
             let (kind, arg) = part.split_once(':').unwrap_or((part, ""));
             match kind {
                 "lexicon" => Box::new(Lexicon::new(train, arg.parse().unwrap_or_else(|_| panic!("lexicon:<eps>, got {part}")))) as Box<dyn Tier>,
+                "words" => {
+                    let (order, lambda) = arg.split_once(':').unwrap_or_else(|| panic!("words:<order>:<lambda>, got {part}"));
+                    Box::new(Words::new(train, order.parse().unwrap(), lambda.parse().unwrap())) as Box<dyn Tier>
+                }
                 "knn" => {
                     let a: Vec<f64> = arg.split(':').map(|x| x.parse().unwrap_or_else(|_| panic!("knn:<k>:<lambda>:<temp>, got {part}"))).collect();
                     assert!(a.len() == 3 && a[0] >= 1.0 && a[0] as usize <= KMAX, "knn:<k>:<lambda>:<temp> with 1 <= k <= {KMAX}, got {part}");
@@ -273,7 +387,7 @@ fn main() {
         let (k, v) = a.split_once('=').unwrap_or_else(|| panic!("expected key=value, got {a}"));
         match k {
             "tier" => specs.push(v.to_string()),
-            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" => {
+            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -288,6 +402,15 @@ fn main() {
     assert!(stride >= 1 && (stride == 1 || !opt.contains_key("expect")), "stride >= 1, and `expect` needs stride 1");
     let offset = size("offset", "0");
     assert!(offset < stride, "offset must be below stride");
+    let part = |k: &str| -> (usize, usize) {
+        let v = get(k, "0/1");
+        let (i, n) = v.split_once('/').unwrap_or_else(|| panic!("{k}=<i>/<n>, got {v}"));
+        let (i, n): (usize, usize) = (i.parse().unwrap(), n.parse().unwrap());
+        assert!(n >= 1 && i < n, "{k}: need i < n");
+        (i, n)
+    };
+    let (part_i, part_n) = part("part");
+    let (spart_i, spart_n) = part("store_part");
     let corpus = get("corpus", "novels6");
 
     let flat: Vec<f32> = std::fs::read_to_string(ckpt).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
@@ -311,15 +434,32 @@ fn main() {
 
     let store = if specs.iter().any(|s| s.contains("knn")) {
         let want = size("store", "15000");
-        let total = (train.len() - 1) / SEQ_LEN;
-        let starts: Vec<usize> = (0..want.min(total)).map(|i| i * total / want.min(total) * SEQ_LEN).collect();
+        let from = get("store_from", "train");
+        assert!(["train", "held", "both"].contains(&from.as_str()), "store_from is train, held or both");
+        assert!(from == "train" || stride > 1, "store_from=held needs stride > 1 so some held-out windows are left unscored");
         let mut gpu = KnnStore::new(cfg.d, 16384);
-        for chunk in starts.chunks(CHUNK) {
-            let f = forward(&dev, &cfg, &train, chunk, tap, true);
-            gpu.add(&f.hidden, &f.targets.iter().map(|&t| t as u8).collect::<Vec<_>>());
+        let (mut n_train, mut n_held) = (0, 0);
+        let mut load = |data: &[usize], starts: &[usize]| {
+            for chunk in starts.chunks(CHUNK) {
+                let f = forward(&dev, &cfg, data, chunk, tap, true);
+                gpu.add(&f.hidden, &f.targets.iter().map(|&t| t as u8).collect::<Vec<_>>());
+            }
+        };
+        if from != "held" {
+            let total = (train.len() - 1) / SEQ_LEN;
+            let starts: Vec<usize> = (0..want.min(total)).map(|i| i * total / want.min(total) * SEQ_LEN).collect();
+            load(&train, &starts);
+            n_train = starts.len();
+        }
+        if from != "train" {
+            let windows = (held_out.len() - 1) / SEQ_LEN;
+            let unscored: Vec<usize> = (0..windows).filter(|i| i % stride != offset && i * spart_n / windows == spart_i).map(|i| i * SEQ_LEN).collect();
+            let starts: Vec<usize> = (0..want.min(unscored.len())).map(|i| unscored[i * unscored.len() / want.min(unscored.len())]).collect();
+            load(&held_out, &starts);
+            n_held = starts.len();
         }
         gpu.finish();
-        println!("memory: {} keys of {} floats from {} train windows (tap = block {tap}), searched on the GPU", gpu.len(), cfg.d, starts.len());
+        println!("memory: {} keys of {} floats from {n_train} train + {n_held} unscored held-out windows (tap = block {tap}), searched on the GPU", gpu.len(), cfg.d);
         Some(Rc::new(Store { gpu, found: RefCell::new((None, vec![])) }))
     } else {
         None
@@ -329,7 +469,8 @@ fn main() {
     let need_hidden = tiers.iter().flatten().any(|t| t.needs_hidden());
     let (mut ce_model, mut ce_device) = (0.0f64, 0.0f64);
     let mut ce_tier = vec![0.0f64; tiers.len()];
-    let starts: Vec<usize> = (offset * SEQ_LEN..held_out.len() - SEQ_LEN).step_by(SEQ_LEN * stride).collect();
+    let n_win = (held_out.len() - 1) / SEQ_LEN;
+    let starts: Vec<usize> = (offset * SEQ_LEN..held_out.len() - SEQ_LEN).step_by(SEQ_LEN * stride).filter(|s| s / SEQ_LEN * part_n / n_win == part_i).collect();
     for (ci, chunk) in starts.chunks(CHUNK).enumerate() {
         let f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden);
         let rows = f.ids.len();
@@ -355,7 +496,7 @@ fn main() {
     }
     let n = (starts.len() * SEQ_LEN) as f64;
     let (ce_model, ce_device) = (ce_model / n, ce_device / n);
-    println!("checkpoint {ckpt}: {} windows (stride {stride}, offset {offset}), {} positions; tap = block {tap}", starts.len(), n as usize);
+    println!("checkpoint {ckpt}: {} windows (stride {stride}, offset {offset}, part {part_i}/{part_n}), {} positions; tap = block {tap}", starts.len(), n as usize);
     println!("model alone: CE {ce_model:.4} (device row losses {ce_device:.4})");
     assert!((ce_model - ce_device).abs() < 1e-4, "gate 0: CE from logits {ce_model:.5} vs device row losses {ce_device:.5}");
     if let Some(expect) = opt.get("expect") {

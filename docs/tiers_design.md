@@ -1,7 +1,7 @@
 # Tiered AI: first cross-tier experiments
 
 Direction and tier map: README, "Direction: tiered AI". Related work: README, "Tiered and neuro-symbolic
-architectures". Status: step 0 and Experiment A built and measured (2026-10-02); Experiments A and B measured; Experiment B on the full held-out split.
+architectures". Status: step 0 and Experiment A built and measured (2026-10-02); Experiments A and B and a second CPU tier (word bigram) measured on the full held-out split.
 
 ## What exists and what does not
 
@@ -124,6 +124,56 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   prediction, not only because nearby text is similar. Not separated: how much of the gain is the same
   train-text continuation the model already fit (train-probe 1.1172 vs held-out 1.2408), which a datastore
   built from data the model never trained on would answer.
+
+- **Second CPU tier: word statistics (`words:<order>:<lambda>`; `runs/tier_words.log`, full held-out).** Inside a word,
+  the train words extending the current prefix give a next-letter / end-of-word distribution (order 1: the words that
+  followed the previous word, backing off to all words by frequency). Order 0 (unigram frequency) is no better than the
+  lexicon (best -0.0063 at lambda 0.1; lambda 0.3 hurts). **Order 1 (word bigram): -0.0158 at lambda 0.25-0.3**
+  (1.2250), 2.6x the lexicon; its bigram list applied at 259061 of the 360476 in-word positions. A 1.4%-of-tokens OOV
+  rate and the model already knowing spelling limit the lexicon; context (the previous word) is what the model's
+  CPU-side counterpart adds.
+- **Memory contents: unseen vs trained-on, and same document vs other documents** (`runs/tier_unseen16.log`,
+  `runs/tier_parts.log`; k = 128, best of a small lambda/temp grid; scored on a subsample, so compare rows within a block):
+
+  | Memory | keys | gain (stride 16, all books; model 1.2565) |
+  |---|---|---|
+  | train windows, equal size | 472k | -0.0077 |
+  | held-out windows not scored (same books, unseen by the model) | 472k | **-0.0366** |
+  | both | 945k | -0.0364 |
+  | all train windows | 4.53M | -0.0265 |
+
+  | Memory (scored: first half of the held-out text, model 1.2140) | keys | gain |
+  |---|---|---|
+  | held-out of the **other** books (unseen, different documents) | 220k | **worse, +0.0057 at best** (all 6 settings hurt) |
+  | held-out of the **same** books (unseen, adjacent) | 220k | **-0.0355** |
+  | train, equal size | 230k | -0.0036 |
+  | all train windows | 4.53M | -0.0268 |
+
+  So the memory's gain is **document-specific retrieval**: recent text of the same book (names, scenes, phrasing)
+  helps a lot, even in small amounts, and more than 10x as much train text from the earlier 90% of those books; text of
+  other books hurts. "Unseen by the model" is not what matters; "from the same document" is. Caveats: the held-out
+  memory here includes text *after* the scored window as well as before it, which a streaming system would not have, so
+  the -0.036 is an upper bound on a causal (past-only) in-document memory, not a deployable number; and the
+  neighbouring windows share rare words and names with the scored ones.
+- **k = 256 and a disjoint split (`runs/tier_o8_final.log`; tuned on offset 0, tested on offset 8; model 1.2524 on
+  offset 8).** knn k=128 -0.0315, **k=256 -0.0324**; words:1:0.25 -0.0150; words+knn256 -0.0368;
+  **lexicon+words+knn256 -0.0381**. Tuning-split numbers were smaller (k=128: -0.0265, k=256: -0.0276), so there is
+  no tuning bias, and k's gain is flattening (128 to 256: +0.0009 to +0.0011).
+- **Full held-out split, all tiers** (`scripts/tier_full2.sh`, `runs/tier_full2.log`; Gate 0 passed at 1.2408; 4.53M keys):
+
+  | Tier | CE | vs model |
+  |---|---|---|
+  | words:1:0.25 | 1.2247 | -0.0161 |
+  | lexicon:0.3 + words:1:0.25 | 1.2225 | -0.0184 |
+  | knn:256:0.4:25 | 1.2118 | -0.0291 |
+  | words:1:0.25 + knn:256:0.4:25 | 1.2066 | -0.0342 |
+  | lexicon:0.3 + words:1:0.25 + knn:256:0.4:25 | **1.2053** | **-0.0356** |
+
+  The three tiers largely add (-0.0184 and -0.0291 alone-ish, -0.0356 together). The model plus tiers is 0.151 nats
+  under the 7-gram (1.3567).
+- **Engineering note:** a `KMAX` = 256 top-k launch over a whole 16384-key tile lost the device (OS GPU watchdog; the
+  `Failed to map buffer` / `Parent device is lost` panics). The kernel now takes 1024-key slices per launch; the
+  unit test is unchanged.
 
 ## Order
 

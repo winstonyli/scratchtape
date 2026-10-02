@@ -11,10 +11,13 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 /// Neighbours kept per query.
-pub const KMAX: usize = 128;
+pub const KMAX: usize = 256;
 const KM: u32 = KMAX as u32;
 /// Queries per block (bounds the [tile, block] distance buffer).
 const QBLOCK: usize = 2048;
+/// Keys per top-k launch: one launch must stay short (a long one trips the OS's GPU watchdog; with KMAX = 256 a
+/// whole 16384-key tile lost the device).
+const SLICE: usize = 1024;
 
 struct Tile {
     keys: Handle,
@@ -83,19 +86,12 @@ impl KnnStore {
             for t in &self.tiles {
                 let (a, b, o) = (MatRef::new(&t.keys), MatRef { trans: true, ..MatRef::new(&qh) }, MatRef::new(&dist));
                 matmul(a, b, o, 1, t.len, self.d, q, Epilogue::default());
-                super::count_launch();
-                k_topk::launch(
-                    client(),
-                    cubes(q),
-                    CubeDim::new_1d(EW_DIM),
-                    buf(&dist, self.tile * q),
-                    buf(&t.norms, t.len),
-                    buf(&t.vals, t.len),
-                    buf(&best_d, q * KMAX),
-                    buf(&best_v, q * KMAX),
-                    q as u32,
-                    t.len as u32,
-                );
+                for j0 in (0..t.len).step_by(SLICE) {
+                    super::count_launch();
+                    let n = SLICE.min(t.len - j0);
+                    #[rustfmt::skip]
+                    k_topk::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * q), buf(&t.norms, t.len), buf(&t.vals, t.len), buf(&best_d, q * KMAX), buf(&best_v, q * KMAX), q as u32, j0 as u32, n as u32);
+                }
             }
             let (bd, bv) = (read(&best_d), read(&best_v));
             for r in 0..q {
@@ -110,15 +106,16 @@ impl KnnStore {
 }
 
 /// Merges one tile into each query's running top list (`best_*`, ascending, `KM` per query). `d` is the
-/// tile's transposed matmul output: d[j * q + qi] = q·key_j.
+/// tile's transposed matmul output: d[j * q + qi] = q·key_j; this launch covers keys j0..j0 + len.
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
-fn k_topk(d: &[f32], norms: &[f32], vals: &[f32], best_d: &mut [f32], best_v: &mut [f32], q: u32, t: u32) {
+fn k_topk(d: &[f32], norms: &[f32], vals: &[f32], best_d: &mut [f32], best_v: &mut [f32], q: u32, j0: u32, len: u32) {
     let qi = ABSOLUTE_POS as u32;
     if qi < q {
         let base = qi * KM;
         let mut worst = best_d[(base + KM - 1) as usize];
-        for j in 0..t {
+        for jj in 0..len {
+            let j = j0 + jj;
             let dist = norms[j as usize] - 2.0 * d[(j * q + qi) as usize];
             if dist < worst {
                 // Insert at the rank of `dist` (the number of kept entries not above it), shifting the tail down.
@@ -166,7 +163,11 @@ mod tests {
             for j in 0..KMAX {
                 let g = got[r * KMAX + j];
                 assert!((g.0 - all[j].0).abs() < 1e-3 * (1.0 + all[j].0), "query {r} rank {j}: gpu {} vs cpu {}", g.0, all[j].0);
-                assert_eq!(g.1, all[j].1, "query {r} rank {j}");
+                // Values can differ only between near-tied distances (float rounding reorders those).
+                let gap = |a: usize, b: usize| (all[a].0 - all[b].0).abs() > 1e-3 * (1.0 + all[a].0);
+                if (j == 0 || gap(j, j - 1)) && (j + 1 == n || gap(j, j + 1)) {
+                    assert_eq!(g.1, all[j].1, "query {r} rank {j}");
+                }
             }
         }
     }
