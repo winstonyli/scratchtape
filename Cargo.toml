@@ -106,6 +106,10 @@ name = "fused_models_check"
 path = "examples/tiny_lm/fused_models_check.rs"
 
 [[example]]
+name = "tier_eval"
+path = "examples/tiny_lm/tier_eval.rs"
+
+[[example]]
 name = "step_profile"
 path = "examples/tiny_lm/step_profile.rs"
 

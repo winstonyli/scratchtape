@@ -1,7 +1,7 @@
 # Tiered AI: first cross-tier experiments
 
 Direction and tier map: README, "Direction: tiered AI". Related work: README, "Tiered and neuro-symbolic
-architectures". Status: design, 2026-10-02; nothing here is built or measured yet.
+architectures". Status: step 0 and Experiment A built and measured (2026-10-02); Experiment B not built.
 
 ## What exists and what does not
 
@@ -52,6 +52,28 @@ keys, form a distribution over their next bytes (softmax of negative distance), 
 - Honest risks: the datastore comes from the training split, which the model has fit (train-probe 1.1172 vs
   held-out 1.2408), so its keys are overfit; the published gains were on models trained once on far more data.
   A negative result is a real result and gets recorded.
+
+## Results so far (2026-10-02)
+
+`examples/tiny_lm/tier_eval.rs` (plug-and-play: a `Tier` trait, specs `tier=<part>+<part>`, `tap=<block>`
+selects the hidden state tiers receive). User decision: the word lexicon is a reasonable first CPU tier and the
+final residual stream a reasonable first working-memory tap, but both stay swappable.
+
+```
+tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
+```
+
+- **Gate 0 passed:** CE from the logits 1.2408 = the device's row losses = the recorded number; lexicon with
+  eps = 1 (no masking) reproduces it exactly (+0.0000).
+- **Experiment A (lexicon, 28728 train-split words; the whole run takes ~20 s):** held-out CE by eps
+  (model alone 1.2408): 0.005 1.2420, 0.02 1.2389, 0.05 1.2369, 0.1 1.2357, 0.15 1.2351, 0.2 1.2348,
+  **0.3 1.2347**, 0.5 1.2354. Best **-0.0061** nats/byte.
+- The tier constrains 360476 of 503808 positions (those inside a word after a boundary). The model's top-1 byte
+  is rejected at only 1676 of them (0.5%), and the next-best allowed byte is then right 1065 times (64%).
+- Reading: the model already spells almost everything, so a train-split lexicon adds little; the high optimal eps
+  (0.3) means a lot of held-out words are outside the lexicon (names in the held-out tails), not that the mask
+  is wrong. Not measured: the held-out out-of-vocabulary rate, and a lexicon that also scores word frequency or
+  context (a bigram tier) rather than only masking.
 
 ## Order
 
