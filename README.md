@@ -1119,7 +1119,9 @@ because raw forgetting deltas hid a floor effect.
   7-gram), with gains shrinking to ~0.005 per extra 1M.
   Lowering dropout from 0.3 to 0.1 (carried over from the small-data
   rounds) gives 1.2578 at 4M windows, better than 0.3 at 8M.
-  See docs/gpu_step_design.md, rounds 11–15.
+  A dropout sweep at 4M windows puts the optimum at 0.1 (0.05 is within
+  noise, 0.0 overfits).
+  See docs/gpu_step_design.md, rounds 11–16.
 
 - **Replay + Fisher consolidation together** — humble-cortex found them
   synergistic. Here each was only tried alone, and Fisher's new-task cost

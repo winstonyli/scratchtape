@@ -1110,8 +1110,27 @@ Next, in order:
    `scripts/local_sgd_driver14.sh`, runs `nov_big_k1_d0_4m` (pid 22772,
    started 18:14) then `nov_big_k1_d0.05_4m`, Normal priority, logs
    `runs/<name>.log` and `runs/local_sgd_driver14.log`, ~35 min each
-   (~70 min total). Resumable. Not yet run: a larger model at K = 1
-   (d = 384), to follow the sweep.
+   (~70 min total). Resumable.
+   **Result (finished 19:14): dropout 0.1 is the optimum at 4M windows;
+   0.05 is within noise of it, 0.0 overfits.** Held-out CE (K = 1, big):
+
+   | dropout | 1M | 2M | 3M | 4M | train-probe | gap |
+   |---|---|---|---|---|---|---|
+   | 0.0 | 1.3146 | 1.2988 | 1.2978 | 1.2961 | 1.1112 | 0.185 |
+   | 0.05 | 1.3184 | 1.2791 | 1.2668 | 1.2588 | 1.1323 | 0.127 |
+   | 0.1 | 1.3349 | 1.2870 | 1.2684 | 1.2578 | 1.1526 | 0.105 |
+   | 0.3 | 1.4246 | 1.3404 | 1.3085 | 1.2929 | 1.2096 | 0.083 |
+
+   0.05 vs 0.1 differ by 0.001 (one seed, not separable); 0.0 stalls
+   after 2M windows. Dropout 0.1 is the novels6 default from here. The
+   best value may shift with window count (not run).
+
+   **Round 16 (2026-10-01): d = 384** (8 heads, d_ff 768, 4 blocks), K = 1,
+   dropout 0.1, lr 0.05 (not retuned), 4M windows; control is d = 256 at
+   1.2578. `scripts/local_sgd_driver15.sh`, run `nov_d384_k1_4m`, pid
+   26428 (Normal), started 19:49, log `runs/nov_d384_k1_4m.log` and
+   `runs/local_sgd_driver15.log`, ~19 ms/step × 128000 ≈ 41 min.
+   Resumable. Not yet run: dropout 0.1 at 8M windows.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
