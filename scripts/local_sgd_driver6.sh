@@ -1,5 +1,5 @@
 #!/bin/bash
-# Round 7 (docs/gpu_step_design.md): (1) the d=256 model with a shorter run / more dropout, averaged + alpha 0.1,
+# Round 7 (docs/fusion_results.md): (1) the d=256 model with a shorter run / more dropout, averaged + alpha 0.1,
 # lr 0.05; (2) K = 8 as two groups of 4, averaged within each group, ensembled across groups. Sequential.
 cd "$(dirname "$0")/.."
 F=target/release/examples/fused_models_check.exe

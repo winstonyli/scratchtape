@@ -1,5 +1,5 @@
 #!/bin/bash
-# Round 4 (docs/gpu_step_design.md): seed repeats of averaging + alpha 0.1, a small DiLoCo outer-step
+# Round 4 (docs/fusion_results.md): seed repeats of averaging + alpha 0.1, a small DiLoCo outer-step
 # sweep, alpha 0.05 / 0.2 with averaging, and K = 2 / 8 with averaging + alpha 0.1. Sequential.
 cd "$(dirname "$0")/.."
 F=target/release/examples/fused_models_check.exe

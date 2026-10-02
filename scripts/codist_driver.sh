@@ -1,5 +1,5 @@
 #!/bin/bash
-# Codistillation experiment (docs/gpu_step_design.md, "Next" step 2). Arms run one after another.
+# Codistillation experiment (docs/fusion_results.md, "Next" step 2). Arms run one after another.
 cd "$(dirname "$0")/.."
 F=target/release/examples/fused_models_check.exe
 T=target/release/examples/training_recipe_check.exe

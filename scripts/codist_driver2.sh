@@ -1,5 +1,5 @@
 #!/bin/bash
-# Codistillation follow-up (docs/gpu_step_design.md): train-probe for the alpha=0 baseline,
+# Codistillation follow-up (docs/fusion_results.md): train-probe for the alpha=0 baseline,
 # a weaker constant alpha, and alpha ramped up from 0. Arms run one after another.
 cd "$(dirname "$0")/.."
 F=target/release/examples/fused_models_check.exe

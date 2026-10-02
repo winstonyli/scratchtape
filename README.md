@@ -632,7 +632,7 @@ model of the earlier recipe. Without α: 1.651; a single model with the
 same data per step (batch 128): 1.755. Costs 3.4 ms/step per model, all
 four in 13.5 ms. Sync period H = 10 / 30 / 100 gave 1.634 / 1.621 / 1.610
 (seed 1 for the first two). Experiments and caveats in
-`docs/gpu_step_design.md`, "Horizontal fusion and codistillation".
+`docs/fusion_results.md`.
 It does not transfer cleanly to a small corpus: on `sherlock_holmes`
 (54 KB train, 93 held-out windows) at 256k windows the recipe overfits
 (single model: best 1.85 mid-run, final 2.04). Final held-out there:
@@ -1070,7 +1070,7 @@ it means here.
   with 4× the steps reached 1.7175. Follow-ups: α = 0.1 is the one
   setting that helps per model (1.650 vs 1.686) at a small ensemble cost
   (1.558), and ramping α changes nothing. Details and caveats in
-  `docs/gpu_step_design.md`.
+  `docs/fusion_results.md`.
 - Douillard et al. 2023, *DiLoCo* ([arXiv 2311.08105](https://arxiv.org/abs/2311.08105)):
   replicas from one init train locally and periodically average weights.
   Tried in its simplest form (plain mean of the K models every H steps,
@@ -1123,7 +1123,7 @@ because raw forgetting deltas hid a floor effect.
   noise, 0.0 overfits).
   Widening to d = 384 gives 1.2457 at 4M windows (0.012 better, ~1.9×
   the step cost).
-  See docs/gpu_step_design.md, rounds 11–16.
+  See docs/fusion_results.md, rounds 11–16.
 
 - **Replay + Fisher consolidation together** — humble-cortex found them
   synergistic. Here each was only tried alone, and Fisher's new-task cost

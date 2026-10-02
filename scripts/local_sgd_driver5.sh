@@ -1,5 +1,5 @@
 #!/bin/bash
-# Round 6 (docs/gpu_step_design.md): (A) sherlock at shorter runs, (B) a final lr decay on aesop,
+# Round 6 (docs/fusion_results.md): (A) sherlock at shorter runs, (B) a final lr decay on aesop,
 # (C) a larger model (d 256, d_ff 512; lr 0.48 diverges, so lr 0.05 / 0.1). Sequential.
 cd "$(dirname "$0")/.."
 F=target/release/examples/fused_models_check.exe

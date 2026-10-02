@@ -1,5 +1,5 @@
 #!/bin/bash
-# Round 5 (docs/gpu_step_design.md): does averaging + alpha 0.1 carry to another corpus (sherlock_holmes,
+# Round 5 (docs/fusion_results.md): does averaging + alpha 0.1 carry to another corpus (sherlock_holmes,
 # 256000 windows: ~same passes over its 54 KB as 1M over aesop's 214 KB), and shorter sync periods on aesop.
 cd "$(dirname "$0")/.."
 F=target/release/examples/fused_models_check.exe

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Fetches the six novels of the `novels6` corpus (docs/gpu_step_design.md, round 11) from Project Gutenberg
+# Fetches the six novels of the `novels6` corpus (docs/fusion_results.md, round 11) from Project Gutenberg
 # into data/gutenberg/ (gitignored), stripping the licence header and footer. Public domain in the US.
 set -e
 cd "$(dirname "$0")/.."

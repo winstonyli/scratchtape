@@ -1,5 +1,5 @@
 #!/bin/bash
-# Local-SGD arms (docs/gpu_step_design.md, "Later: weight averaging"): K = 4 from one shared init,
+# Local-SGD arms (docs/fusion_results.md, "Later: weight averaging"): K = 4 from one shared init,
 # averaged every H steps. Waits for the pid in $1 (the codistillation follow-up driver) to exit,
 # then rebuilds the example, so the running binary isn't replaced under it.
 cd "$(dirname "$0")/.."

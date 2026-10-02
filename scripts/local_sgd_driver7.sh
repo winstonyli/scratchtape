@@ -1,5 +1,5 @@
 #!/bin/bash
-# Round 8 (docs/gpu_step_design.md): the recipe on all four bundled books (373 KB train; held-out is the
+# Round 8 (docs/fusion_results.md): the recipe on all four bundled books (373 KB train; held-out is the
 # last 10% of each book). Resumable: relaunch the script and each run continues from runs/<name>.resume
 # (a finished run's .ckpt is not rechecked, so delete it to rerun). Sequential.
 cd "$(dirname "$0")/.."

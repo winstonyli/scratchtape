@@ -1,5 +1,5 @@
 #!/bin/bash
-# Follow-ups to local_sgd_driver.sh (docs/gpu_step_design.md): seed repeats of the H=100 averaged arm and
+# Follow-ups to local_sgd_driver.sh (docs/fusion_results.md): seed repeats of the H=100 averaged arm and
 # of the single batch-128 baseline, DiLoCo's outer optimizer, and averaging plus alpha 0.1. Sequential.
 cd "$(dirname "$0")/.."
 F=target/release/examples/fused_models_check.exe

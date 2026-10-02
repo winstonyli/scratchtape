@@ -1,5 +1,5 @@
 #!/bin/bash
-# Round 12 (docs/gpu_step_design.md): does averaging help the big model once data is plentiful?
+# Round 12 (docs/fusion_results.md): does averaging help the big model once data is plentiful?
 # big K = 1 at 4M windows on novels6, the control for nov_big_k4_h100_a0.1_4m.
 cd "$(dirname "$0")/.."
 . scripts/lib_runs.sh

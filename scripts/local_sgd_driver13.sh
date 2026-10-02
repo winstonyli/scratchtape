@@ -1,5 +1,5 @@
 #!/bin/bash
-# Round 14 (docs/gpu_step_design.md): big K = 1 at 4M windows on novels6 with dropout 0.1 instead of 0.3
+# Round 14 (docs/fusion_results.md): big K = 1 at 4M windows on novels6 with dropout 0.1 instead of 0.3
 # (control: nov_big_k1_4m, 1.2929).
 cd "$(dirname "$0")/.."
 . scripts/lib_runs.sh

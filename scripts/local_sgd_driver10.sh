@@ -1,5 +1,5 @@
 #!/bin/bash
-# Round 11 (docs/gpu_step_design.md): the recipe on `novels6` (6 Gutenberg novels, 4.5 MB train; run
+# Round 11 (docs/fusion_results.md): the recipe on `novels6` (6 Gutenberg novels, 4.5 MB train; run
 # scripts/fetch_gutenberg.sh first). Waits for the pid in $1, rebuilds, then runs resumably, in priority order.
 cd "$(dirname "$0")/.."
 . scripts/lib_runs.sh
