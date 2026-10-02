@@ -1078,7 +1078,19 @@ Next, in order:
    flatten?). `scripts/local_sgd_driver12.sh`, run `nov_big_k1_8m`, pid
    37188 (Normal), started 15:42, log `runs/nov_big_k1_8m.log` and
    `runs/local_sgd_driver12.log`, ~10 ms/step × 256000 steps ≈ 45 min.
-   Resumable. Not yet run: a larger or lower-dropout model at K = 1.
+   Resumable.
+   **Result (finished 16:52, 70 min): 1.2622 at 8M windows**, 0.095 below
+   the 7-gram; train-probe 1.1730 (gap 0.089). Per extra 1M windows the
+   gain shrinks but does not vanish: 4M 1.2929, 5M 1.2808, 6M 1.2740,
+   7M 1.2670, 8M 1.2622 (−0.012, −0.007, −0.007, −0.005). Reading
+   (untested): still data/training-limited rather than capacity-limited.
+
+   **Round 14 (2026-10-01): dropout 0.1 vs 0.3**, big K = 1 at 4M windows
+   (control `nov_big_k1_4m`, 1.2929; tests whether regularization is now
+   too strong). `scripts/local_sgd_driver13.sh`, run
+   `nov_big_k1_d0.1_4m`, pid 26248 (Normal), started 17:12, log
+   `runs/nov_big_k1_d0.1_4m.log` and `runs/local_sgd_driver13.log`,
+   ~35 min. Resumable. Not yet run: a larger model at K = 1.
    **Later: weight averaging.** Periodically average replicas that share
    an init (local SGD; DiLoCo, arXiv 2311.08105).
 
