@@ -14,6 +14,19 @@ message narrates what was tried, what was measured, and what the result
 actually was — including the negative ones. `git log` reads like a lab
 notebook; this README is the map, not a replacement for it.
 
+## Direction: tiered AI
+
+The project's driving goal is a tiered memory architecture for pushing
+model capability: tier 1 the live weights (kept device-resident, which is
+why `gpu_step/` exists), tier 2 a bounded replay buffer, tier 3 disk
+checkpoints of weights plus buffer (resumable across processes), and a
+slow consolidation tier (Fisher/EWC tried; CLS-ER-style fast/slow copies
+untried). Experiments are chosen by what they say about the tiers: the
+averaged-weights recipe is a candidate slow tier, and the `novels6`
+corpus (six novels as phases) is the real-scale test of the memory-tier
+results, which so far are toy-scale or Aesop-quarters (see "Continual
+learning / memory tiers" below and `examples/memory_tiers/`).
+
 ## Quick start
 
 ```bash
