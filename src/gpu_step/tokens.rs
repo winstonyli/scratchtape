@@ -22,7 +22,21 @@ pub fn upload_ids(ids: &[usize]) -> Handle {
 pub fn embed(ids: &Handle, rows: usize, d: usize, t: usize, params: &Handle, tok_off: usize, pos_off: usize, m: Models) -> Handle {
     let y = client().empty(rows * d * 4);
     super::count_launch();
-    k_embed::launch(client(), cubes(rows * d), CubeDim::new_1d(EW_DIM), whole(ids), whole(params), whole(&y), rows as u32, d as u32, t as u32, tok_off as u32, pos_off as u32, (rows / m.k) as u32, m.stride as u32);
+    k_embed::launch(
+        client(),
+        cubes(rows * d),
+        CubeDim::new_1d(EW_DIM),
+        whole(ids),
+        whole(params),
+        whole(&y),
+        rows as u32,
+        d as u32,
+        t as u32,
+        tok_off as u32,
+        pos_off as u32,
+        (rows / m.k) as u32,
+        m.stride as u32,
+    );
     y
 }
 
@@ -35,7 +49,20 @@ pub fn embed_backward(dy: &Handle, ids: &Handle, rows: usize, d: usize, t: usize
     let c = client();
     let (rows_pm, stride) = ((rows / m.k) as u32, m.stride as u32);
     super::count_launch();
-    k_embed_bwd_tok::launch(c, cubes(m.k * vocab * d), CubeDim::new_1d(EW_DIM), whole(dy), whole(ids), whole(grads), rows_pm, d as u32, vocab as u32, tok_off as u32, m.k as u32, stride);
+    k_embed_bwd_tok::launch(
+        c,
+        cubes(m.k * vocab * d),
+        CubeDim::new_1d(EW_DIM),
+        whole(dy),
+        whole(ids),
+        whole(grads),
+        rows_pm,
+        d as u32,
+        vocab as u32,
+        tok_off as u32,
+        m.k as u32,
+        stride,
+    );
     super::count_launch();
     k_embed_bwd_pos::launch(c, cubes(m.k * t * d), CubeDim::new_1d(EW_DIM), whole(dy), whole(grads), rows_pm, d as u32, t as u32, pos_off as u32, m.k as u32, stride);
 }
@@ -78,7 +105,21 @@ pub fn cross_entropy_backward(logits: &Handle, targets: &Handle, fwd: &CeOut, ro
     assert!(distill == 0.0 || models > 1, "distillation needs peers");
     let dl = client().empty(rows * vocab * 4);
     super::count_launch();
-    k_ce_bwd::launch(client(), cubes(rows * vocab), CubeDim::new_1d(EW_DIM), whole(logits), whole(targets), whole(&fwd.lse), whole(&dl), rows as u32, vocab as u32, (rows / models) as u32, models as u32, distill, distill != 0.0);
+    k_ce_bwd::launch(
+        client(),
+        cubes(rows * vocab),
+        CubeDim::new_1d(EW_DIM),
+        whole(logits),
+        whole(targets),
+        whole(&fwd.lse),
+        whole(&dl),
+        rows as u32,
+        vocab as u32,
+        (rows / models) as u32,
+        models as u32,
+        distill,
+        distill != 0.0,
+    );
     dl
 }
 

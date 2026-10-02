@@ -84,15 +84,7 @@ fn main() {
     let pred = forward(&l1, &l2, &x_data);
     println!("\ninput -> pred (target)");
     for i in 0..4 {
-        println!(
-            "({:.0}, {:.0}) -> {:.4} ({:.0})",
-            x_data.data[i * 2],
-            x_data.data[i * 2 + 1],
-            pred.data[i],
-            y_data.data[i]
-        );
+        println!("({:.0}, {:.0}) -> {:.4} ({:.0})", x_data.data[i * 2], x_data.data[i * 2 + 1], pred.data[i], y_data.data[i]);
     }
-    println!(
-        "\ntotal forward evals: {forward_evals} (backprop: ~150-300 forward+backward pairs to solve the same task)"
-    );
+    println!("\ntotal forward evals: {forward_evals} (backprop: ~150-300 forward+backward pairs to solve the same task)");
 }

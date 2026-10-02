@@ -82,8 +82,7 @@ fn main() {
 
     // Control branch: continue training the snapshot on corpus B,
     // untouched - ordinary continual learning, no reinitialization.
-    let (mut c_token_emb, mut c_pos_emb, mut c_blocks, mut c_final_ln, mut c_output_proj) =
-        reconstruct(&snapshot, vocab_size, d_model, seq_len, n_blocks, n_heads, d_ff);
+    let (mut c_token_emb, mut c_pos_emb, mut c_blocks, mut c_final_ln, mut c_output_proj) = reconstruct(&snapshot, vocab_size, d_model, seq_len, n_blocks, n_heads, d_ff);
     println!("\nphase 2 (control): continuing on corpus B, block0 untouched");
     let mut phase2_rng = Rng::new(2);
     train(&mut phase2_rng, &mut c_token_emb, &mut c_pos_emb, &mut c_blocks, &mut c_final_ln, &mut c_output_proj, &corpus_b, seq_len, steps_per_phase, &opt);
@@ -96,8 +95,7 @@ fn main() {
     // into an existing circuit - then trains on the SAME corpus-B
     // sequence (same rng seed) for the same step count, so the only
     // difference from the control is the reinitialization event itself.
-    let (mut n_token_emb, mut n_pos_emb, mut n_blocks, mut n_final_ln, mut n_output_proj) =
-        reconstruct(&snapshot, vocab_size, d_model, seq_len, n_blocks, n_heads, d_ff);
+    let (mut n_token_emb, mut n_pos_emb, mut n_blocks, mut n_final_ln, mut n_output_proj) = reconstruct(&snapshot, vocab_size, d_model, seq_len, n_blocks, n_heads, d_ff);
     let mut neurogenesis_rng = Rng::new(777);
     n_blocks[0] = TransformerBlock::new(&mut neurogenesis_rng, d_model, n_heads, d_ff);
     println!("\nphase 2 (neurogenesis): continuing on corpus B, block0 reinitialized to fresh random weights first");
@@ -107,7 +105,11 @@ fn main() {
     let neuro_loss_b = eval_loss(&n_token_emb, &n_pos_emb, &n_blocks, &n_final_ln, &n_output_proj, &corpus_b, seq_len);
     println!("  neurogenesis: loss on A = {neuro_loss_a:.3}, loss on B = {neuro_loss_b:.3} ({:.1}s elapsed)", start_time.elapsed().as_secs_f32());
 
-    println!("\nforgetting of A (loss increase from {loss_a_after_phase1:.3}): control +{:.3}, neurogenesis +{:.3}", control_loss_a - loss_a_after_phase1, neuro_loss_a - loss_a_after_phase1);
+    println!(
+        "\nforgetting of A (loss increase from {loss_a_after_phase1:.3}): control +{:.3}, neurogenesis +{:.3}",
+        control_loss_a - loss_a_after_phase1,
+        neuro_loss_a - loss_a_after_phase1
+    );
     println!("learning B: control {control_loss_b:.3}, neurogenesis {neuro_loss_b:.3}");
     println!("\ntotal training time: {:.1}s", start_time.elapsed().as_secs_f32());
 }

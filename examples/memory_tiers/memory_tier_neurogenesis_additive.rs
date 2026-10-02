@@ -85,8 +85,7 @@ fn main() {
 
     // Control branch: continue training the 4-block snapshot on corpus
     // B, unchanged shape - ordinary continual learning.
-    let (mut c_token_emb, mut c_pos_emb, mut c_blocks, mut c_final_ln, mut c_output_proj) =
-        reconstruct(&snapshot, vocab_size, d_model, seq_len, n_blocks, n_heads, d_ff);
+    let (mut c_token_emb, mut c_pos_emb, mut c_blocks, mut c_final_ln, mut c_output_proj) = reconstruct(&snapshot, vocab_size, d_model, seq_len, n_blocks, n_heads, d_ff);
     println!("\nphase 2 (control): continuing on corpus B, still {n_blocks} blocks");
     let mut phase2_rng = Rng::new(2);
     train(&mut phase2_rng, &mut c_token_emb, &mut c_pos_emb, &mut c_blocks, &mut c_final_ln, &mut c_output_proj, &corpus_b, seq_len, steps_per_phase, &opt);
@@ -99,8 +98,7 @@ fn main() {
     // capacity, nothing erased. Trains on the SAME corpus-B sequence
     // (same rng seed) for the same step count, so the only difference
     // from the control is the presence of this new block.
-    let (mut n_token_emb, mut n_pos_emb, mut n_blocks, mut n_final_ln, mut n_output_proj) =
-        reconstruct(&snapshot, vocab_size, d_model, seq_len, n_blocks, n_heads, d_ff);
+    let (mut n_token_emb, mut n_pos_emb, mut n_blocks, mut n_final_ln, mut n_output_proj) = reconstruct(&snapshot, vocab_size, d_model, seq_len, n_blocks, n_heads, d_ff);
     let mut neurogenesis_rng = Rng::new(777);
     n_blocks.push(TransformerBlock::new(&mut neurogenesis_rng, d_model, n_heads, d_ff));
     println!("\nphase 2 (additive): continuing on corpus B, blocks 0-3 untouched, block4 appended fresh ({} blocks total)", n_blocks.len());

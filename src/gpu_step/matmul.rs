@@ -153,7 +153,19 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
     if let Some(partial) = &scratch {
         let len = m * n;
         super::count_launch_as(|| format!("split-k sum {batch}x{splits}x[{m}x{n}]"));
-        k_split_sum::launch(client(), CubeCount::Static(((batch * len) as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), whole(partial), whole(dest.h), u(len), u(splits), u(dest.off), u(dest.stride), u(batch), epi.accumulate);
+        k_split_sum::launch(
+            client(),
+            CubeCount::Static(((batch * len) as u32).div_ceil(256), 1, 1),
+            CubeDim::new_1d(256),
+            whole(partial),
+            whole(dest.h),
+            u(len),
+            u(splits),
+            u(dest.off),
+            u(dest.stride),
+            u(batch),
+            epi.accumulate,
+        );
     }
 }
 
@@ -369,7 +381,23 @@ mod tests {
 
     /// Plain-loop reference for one case, same argument meaning as `matmul`.
     #[allow(clippy::too_many_arguments)]
-    fn reference(a: &[f32], ar: (usize, usize, bool), b: &[f32], br: (usize, usize, bool), out: &mut [f32], or: (usize, usize), batch: usize, m: usize, k: usize, n: usize, bias: Option<(&[f32], usize)>, relu: bool, mask: Option<&[f32]>, res: Option<&[f32]>, accumulate: bool) {
+    fn reference(
+        a: &[f32],
+        ar: (usize, usize, bool),
+        b: &[f32],
+        br: (usize, usize, bool),
+        out: &mut [f32],
+        or: (usize, usize),
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        bias: Option<(&[f32], usize)>,
+        relu: bool,
+        mask: Option<&[f32]>,
+        res: Option<&[f32]>,
+        accumulate: bool,
+    ) {
         for z in 0..batch {
             for i in 0..m {
                 for j in 0..n {
@@ -427,12 +455,12 @@ mod tests {
             (3, 128, 512, 128, true, false, false, false, false, false, true),  // fused models' dW: 3 matrices, split 6 each
             (2, 70, 300, 20, true, false, false, false, false, false, false),   // batched split 4, ragged
             (1, 512, 256, 128, false, true, false, false, false, false, false), // dX (NT)
-            (64, 64, 16, 64, false, true, false, false, false, false, false),  // AttnScores
-            (64, 64, 64, 16, false, false, false, false, false, false, false), // AttnOut
-            (1, 512, 128, 256, false, false, true, true, false, false, false), // FFN1
-            (1, 512, 256, 128, false, false, true, false, false, true, false), // FFN2 + residual
-            (1, 512, 128, 256, false, true, false, false, true, false, false), // FFN1 dX, ReLU-masked
-            (2, 33, 17, 65, true, false, true, true, true, true, true),        // everything at once
+            (64, 64, 16, 64, false, true, false, false, false, false, false),   // AttnScores
+            (64, 64, 64, 16, false, false, false, false, false, false, false),  // AttnOut
+            (1, 512, 128, 256, false, false, true, true, false, false, false),  // FFN1
+            (1, 512, 256, 128, false, false, true, false, false, true, false),  // FFN2 + residual
+            (1, 512, 128, 256, false, true, false, false, true, false, false),  // FFN1 dX, ReLU-masked
+            (2, 33, 17, 65, true, false, true, true, true, true, true),         // everything at once
         ];
         for &(batch, m, k, n, ta, tb, has_bias, relu, has_mask, has_res, acc) in &cases {
             // Offsets and strides that aren't multiples of anything.
@@ -447,11 +475,43 @@ mod tests {
             let mask = gauss(m_off + batch * so); // about half positive
             let out0 = gauss(o_off + batch * so);
             let mut want = out0.clone();
-            reference(&a, (a_off, sa, ta), &b, (b_off, sb, tb), &mut want, (o_off, so), batch, m, k, n, has_bias.then_some((&bias[bias_off..], bias_stride)), relu, has_mask.then_some(&mask[m_off..]), has_res.then_some(&res[r_off..]), acc);
+            reference(
+                &a,
+                (a_off, sa, ta),
+                &b,
+                (b_off, sb, tb),
+                &mut want,
+                (o_off, so),
+                batch,
+                m,
+                k,
+                n,
+                has_bias.then_some((&bias[bias_off..], bias_stride)),
+                relu,
+                has_mask.then_some(&mask[m_off..]),
+                has_res.then_some(&res[r_off..]),
+                acc,
+            );
 
             let (ah, bh, bias_h, mask_h, res_h, oh) = (upload(&a), upload(&b), upload(&bias), upload(&mask), upload(&res), upload(&out0));
-            let epi = Epilogue { bias: has_bias.then_some((&bias_h, bias_off)), bias_stride, relu, mask: has_mask.then_some((&mask_h, m_off)), residual: has_res.then_some((&res_h, r_off)), accumulate: acc };
-            matmul(MatRef { off: a_off, stride: sa, trans: ta, ..MatRef::new(&ah) }, MatRef { off: b_off, stride: sb, trans: tb, ..MatRef::new(&bh) }, MatRef { off: o_off, stride: so, trans: false, ..MatRef::new(&oh) }, batch, m, k, n, epi);
+            let epi = Epilogue {
+                bias: has_bias.then_some((&bias_h, bias_off)),
+                bias_stride,
+                relu,
+                mask: has_mask.then_some((&mask_h, m_off)),
+                residual: has_res.then_some((&res_h, r_off)),
+                accumulate: acc,
+            };
+            matmul(
+                MatRef { off: a_off, stride: sa, trans: ta, ..MatRef::new(&ah) },
+                MatRef { off: b_off, stride: sb, trans: tb, ..MatRef::new(&bh) },
+                MatRef { off: o_off, stride: so, trans: false, ..MatRef::new(&oh) },
+                batch,
+                m,
+                k,
+                n,
+                epi,
+            );
             let got = read(&oh);
             let scale = want.iter().fold(0.0f32, |s, v| s.max(v.abs()));
             let err = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
@@ -493,7 +553,16 @@ mod tests {
             }
         }
         let sh = client().empty(want.len() * 4);
-        matmul(MatRef::heads(&qh, 0, fused, t, heads, w), MatRef { trans: true, ..MatRef::heads(&qh, hw, fused, t, heads, w) }, MatRef { stride: t * t, ..MatRef::new(&sh) }, batch, t, w, t, Epilogue::default());
+        matmul(
+            MatRef::heads(&qh, 0, fused, t, heads, w),
+            MatRef { trans: true, ..MatRef::heads(&qh, hw, fused, t, heads, w) },
+            MatRef { stride: t * t, ..MatRef::new(&sh) },
+            batch,
+            t,
+            w,
+            t,
+            Epilogue::default(),
+        );
         let e = err(&read(&sh), &want);
         assert!(e < 1e-5, "scores: {e}");
 
@@ -506,7 +575,16 @@ mod tests {
             }
         }
         let ch = upload(&ctx0);
-        matmul(MatRef { stride: t * t, ..MatRef::new(&ph) }, MatRef::heads(&qh, 2 * hw, fused, t, heads, w), MatRef::heads(&ch, 0, hw, t, heads, w), batch, t, t, w, Epilogue { accumulate: true, ..Default::default() });
+        matmul(
+            MatRef { stride: t * t, ..MatRef::new(&ph) },
+            MatRef::heads(&qh, 2 * hw, fused, t, heads, w),
+            MatRef::heads(&ch, 0, hw, t, heads, w),
+            batch,
+            t,
+            t,
+            w,
+            Epilogue { accumulate: true, ..Default::default() },
+        );
         let e = err(&read(&ch), &want);
         assert!(e < 1e-5, "ctx: {e}");
 
@@ -519,7 +597,16 @@ mod tests {
             }
         }
         let gh = upload(&qkv);
-        matmul(MatRef { stride: t * t, trans: true, ..MatRef::new(&ph) }, MatRef::heads(&dh, 0, hw, t, heads, w), MatRef::heads(&gh, 2 * hw, fused, t, heads, w), batch, t, t, w, Epilogue { accumulate: true, ..Default::default() });
+        matmul(
+            MatRef { stride: t * t, trans: true, ..MatRef::new(&ph) },
+            MatRef::heads(&dh, 0, hw, t, heads, w),
+            MatRef::heads(&gh, 2 * hw, fused, t, heads, w),
+            batch,
+            t,
+            t,
+            w,
+            Epilogue { accumulate: true, ..Default::default() },
+        );
         let e = err(&read(&gh), &want);
         assert!(e < 1e-5, "dV: {e}");
     }

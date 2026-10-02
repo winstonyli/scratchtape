@@ -79,9 +79,5 @@ fn main() {
         println!("  {name}: {d_replay:.4} | {d_noreplay:.4} | {ratio:.3}");
     }
     let overall_ratio = if total_noreplay == 0.0 { 0.0 } else { total_replay.sqrt() / total_noreplay.sqrt() };
-    println!(
-        "  overall (all params): {:.4} | {:.4} | {overall_ratio:.3}",
-        total_replay.sqrt(),
-        total_noreplay.sqrt()
-    );
+    println!("  overall (all params): {:.4} | {:.4} | {overall_ratio:.3}", total_replay.sqrt(), total_noreplay.sqrt());
 }

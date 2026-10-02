@@ -197,7 +197,6 @@ impl DeviceParams {
     pub fn read(&self, h: &Handle) -> Vec<f32> {
         f32::from_bytes(&client().read_one(h.clone()).unwrap())[..self.len].to_vec()
     }
-
 }
 
 /// The first f32 of a buffer, blocking: a training step's one readback

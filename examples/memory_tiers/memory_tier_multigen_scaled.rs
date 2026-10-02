@@ -74,11 +74,7 @@ fn main() {
         })
         .collect();
     let labels = ["A", "B", "C", "D"];
-    println!(
-        "corpus: {} bytes total, split into 4 phases of {} bytes each (last phase gets the remainder)",
-        full_encoded.len(),
-        quarter
-    );
+    println!("corpus: {} bytes total, split into 4 phases of {} bytes each (last phase gets the remainder)", full_encoded.len(), quarter);
 
     // Same architecture tiny_lm_corpus.rs's whole KR&R investigation was
     // built on - the "real scale" this experiment is testing against,
@@ -97,8 +93,7 @@ fn main() {
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);
     let mut pos_emb = Embedding::new(&mut rng, seq_len, d_model);
-    let mut blocks: Vec<TransformerBlock> =
-        (0..n_blocks).map(|_| TransformerBlock::new(&mut rng, d_model, n_heads, d_ff)).collect();
+    let mut blocks: Vec<TransformerBlock> = (0..n_blocks).map(|_| TransformerBlock::new(&mut rng, d_model, n_heads, d_ff)).collect();
     let mut final_ln = LayerNorm::new(d_model);
     let mut output_proj = Linear::new(&mut rng, d_model, vocab_size);
     let opt = Sgd { lr: 0.3 };
@@ -109,15 +104,8 @@ fn main() {
 
     for phase in 0..4 {
         let name = labels[phase];
-        println!(
-            "phase {phase} ({name}): training {steps_per_phase} steps, replay buffer = [{}] ({:.1}s elapsed)",
-            composition(&buffer),
-            start_time.elapsed().as_secs_f32()
-        );
-        train(
-            &mut rng, &mut token_emb, &mut pos_emb, &mut blocks, &mut final_ln, &mut output_proj,
-            &encoded[phase], seq_len, steps_per_phase, &opt, &buffer, replay_prob,
-        );
+        println!("phase {phase} ({name}): training {steps_per_phase} steps, replay buffer = [{}] ({:.1}s elapsed)", composition(&buffer), start_time.elapsed().as_secs_f32());
+        train(&mut rng, &mut token_emb, &mut pos_emb, &mut blocks, &mut final_ln, &mut output_proj, &encoded[phase], seq_len, steps_per_phase, &opt, &buffer, replay_prob);
         buffer = curate(buffer, name, &encoded[phase], seq_len, budget, &mut snapshot_rng);
 
         print!("  loss now on: ");

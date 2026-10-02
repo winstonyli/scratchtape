@@ -28,8 +28,7 @@ fn main() {
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, VOCAB_SIZE, D_MODEL);
     let mut pos_emb = Embedding::new(&mut rng, SEQ_LEN, D_MODEL);
-    let mut blocks: Vec<TransformerBlock> =
-        (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF)).collect();
+    let mut blocks: Vec<TransformerBlock> = (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF)).collect();
     let mut final_ln = LayerNorm::new(D_MODEL);
     let mut output_proj = Linear::new(&mut rng, D_MODEL, VOCAB_SIZE);
     let opt = Sgd { lr: 0.3 };

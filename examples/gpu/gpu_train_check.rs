@@ -255,4 +255,3 @@ fn main() {
     println!("step ms (best / median, steps 1..): cpu {cb:.1} / {cm:.1}, gpu {gb:.2} / {gm:.2}; speedup {:.1}x / {:.1}x", cb / gb, cm / gm);
     println!("gpu launches per step: {launches}");
 }
-

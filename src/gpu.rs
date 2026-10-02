@@ -48,9 +48,7 @@ async fn init_context() -> GpuContext {
     // default() picked the integrated Radeon 780M over the discrete RX 9060
     // XT - every GPU benchmark before this fix ran on the iGPU. The adapter
     // actually chosen is logged below so this can't go unnoticed again.
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })
-        .await;
+    let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }).await;
     // Preferred backend unavailable: retry across all backends rather than fail.
     let adapter = match adapter {
         Ok(a) => a,
@@ -61,15 +59,9 @@ async fn init_context() -> GpuContext {
     };
     let info = adapter.get_info();
     eprintln!("gpu: using {} ({:?}, {:?})", info.name, info.device_type, info.backend);
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor::default())
-        .await
-        .expect("gpu_matmul: failed to get GPU device");
+    let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.expect("gpu_matmul: failed to get GPU device");
 
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("matmul"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("matmul.wgsl").into()),
-    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("matmul"), source: wgpu::ShaderSource::Wgsl(include_str!("matmul.wgsl").into()) });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("matmul_pipeline"),
         layout: None,
@@ -119,16 +111,8 @@ pub fn gpu_matmul(a: &NdArray, b: &NdArray) -> NdArray {
     let out_size = (m * n * 4) as u64;
 
     use wgpu::util::DeviceExt;
-    let a_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("a"),
-        contents: &a_bytes,
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let b_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("b"),
-        contents: &b_bytes,
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let a_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("a"), contents: &a_bytes, usage: wgpu::BufferUsages::STORAGE });
+    let b_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("b"), contents: &b_bytes, usage: wgpu::BufferUsages::STORAGE });
     let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("out"),
         size: out_size,

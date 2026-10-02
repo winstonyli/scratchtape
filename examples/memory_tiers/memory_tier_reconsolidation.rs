@@ -45,7 +45,7 @@ use std::time::Instant;
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{apply_grad, curate, encode_bytes, forward, sample_window, ForwardOut};
+use common::{ForwardOut, apply_grad, curate, encode_bytes, forward, sample_window};
 
 /// Same six segments memory_tier_multigen_diverse_consolidate_fisher.rs
 /// scores - see that file's train_with_fisher for why blocks are one
@@ -175,9 +175,7 @@ fn main() {
         b_fresh_early.n(&segments[0]) + b_fresh_late.n(&segments[0]),
     );
 
-    println!(
-        "\nper-segment mean squared gradient - phase1-A-baseline (last {baseline_window} steps) | A-replay early | A-replay late | B-fresh early | B-fresh late:"
-    );
+    println!("\nper-segment mean squared gradient - phase1-A-baseline (last {baseline_window} steps) | A-replay early | A-replay late | B-fresh early | B-fresh late:");
     for seg in segments {
         println!(
             "  {seg}: {:.3e} | {:.3e} | {:.3e} | {:.3e} | {:.3e}",

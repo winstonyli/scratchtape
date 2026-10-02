@@ -223,19 +223,28 @@ fn main() {
     // varying at every branch) so there's no clean structural symmetry
     // for a wrong bridge hypothesis to hide behind.
     let parent_edges: Vec<(usize, usize)> = [
-        ("alice", "eve"), ("alice", "frank"), ("alice", "grace"),
-        ("bob", "heidi"), ("bob", "ivan"),
+        ("alice", "eve"),
+        ("alice", "frank"),
+        ("alice", "grace"),
+        ("bob", "heidi"),
+        ("bob", "ivan"),
         ("carol", "judy"),
-        ("dave", "karl"), ("dave", "liam"), ("dave", "mia"),
-        ("eve", "nina"), ("eve", "oscar"),
+        ("dave", "karl"),
+        ("dave", "liam"),
+        ("dave", "mia"),
+        ("eve", "nina"),
+        ("eve", "oscar"),
         ("frank", "paul"),
         ("grace", "quinn"),
-        ("heidi", "rose"), ("heidi", "sam"),
+        ("heidi", "rose"),
+        ("heidi", "sam"),
         ("ivan", "tara"),
-        ("judy", "uma"), ("judy", "vince"),
+        ("judy", "uma"),
+        ("judy", "vince"),
         ("karl", "wendy"),
         ("liam", "xander"),
-        ("mia", "yara"), ("mia", "zack"),
+        ("mia", "yara"),
+        ("mia", "zack"),
     ]
     .iter()
     .map(|&(p, c)| (idx(p), idx(c)))

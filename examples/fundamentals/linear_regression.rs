@@ -49,12 +49,7 @@ fn main() {
         opt.step(&mut b, &b_grad);
 
         if epoch % 20 == 0 {
-            println!(
-                "epoch {epoch:>3}: loss = {:.6}, w = {:.4}, b = {:.4}",
-                tape.value(loss).data[0],
-                w.data[0],
-                b.data[0]
-            );
+            println!("epoch {epoch:>3}: loss = {:.6}, w = {:.4}, b = {:.4}", tape.value(loss).data[0], w.data[0], b.data[0]);
         }
     }
 

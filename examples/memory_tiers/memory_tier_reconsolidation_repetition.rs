@@ -36,7 +36,7 @@ use std::time::Instant;
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{apply_grad, curate, encode_bytes, forward, sample_window, ForwardOut};
+use common::{ForwardOut, apply_grad, curate, encode_bytes, forward, sample_window};
 
 /// Same six-segment breakdown as memory_tier_reconsolidation.rs -
 /// copied for the same reason that file gave for not sharing Fisher's

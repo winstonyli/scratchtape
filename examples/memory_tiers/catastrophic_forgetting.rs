@@ -70,8 +70,7 @@ fn main() {
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);
     let mut pos_emb = Embedding::new(&mut rng, seq_len, d_model);
-    let mut blocks: Vec<TransformerBlock> =
-        (0..n_blocks).map(|_| TransformerBlock::new(&mut rng, d_model, n_heads, d_ff)).collect();
+    let mut blocks: Vec<TransformerBlock> = (0..n_blocks).map(|_| TransformerBlock::new(&mut rng, d_model, n_heads, d_ff)).collect();
     let mut final_ln = LayerNorm::new(d_model);
     let mut output_proj = Linear::new(&mut rng, d_model, vocab_size);
     let opt = Sgd { lr: 0.3 };
@@ -89,8 +88,7 @@ fn main() {
     // faithful and more interesting version of this question - does even
     // this little retained data prevent most of the forgetting?
     let mut snapshot_rng = Rng::new(99);
-    let replay_buffer: Vec<(Vec<usize>, Vec<usize>)> =
-        (0..8).map(|_| sample_window(&mut snapshot_rng, &corpus_a, seq_len)).collect();
+    let replay_buffer: Vec<(Vec<usize>, Vec<usize>)> = (0..8).map(|_| sample_window(&mut snapshot_rng, &corpus_a, seq_len)).collect();
 
     // Fork the phase-1-trained model into an independent copy - both
     // phase-2 conditions (no replay vs with replay) must start from
@@ -114,10 +112,7 @@ fn main() {
     // the no-replay run's via a shared pseudorandom sequence.
     println!("\nphase 2b: training on corpus B WITH replay (15% of steps drawn from an 8-window snapshot of corpus A, {steps_per_phase} steps)");
     let mut rng2 = Rng::new(2);
-    train(
-        &mut rng2, &mut token_emb2, &mut pos_emb2, &mut blocks2, &mut final_ln2, &mut output_proj2,
-        &corpus_b, seq_len, steps_per_phase, &opt, Some(&replay_buffer), 0.15,
-    );
+    train(&mut rng2, &mut token_emb2, &mut pos_emb2, &mut blocks2, &mut final_ln2, &mut output_proj2, &corpus_b, seq_len, steps_per_phase, &opt, Some(&replay_buffer), 0.15);
     let loss_a_after_b_replay = eval_loss(&token_emb2, &pos_emb2, &blocks2, &final_ln2, &output_proj2, &corpus_a, seq_len);
     let loss_b_after_b_replay = eval_loss(&token_emb2, &pos_emb2, &blocks2, &final_ln2, &output_proj2, &corpus_b, seq_len);
     println!("  loss on A after training on B WITH replay: {loss_a_after_b_replay:.4}");

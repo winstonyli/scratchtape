@@ -40,8 +40,7 @@ fn main() {
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, VOCAB_SIZE, D_MODEL);
     let mut pos_emb = Embedding::new(&mut rng, SEQ_LEN, D_MODEL);
-    let mut blocks: Vec<TransformerBlock> =
-        (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF)).collect();
+    let mut blocks: Vec<TransformerBlock> = (0..N_BLOCKS).map(|_| TransformerBlock::new(&mut rng, D_MODEL, N_HEADS, D_FF)).collect();
     let mut final_ln = LayerNorm::new(D_MODEL);
     let mut output_proj = Linear::new(&mut rng, D_MODEL, VOCAB_SIZE);
     let opt = Sgd { lr: 0.3 };
@@ -67,8 +66,7 @@ fn main() {
     // the point of persisting it is that a later process genuinely
     // wouldn't have corpus A available to resample from.
     let mut snapshot_rng = Rng::new(99);
-    let replay_buffer: Vec<(Vec<usize>, Vec<usize>)> =
-        (0..REPLAY_WINDOWS).map(|_| sample_window(&mut snapshot_rng, &corpus_a, SEQ_LEN)).collect();
+    let replay_buffer: Vec<(Vec<usize>, Vec<usize>)> = (0..REPLAY_WINDOWS).map(|_| sample_window(&mut snapshot_rng, &corpus_a, SEQ_LEN)).collect();
 
     let mut flat = token_emb.to_flat();
     flat.extend(pos_emb.to_flat());

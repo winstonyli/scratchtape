@@ -42,12 +42,7 @@ fn main() {
     );
 
     let d_k = 4.0f32;
-    let labels = [
-        "exact match (key 2)",
-        "noisy query (~key 0)",
-        "ambiguous (keys 1 & 3, still relevant)",
-        "no good match (negative vs every key)",
-    ];
+    let labels = ["exact match (key 2)", "noisy query (~key 0)", "ambiguous (keys 1 & 3, still relevant)", "no good match (negative vs every key)"];
 
     let mut tape = Tape::new();
     let q = tape.leaf(queries.clone());

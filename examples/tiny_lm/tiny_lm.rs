@@ -46,8 +46,7 @@ fn kmeans(points: &[Vec<f32>], k: usize, iterations: usize, rng: &mut Rng) -> Ve
             assignments[i] = best;
         }
         for c in 0..k {
-            let members: Vec<&Vec<f32>> =
-                points.iter().zip(assignments.iter()).filter(|&(_, &a)| a == c).map(|(p, _)| p).collect();
+            let members: Vec<&Vec<f32>> = points.iter().zip(assignments.iter()).filter(|&(_, &a)| a == c).map(|(p, _)| p).collect();
             if !members.is_empty() {
                 let mut mean = vec![0.0f32; dim];
                 for m in &members {
@@ -134,8 +133,7 @@ fn main() {
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);
     let mut pos_emb = Embedding::new(&mut rng, seq_len, d_model);
-    let mut blocks: Vec<TransformerBlock> =
-        (0..n_blocks).map(|_| TransformerBlock::new(&mut rng, d_model, n_heads, d_ff)).collect();
+    let mut blocks: Vec<TransformerBlock> = (0..n_blocks).map(|_| TransformerBlock::new(&mut rng, d_model, n_heads, d_ff)).collect();
     let mut final_ln = LayerNorm::new(d_model);
     let mut output_proj = Linear::new(&mut rng, d_model, vocab_size);
 
@@ -183,23 +181,14 @@ fn main() {
     distinct_bytes.sort_unstable();
     distinct_bytes.dedup();
 
-    let embedding_rows: Vec<Vec<f32>> =
-        distinct_bytes.iter().map(|&b| token_emb.table.data[b * d_model..b * d_model + d_model].to_vec()).collect();
+    let embedding_rows: Vec<Vec<f32>> = distinct_bytes.iter().map(|&b| token_emb.table.data[b * d_model..b * d_model + d_model].to_vec()).collect();
 
     let k = 5;
     let assignments = kmeans(&embedding_rows, k, 50, &mut rng);
 
-    println!(
-        "\nk-means clusters (k={k}) over the {} bytes actually seen during training:",
-        distinct_bytes.len()
-    );
+    println!("\nk-means clusters (k={k}) over the {} bytes actually seen during training:", distinct_bytes.len());
     for c in 0..k {
-        let members: Vec<String> = distinct_bytes
-            .iter()
-            .zip(assignments.iter())
-            .filter(|&(_, &a)| a == c)
-            .map(|(&b, _)| format!("{:?}", (b as u8) as char))
-            .collect();
+        let members: Vec<String> = distinct_bytes.iter().zip(assignments.iter()).filter(|&(_, &a)| a == c).map(|(&b, _)| format!("{:?}", (b as u8) as char)).collect();
         println!("  cluster {c}: {}", members.join(" "));
     }
 
@@ -242,19 +231,11 @@ fn main() {
         let mut targets: Vec<(usize, f32)> = (0..n_bytes)
             .filter_map(|j| {
                 let c = weight_count[i * n_bytes + j];
-                if c == 0 {
-                    None
-                } else {
-                    Some((j, weight_sum[i * n_bytes + j] / c as f32))
-                }
+                if c == 0 { None } else { Some((j, weight_sum[i * n_bytes + j] / c as f32)) }
             })
             .collect();
         targets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let top: Vec<String> = targets
-            .iter()
-            .take(2)
-            .map(|&(j, w)| format!("{:?}({:.2})", (distinct_bytes[j] as u8) as char, w))
-            .collect();
+        let top: Vec<String> = targets.iter().take(2).map(|&(j, w)| format!("{:?}({:.2})", (distinct_bytes[j] as u8) as char, w)).collect();
         println!("  {:?} -> {}", (b as u8) as char, top.join(", "));
     }
 }

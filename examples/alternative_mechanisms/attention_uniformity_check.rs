@@ -246,13 +246,11 @@ fn load(path: &str, v: Variant) -> Option<(Model, Vec<f32>)> {
 fn argmax_targets(sum: &[f32], count: &[u32], n: usize) -> Vec<Option<usize>> {
     (0..n)
         .map(|i| {
-            (0..n)
-                .filter(|&j| count[i * n + j] > 0)
-                .max_by(|&a, &b| {
-                    let ma = sum[i * n + a] / count[i * n + a] as f32;
-                    let mb = sum[i * n + b] / count[i * n + b] as f32;
-                    ma.partial_cmp(&mb).unwrap()
-                })
+            (0..n).filter(|&j| count[i * n + j] > 0).max_by(|&a, &b| {
+                let ma = sum[i * n + a] / count[i * n + a] as f32;
+                let mb = sum[i * n + b] / count[i * n + b] as f32;
+                ma.partial_cmp(&mb).unwrap()
+            })
         })
         .collect()
 }
@@ -362,9 +360,7 @@ fn analyze(name: &str, m: &Model, train_set: &[usize], filtered: &[usize], v: Va
             let pairs: Vec<(usize, usize)> = targets.iter().zip(null_targets.iter()).filter_map(|(a, c)| Some(((*a)?, (*c)?))).collect();
             let agree = pairs.iter().filter(|(a, c)| a == c).count() as f64 / pairs.len() as f64;
             let (k, p, ms) = (kl[hid] / rows as f64, peak[hid] / rows as f64, mass[hid] / rows as f64);
-            lines.push(format!(
-                "  block {b} head {h}: KL={k:.5} peak={p:.3} mass={ms:.3} self={self_rate:.2} sink={sink} null-argmax-agreement={agree:.2}"
-            ));
+            lines.push(format!("  block {b} head {h}: KL={k:.5} peak={p:.3} mass={ms:.3} self={self_rate:.2} sink={sink} null-argmax-agreement={agree:.2}"));
             agree_all += agree;
             kl_all += k;
             peak_all += p;

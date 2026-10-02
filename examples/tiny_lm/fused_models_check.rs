@@ -102,7 +102,10 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups] [checkpoint_secs]");
+    assert!(
+        args.len() >= 5,
+        "usage: fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups] [checkpoint_secs]"
+    );
     let name = &args[1];
     let k: usize = args[2].parse().unwrap();
     let batch: usize = args[3].parse().unwrap();
@@ -138,8 +141,19 @@ fn main() {
 
     // Model m's generator: its init, then its batches (training_recipe_check's order).
     let mut rngs: Vec<Rng> = (0..k as u64).map(|m| Rng::new(seed + m)).collect();
-    let flat: Vec<f32> = if shared_init { (0..groups as u64).flat_map(|g| init(&mut Rng::new(seed + 1000 * g), &cfg).repeat(k / groups)).collect() } else { rngs.iter_mut().flat_map(|r| init(r, &cfg)).collect() };
-    let config = format!("k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu} corpus={corpus_name} lr_decay_frac={lr_decay_frac} model d={} heads={} d_ff={} blocks={} groups={groups}", seed + k as u64 - 1, cfg.d, cfg.heads, cfg.d_ff, cfg.n_blocks);
+    let flat: Vec<f32> = if shared_init {
+        (0..groups as u64).flat_map(|g| init(&mut Rng::new(seed + 1000 * g), &cfg).repeat(k / groups)).collect()
+    } else {
+        rngs.iter_mut().flat_map(|r| init(r, &cfg)).collect()
+    };
+    let config = format!(
+        "k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu} corpus={corpus_name} lr_decay_frac={lr_decay_frac} model d={} heads={} d_ff={} blocks={} groups={groups}",
+        seed + k as u64 - 1,
+        cfg.d,
+        cfg.heads,
+        cfg.d_ff,
+        cfg.n_blocks
+    );
     println!("run {name}: pid {} {config} steps={steps}", std::process::id());
     let _lease = gpu_lease::hold(Kind::Shared, &format!("scratchtape fused_models_check {name}"), Duration::from_secs(4 * 3600));
     // Resume file: header "<config> | <step> <rng state per model>", then
@@ -233,11 +247,7 @@ fn main() {
             }
         }
         dev.zero_grads();
-        let dt = if dropout > 0.0 {
-            DeviceTape::with_dropout(&dev, dropout, (seed as u32).wrapping_mul(0x85eb_ca6b) ^ step as u32)
-        } else {
-            DeviceTape::new(&dev)
-        };
+        let dt = if dropout > 0.0 { DeviceTape::with_dropout(&dev, dropout, (seed as u32).wrapping_mul(0x85eb_ca6b) ^ step as u32) } else { DeviceTape::new(&dev) };
         let mut dt = dt.with_distill(alpha * ((step + 1) as f32 / ramp as f32).min(1.0));
         let (_, _, loss) = model_forward(&mut dt, &cfg, &input, &target, k * batch);
         dt.backward(loss);

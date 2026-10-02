@@ -186,12 +186,16 @@ fn main() {
     // 3-generation family tree, hand-authored so the true grandparent set
     // is known exactly (computed below from these edges, not asserted).
     let parent_edges: Vec<(usize, usize)> = [
-        ("alice", "carol"), ("alice", "dave"),
-        ("bob", "eve"), ("bob", "frank"),
-        ("carol", "grace"), ("carol", "heidi"),
+        ("alice", "carol"),
+        ("alice", "dave"),
+        ("bob", "eve"),
+        ("bob", "frank"),
+        ("carol", "grace"),
+        ("carol", "heidi"),
         ("dave", "ivan"),
         ("eve", "judy"),
-        ("frank", "karl"), ("frank", "liam"),
+        ("frank", "karl"),
+        ("frank", "liam"),
     ]
     .iter()
     .map(|&(p, c)| (idx(p), idx(c)))
@@ -299,8 +303,7 @@ fn main() {
                 if y == x || y == z {
                     continue;
                 }
-                let s = parent_score(&subj_emb.table, &obj_emb.table, bias.data[0], x, y, d)
-                    * parent_score(&subj_emb.table, &obj_emb.table, bias.data[0], y, z, d);
+                let s = parent_score(&subj_emb.table, &obj_emb.table, bias.data[0], x, y, d) * parent_score(&subj_emb.table, &obj_emb.table, bias.data[0], y, z, d);
                 if s > best {
                     best = s;
                 }
@@ -312,14 +315,8 @@ fn main() {
     let true_count = labels.iter().filter(|&&l| l == 1).count();
     let (p, r, f1) = precision_recall_f1(&labels, &predictions);
     let correct = labels.iter().zip(predictions.iter()).filter(|(l, p)| l == p).count();
-    println!(
-        "\nphase 2 result - zero-shot grandparent(x,z) via backward chaining over frozen `parent` embeddings:"
-    );
-    println!(
-        "  {true_count}/{} true grandparent pairs, accuracy={:.3} precision={p:.3} recall={r:.3} f1={f1:.3}",
-        labels.len(),
-        correct as f32 / labels.len() as f32
-    );
+    println!("\nphase 2 result - zero-shot grandparent(x,z) via backward chaining over frozen `parent` embeddings:");
+    println!("  {true_count}/{} true grandparent pairs, accuracy={:.3} precision={p:.3} recall={r:.3} f1={f1:.3}", labels.len(), correct as f32 / labels.len() as f32);
 
     println!("\ntrue grandparent pairs and what the prover scored them:");
     for x in 0..n {
@@ -331,8 +328,7 @@ fn main() {
                     if y == x || y == z {
                         continue;
                     }
-                    let s = parent_score(&subj_emb.table, &obj_emb.table, bias.data[0], x, y, d)
-                        * parent_score(&subj_emb.table, &obj_emb.table, bias.data[0], y, z, d);
+                    let s = parent_score(&subj_emb.table, &obj_emb.table, bias.data[0], x, y, d) * parent_score(&subj_emb.table, &obj_emb.table, bias.data[0], y, z, d);
                     if s > best {
                         best = s;
                         best_y = y;
@@ -415,8 +411,7 @@ fn main() {
             if y == gp_xs[i] || y == gp_zs[i] {
                 continue;
             }
-            let s = parent_score(&subj_emb3.table, &obj_emb3.table, bias3.data[0], gp_xs[i], y, d)
-                * parent_score(&subj_emb3.table, &obj_emb3.table, bias3.data[0], y, gp_zs[i], d);
+            let s = parent_score(&subj_emb3.table, &obj_emb3.table, bias3.data[0], gp_xs[i], y, d) * parent_score(&subj_emb3.table, &obj_emb3.table, bias3.data[0], y, gp_zs[i], d);
             if s > best {
                 best = s;
             }
@@ -435,9 +430,7 @@ fn main() {
         recovered_predictions[i] = if s > 0.5 { 1 } else { 0 };
     }
     let (rp, rr, rf1) = precision_recall_f1(&fact_labels_usize, &recovered_predictions);
-    println!(
-        "phase 3 check 2 - did it recover the TRUE `parent` facts as a byproduct: precision={rp:.3} recall={rr:.3} f1={rf1:.3}"
-    );
+    println!("phase 3 check 2 - did it recover the TRUE `parent` facts as a byproduct: precision={rp:.3} recall={rr:.3} f1={rf1:.3}");
     println!("  (facts it inferred as `parent` that were never directly supervised:)");
     for i in 0..n_pairs {
         if recovered_predictions[i] == 1 {
@@ -504,8 +497,7 @@ fn main() {
             if y == gp_xs[i] || y == gp_zs[i] {
                 continue;
             }
-            let s = parent_score(&subj_emb4.table, &obj_emb4.table, bias4.data[0], gp_xs[i], y, d)
-                * parent_score(&subj_emb4.table, &obj_emb4.table, bias4.data[0], y, gp_zs[i], d);
+            let s = parent_score(&subj_emb4.table, &obj_emb4.table, bias4.data[0], gp_xs[i], y, d) * parent_score(&subj_emb4.table, &obj_emb4.table, bias4.data[0], y, gp_zs[i], d);
             if s > best {
                 best = s;
             }
@@ -521,9 +513,7 @@ fn main() {
         recovered_predictions4[i] = if s > 0.5 { 1 } else { 0 };
     }
     let (rp4, rr4, rf14) = precision_recall_f1(&fact_labels_usize, &recovered_predictions4);
-    println!(
-        "phase 4 check 2 - did it recover the TRUE `parent` facts as a byproduct: precision={rp4:.3} recall={rr4:.3} f1={rf14:.3}"
-    );
+    println!("phase 4 check 2 - did it recover the TRUE `parent` facts as a byproduct: precision={rp4:.3} recall={rr4:.3} f1={rf14:.3}");
     println!("  (facts it inferred as `parent` that were never directly supervised:)");
     for i in 0..n_pairs {
         if recovered_predictions4[i] == 1 {

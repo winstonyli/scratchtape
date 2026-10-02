@@ -33,7 +33,10 @@ use scratchtape::tensor::NdArray;
 use std::io::{BufRead, BufReader};
 use std::os::windows::io::AsRawHandle;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
@@ -61,12 +64,20 @@ fn load(n: usize) {
     let preferred = wgpu::Backends::DX12;
     let backends = wgpu::Backends::from_env().unwrap_or(preferred);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..wgpu::InstanceDescriptor::new_without_display_handle() });
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).unwrap();
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).unwrap();
     let info = adapter.get_info();
     eprintln!("load: {} ({:?}, {:?})", info.name, info.device_type, info.backend);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(include_str!("../../src/matmul.wgsl").into()) });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
     let (m, k) = (2048usize, 128usize);
     let mut rng = Rng::new(5);
     let storage = wgpu::BufferUsages::STORAGE;

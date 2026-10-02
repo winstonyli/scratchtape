@@ -73,15 +73,9 @@ impl Linear {
     /// across layers.
     pub fn new(rng: &mut Rng, in_dim: usize, out_dim: usize) -> Self {
         let limit = (6.0 / in_dim as f32).sqrt();
-        let w_data = (0..in_dim * out_dim)
-            .map(|_| (rng.next_f32() * 2.0 - 1.0) * limit)
-            .collect();
+        let w_data = (0..in_dim * out_dim).map(|_| (rng.next_f32() * 2.0 - 1.0) * limit).collect();
         let b_data = vec![0.0; out_dim];
-        Self {
-            w: NdArray::new(w_data, vec![in_dim, out_dim]),
-            b: NdArray::new(b_data, vec![out_dim]),
-            last_leaf: Cell::new(None),
-        }
+        Self { w: NdArray::new(w_data, vec![in_dim, out_dim]), b: NdArray::new(b_data, vec![out_dim]), last_leaf: Cell::new(None) }
     }
 
     /// Builds a Linear directly from already-computed w/b - for callers
@@ -207,7 +201,7 @@ pub struct EmbeddingOut {
 /// any code was written, same as Gather itself.
 #[derive(Clone)]
 pub struct Embedding {
-    pub table: NdArray, // [vocab_size, d_model]
+    pub table: NdArray,           // [vocab_size, d_model]
     last_leaf: Cell<Option<Var>>, // see Linear's identical field for why
 }
 
@@ -294,12 +288,7 @@ impl LayerNorm {
     /// identically over every position, so there's no symmetry-collapse
     /// risk here to break.
     pub fn new(d_model: usize) -> Self {
-        Self {
-            gamma: NdArray::new(vec![1.0; d_model], vec![1, d_model]),
-            beta: NdArray::new(vec![0.0; d_model], vec![1, d_model]),
-            eps: 1e-5,
-            last_leaf: Cell::new(None),
-        }
+        Self { gamma: NdArray::new(vec![1.0; d_model], vec![1, d_model]), beta: NdArray::new(vec![0.0; d_model], vec![1, d_model]), eps: 1e-5, last_leaf: Cell::new(None) }
     }
 
     /// Same fresh-leaf-per-call caveat as Linear::forward - see its doc
@@ -837,14 +826,8 @@ mod tests {
             xp[i] += eps;
             let mut xm = x_data.clone();
             xm[i] -= eps;
-            let numerical = (transformer_block_loss(&block, &xp, seq_len, d_model)
-                - transformer_block_loss(&block, &xm, seq_len, d_model))
-                / (2.0 * eps);
-            assert!(
-                (numerical - x_grad.data[i]).abs() < 1e-2,
-                "x grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                x_grad.data[i]
-            );
+            let numerical = (transformer_block_loss(&block, &xp, seq_len, d_model) - transformer_block_loss(&block, &xm, seq_len, d_model)) / (2.0 * eps);
+            assert!((numerical - x_grad.data[i]).abs() < 1e-2, "x grad[{i}] mismatch: numerical {numerical} vs analytical {}", x_grad.data[i]);
         }
 
         let orig = block.out_proj.w.data[0];
@@ -854,11 +837,7 @@ mod tests {
         let lm = transformer_block_loss(&block, &x_data, seq_len, d_model);
         block.out_proj.w.data[0] = orig;
         let numerical = (lp - lm) / (2.0 * eps);
-        assert!(
-            (numerical - out_proj_w_grad.data[0]).abs() < 1e-2,
-            "out_proj.w[0] grad mismatch: numerical {numerical} vs analytical {}",
-            out_proj_w_grad.data[0]
-        );
+        assert!((numerical - out_proj_w_grad.data[0]).abs() < 1e-2, "out_proj.w[0] grad mismatch: numerical {numerical} vs analytical {}", out_proj_w_grad.data[0]);
 
         let orig = block.ffn1.w.data[0];
         block.ffn1.w.data[0] = orig + eps;
@@ -867,11 +846,7 @@ mod tests {
         let lm = transformer_block_loss(&block, &x_data, seq_len, d_model);
         block.ffn1.w.data[0] = orig;
         let numerical = (lp - lm) / (2.0 * eps);
-        assert!(
-            (numerical - ffn1_w_grad.data[0]).abs() < 1e-2,
-            "ffn1.w[0] grad mismatch: numerical {numerical} vs analytical {}",
-            ffn1_w_grad.data[0]
-        );
+        assert!((numerical - ffn1_w_grad.data[0]).abs() < 1e-2, "ffn1.w[0] grad mismatch: numerical {numerical} vs analytical {}", ffn1_w_grad.data[0]);
     }
 
     /// Same shape of check as transformer_block_backward_matches_finite_difference,
@@ -922,11 +897,7 @@ mod tests {
             let mut xm = x_data.clone();
             xm[i] -= eps;
             let numerical = (loss_with(&block, &xp) - loss_with(&block, &xm)) / (2.0 * eps);
-            assert!(
-                (numerical - x_grad.data[i]).abs() < 1e-2,
-                "x grad[{i}] mismatch: numerical {numerical} vs analytical {}",
-                x_grad.data[i]
-            );
+            assert!((numerical - x_grad.data[i]).abs() < 1e-2, "x grad[{i}] mismatch: numerical {numerical} vs analytical {}", x_grad.data[i]);
         }
 
         let mut block = block;
@@ -937,11 +908,7 @@ mod tests {
         let lm = loss_with(&block, &x_data);
         block.qkv.w.data[0] = orig;
         let numerical = (lp - lm) / (2.0 * eps);
-        assert!(
-            (numerical - q0_w_grad.data[0]).abs() < 1e-2,
-            "qkv.w[0] grad mismatch: numerical {numerical} vs analytical {}",
-            q0_w_grad.data[0]
-        );
+        assert!((numerical - q0_w_grad.data[0]).abs() < 1e-2, "qkv.w[0] grad mismatch: numerical {numerical} vs analytical {}", q0_w_grad.data[0]);
 
         let orig = block.qk_norm.as_ref().unwrap().1.gamma.data[k1];
         block.qk_norm.as_mut().unwrap().1.gamma.data[k1] = orig + eps;
@@ -950,10 +917,7 @@ mod tests {
         let lm = loss_with(&block, &x_data);
         block.qk_norm.as_mut().unwrap().1.gamma.data[k1] = orig;
         let numerical = (lp - lm) / (2.0 * eps);
-        assert!(
-            (numerical - k1_gamma_grad).abs() < 1e-2,
-            "k-norm head 1 gamma[0] grad mismatch: numerical {numerical} vs analytical {k1_gamma_grad}"
-        );
+        assert!((numerical - k1_gamma_grad).abs() < 1e-2, "k-norm head 1 gamma[0] grad mismatch: numerical {numerical} vs analytical {k1_gamma_grad}");
         assert!(k1_gamma_grad.abs() > 1e-6, "k-norm gamma gets no gradient - scale not wired into scores");
     }
 

@@ -200,15 +200,7 @@ impl Model {
 /// sampled `eval_loss` (different signature, takes an `Rng` and a
 /// window count) for a genuinely different purpose - kept local there,
 /// not merged into this one.
-pub fn eval_loss(
-    token_emb: &Embedding,
-    pos_emb: &Embedding,
-    blocks: &[TransformerBlock],
-    final_ln: &LayerNorm,
-    output_proj: &Linear,
-    corpus: &[usize],
-    seq_len: usize,
-) -> f32 {
+pub fn eval_loss(token_emb: &Embedding, pos_emb: &Embedding, blocks: &[TransformerBlock], final_ln: &LayerNorm, output_proj: &Linear, corpus: &[usize], seq_len: usize) -> f32 {
     let mut total = 0.0f32;
     let mut count = 0usize;
     let mut start = 0;
@@ -277,7 +269,15 @@ pub fn flatten_all(token_emb: &Embedding, pos_emb: &Embedding, blocks: &[Transfo
 
 /// Inverse of flatten_all - rebuilds each component from its slice of
 /// the flat vector, in the same fixed order.
-pub fn reconstruct(flat: &[f32], vocab_size: usize, d_model: usize, seq_len: usize, n_blocks: usize, n_heads: usize, d_ff: usize) -> (Embedding, Embedding, Vec<TransformerBlock>, LayerNorm, Linear) {
+pub fn reconstruct(
+    flat: &[f32],
+    vocab_size: usize,
+    d_model: usize,
+    seq_len: usize,
+    n_blocks: usize,
+    n_heads: usize,
+    d_ff: usize,
+) -> (Embedding, Embedding, Vec<TransformerBlock>, LayerNorm, Linear) {
     let mut offset = 0usize;
     let token_emb = Embedding::from_flat(flat, &mut offset, vocab_size, d_model);
     let pos_emb = Embedding::from_flat(flat, &mut offset, seq_len, d_model);

@@ -517,10 +517,7 @@ impl Tape {
                 }
                 OpKind::Relu(a) => {
                     let a_val = &self.nodes[a].value;
-                    let mask = NdArray {
-                        data: a_val.data.iter().map(|&x| if x > 0.0 { 1.0 } else { 0.0 }).collect(),
-                        shape: a_val.shape.clone(),
-                    };
+                    let mask = NdArray { data: a_val.data.iter().map(|&x| if x > 0.0 { 1.0 } else { 0.0 }).collect(), shape: a_val.shape.clone() };
                     self.accumulate(a, grad.mul(&mask));
                 }
                 OpKind::Sum(a) => {
@@ -764,11 +761,7 @@ mod tests {
         });
         // Row 2 was looked up twice - its gradient must reflect BOTH uses
         // (2x what a single lookup would produce), not just one.
-        assert!(
-            grads[0][6..9].iter().all(|g| g.abs() > 0.1),
-            "row 2's gradient looks like only one of its two lookups contributed: {:?}",
-            &grads[0][6..9]
-        );
+        assert!(grads[0][6..9].iter().all(|g| g.abs() > 0.1), "row 2's gradient looks like only one of its two lookups contributed: {:?}", &grads[0][6..9]);
     }
 
     /// The full layer-norm-shaped chain: SumLastAxis -> Scale -> Sub -> Mul

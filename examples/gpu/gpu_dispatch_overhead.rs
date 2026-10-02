@@ -49,18 +49,12 @@ fn main() {
     let preferred = if cfg!(windows) { wgpu::Backends::DX12 } else { wgpu::Backends::all() };
     let backends = wgpu::Backends::from_env().unwrap_or(preferred);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..wgpu::InstanceDescriptor::new_without_display_handle() });
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        ..Default::default()
-    }))
-    .expect("no adapter for requested backend");
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }))
+        .expect("no adapter for requested backend");
     let info = adapter.get_info();
     println!("device: {} ({:?}, {:?})", info.name, info.device_type, info.backend);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: None,
-        source: wgpu::ShaderSource::Wgsl(include_str!("../../src/matmul.wgsl").into()),
-    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(include_str!("../../src/matmul.wgsl").into()) });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
         layout: None,
@@ -135,18 +129,28 @@ fn main() {
         let err = got.iter().zip(&want.data).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
         assert!(err < 1e-3, "queued dispatch disagrees with CPU: max err {err}");
 
-        let best = |f: &mut dyn FnMut()| (0..REPS).map(|_| { let t = Instant::now(); f(); t.elapsed().as_secs_f64() }).fold(f64::MAX, f64::min);
+        let best = |f: &mut dyn FnMut()| {
+            (0..REPS)
+                .map(|_| {
+                    let t = Instant::now();
+                    f();
+                    t.elapsed().as_secs_f64()
+                })
+                .fold(f64::MAX, f64::min)
+        };
         let rt_calls = 20;
-        let roundtrip = best(&mut || for _ in 0..rt_calls { std::hint::black_box(gpu_matmul(&a, &b)); }) / rt_calls as f64;
+        let roundtrip = best(&mut || {
+            for _ in 0..rt_calls {
+                std::hint::black_box(gpu_matmul(&a, &b));
+            }
+        }) / rt_calls as f64;
         let queued = best(&mut || run_queued(N)) / N as f64;
         let cpu_calls = if m * k * k > 10_000_000 { 5 } else { 50 };
-        let cpu = best(&mut || for _ in 0..cpu_calls { std::hint::black_box(a.matmul(&b)); }) / cpu_calls as f64;
-        println!(
-            "({m:>4},{k:>3})@({k},{k}) | {:>8.3} | {:>8.4} | {:>8.3} | {:>7.1}",
-            roundtrip * 1e3,
-            queued * 1e3,
-            cpu * 1e3,
-            flops / queued / 1e9
-        );
+        let cpu = best(&mut || {
+            for _ in 0..cpu_calls {
+                std::hint::black_box(a.matmul(&b));
+            }
+        }) / cpu_calls as f64;
+        println!("({m:>4},{k:>3})@({k},{k}) | {:>8.3} | {:>8.4} | {:>8.3} | {:>7.1}", roundtrip * 1e3, queued * 1e3, cpu * 1e3, flops / queued / 1e9);
     }
 }

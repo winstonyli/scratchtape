@@ -79,16 +79,7 @@ fn backprop_grads(x0: &NdArray, target: &NdArray, w0: &NdArray, w1: &NdArray) ->
 /// weighting explains the gap at all, before committing to that bigger
 /// build. Parked: revisit with genuinely learned precision later if this
 /// fixed-value test is inconclusive rather than decisive either way.
-fn pc_grads_precision(
-    x0: &NdArray,
-    target: &NdArray,
-    w0: &NdArray,
-    w1: &NdArray,
-    steps: usize,
-    lr_inf: f32,
-    sigma1_inv: f32,
-    sigma2_inv: f32,
-) -> (NdArray, NdArray) {
+fn pc_grads_precision(x0: &NdArray, target: &NdArray, w0: &NdArray, w1: &NdArray, steps: usize, lr_inf: f32, sigma1_inv: f32, sigma2_inv: f32) -> (NdArray, NdArray) {
     let z0 = x0.matmul(w0);
     let pred1 = z0.relu();
     let mut x1 = pred1.clone();
@@ -254,11 +245,7 @@ fn main() {
     println!("\nPC gradient relative error vs backprop, by relaxation step count T:");
     for &t in &[1usize, 5, 20, 50, 100, 300] {
         let (pc_w0, pc_w1) = pc_grads(&x0, &target, &w0_init, &w1_init, t, 0.1);
-        println!(
-            "  T={t:>3}: dW0 rel err = {:.6}, dW1 rel err = {:.6}",
-            rel_error(&pc_w0, &bp_w0),
-            rel_error(&pc_w1, &bp_w1)
-        );
+        println!("  T={t:>3}: dW0 rel err = {:.6}, dW1 rel err = {:.6}", rel_error(&pc_w0, &bp_w0), rel_error(&pc_w1, &bp_w1));
     }
 
     // Precision-weighted revisit: theoretically-motivated first test, not
@@ -271,11 +258,7 @@ fn main() {
     println!("\nprecision-weighted revisit (sigma1_inv=10.0, sigma2_inv=1.0 - heavily penalizes x1 drift):");
     for &t in &[1usize, 5, 20, 50, 100, 300] {
         let (pc_w0, pc_w1) = pc_grads_precision(&x0, &target, &w0_init, &w1_init, t, 0.1, 10.0, 1.0);
-        println!(
-            "  T={t:>3}: dW0 rel err = {:.6}, dW1 rel err = {:.6}",
-            rel_error(&pc_w0, &bp_w0_p),
-            rel_error(&pc_w1, &bp_w1_p)
-        );
+        println!("  T={t:>3}: dW0 rel err = {:.6}, dW1 rel err = {:.6}", rel_error(&pc_w0, &bp_w0_p), rel_error(&pc_w1, &bp_w1_p));
     }
 
     // Secondary: actually train XOR via repeated relax-then-update steps,
@@ -377,7 +360,9 @@ fn main() {
     // a hand-tuned wall (see update_precision_map's doc comment).
     let pseudo_n = 4.0;
 
-    println!("\ntraining XOR with LEARNED precision ({warmup_epochs}-epoch warm-up, {ramp_epochs}-epoch ramp, MAP estimate with pseudo_n={pseudo_n}, T=20 relaxation steps/epoch):");
+    println!(
+        "\ntraining XOR with LEARNED precision ({warmup_epochs}-epoch warm-up, {ramp_epochs}-epoch ramp, MAP estimate with pseudo_n={pseudo_n}, T=20 relaxation steps/epoch):"
+    );
     for epoch in 0..1000 {
         let (d_w0, d_w1, e1, e2) = pc_grads_and_errors(&x0, &target, &w0_lp, &w1_lp, 20, 0.1, sigma1_inv, sigma2_inv);
         adam_lp.step(&mut w0_lp, &d_w0, &mut w0_lp_state);
@@ -417,11 +402,7 @@ fn main() {
     println!("\nlearned-precision T-sweep at trained weights (sigma1_inv={sigma1_inv:.4}, sigma2_inv={sigma2_inv:.4}):");
     for &t in &[1usize, 5, 20, 50, 100, 300] {
         let (pc_w0, pc_w1) = pc_grads_precision(&x0, &target, &w0_lp, &w1_lp, t, 0.1, sigma1_inv, sigma2_inv);
-        println!(
-            "  T={t:>3}: dW0 rel err = {:.6}, dW1 rel err = {:.6}",
-            rel_error(&pc_w0, &bp_w0_lp),
-            rel_error(&pc_w1, &bp_w1_lp)
-        );
+        println!("  T={t:>3}: dW0 rel err = {:.6}, dW1 rel err = {:.6}", rel_error(&pc_w0, &bp_w0_lp), rel_error(&pc_w1, &bp_w1_lp));
     }
 
     let pred_lp = x0.matmul(&w0_lp).relu().matmul(&w1_lp);

@@ -111,13 +111,7 @@ fn hard_majority_vote(labels: &[usize], related: impl Fn(usize, usize) -> bool, 
 /// returns predictions for the test fold. Evidence features (x_short,
 /// x_long) are fixed, precomputed from ALL n nodes' true labels - only
 /// the 3 combination weights are what training actually learns.
-fn fit_and_predict(
-    x_short: &[f32],
-    x_long: &[f32],
-    labels: &[usize],
-    train_idx: &[usize],
-    test_idx: &[usize],
-) -> Vec<usize> {
+fn fit_and_predict(x_short: &[f32], x_long: &[f32], labels: &[usize], train_idx: &[usize], test_idx: &[usize]) -> Vec<usize> {
     let train_x_short: Vec<f32> = train_idx.iter().map(|&i| x_short[i]).collect();
     let train_x_long: Vec<f32> = train_idx.iter().map(|&i| x_long[i]).collect();
     let train_y: Vec<f32> = train_idx.iter().map(|&i| labels[i] as f32).collect();
@@ -226,12 +220,8 @@ fn main() {
         let (old_p, old_r, old_f1) = precision_recall_f1(&labels, &old_predictions);
         let old_correct = (0..n).filter(|&i| old_predictions[i] == labels[i]).count();
 
-        let x_short: Vec<f32> = (0..n)
-            .map(|i| (0..n).filter(|&j| j != i && short_adj[i][j]).map(|j| labels[j] as f32).sum())
-            .collect();
-        let x_long: Vec<f32> = (0..n)
-            .map(|i| (0..n).filter(|&j| j != i && long_adj[i][j]).map(|j| labels[j] as f32).sum())
-            .collect();
+        let x_short: Vec<f32> = (0..n).map(|i| (0..n).filter(|&j| j != i && short_adj[i][j]).map(|j| labels[j] as f32).sum()).collect();
+        let x_long: Vec<f32> = (0..n).map(|i| (0..n).filter(|&j| j != i && long_adj[i][j]).map(|j| labels[j] as f32).sum()).collect();
 
         let mut order: Vec<usize> = (0..n).collect();
         shuffle(&mut order, &mut rng);

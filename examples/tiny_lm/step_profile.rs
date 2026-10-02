@@ -102,7 +102,11 @@ fn census(tape: &Tape) {
         let mut group_has_launch = false;
         for &p in parents {
             let into_leaf = ops[p].0 == "Leaf";
-            if into_leaf { bwd_leaf += 1 } else { bwd += 1 }
+            if into_leaf {
+                bwd_leaf += 1
+            } else {
+                bwd += 1
+            }
             if ops[p].2 < *elems && is_ew(op) {
                 reduce += 1;
             }
@@ -122,8 +126,12 @@ fn census(tape: &Tape) {
     let params = ops.iter().enumerate().filter(|(i, (op, _, _))| *op == "Leaf" && consumers[*i] > 0).count();
     println!("census: {} nodes; op counts {:?}", ops.len(), hist);
     println!("  forward  launches: {nonleaf} unfused, {fwd_fused} with elementwise fusion");
-    println!("  backward launches: {} grad kernels ({} of them into leaves) + {reduce} broadcast reduces + {accum} accumulates = {} unfused",
-        bwd + bwd_leaf, bwd_leaf, bwd + bwd_leaf + reduce + accum);
+    println!(
+        "  backward launches: {} grad kernels ({} of them into leaves) + {reduce} broadcast reduces + {accum} accumulates = {} unfused",
+        bwd + bwd_leaf,
+        bwd_leaf,
+        bwd + bwd_leaf + reduce + accum
+    );
     println!("                     ~{} fused (+{reduce} reduces)", bwd_fused);
     println!("  update   launches: {params} leaves in use, or 1 multi-tensor");
     let unfused = nonleaf + bwd + bwd_leaf + reduce + accum + params;

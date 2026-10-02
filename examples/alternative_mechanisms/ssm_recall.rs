@@ -167,8 +167,7 @@ fn main() {
         (tape, h_vars, out.y)
     }
 
-    let (tape, _, out_y) =
-        run(&embed_w, &embed_b, &a, &b_gain, &readout, &inputs, &contents, batch, d_state, denom);
+    let (tape, _, out_y) = run(&embed_w, &embed_b, &a, &b_gain, &readout, &inputs, &contents, batch, d_state, denom);
     let pred = tape.value(out_y);
     println!("\ncontent -> recalled (target), trained params");
     for b in 0..batch {
@@ -181,21 +180,8 @@ fn main() {
     // actual vanishing-gradient measurement. Loss is still large here, so
     // the gradient's shape across timesteps reflects the recurrence's raw
     // information-carrying capacity, not the trivial "near a minimum" case.
-    let (init_tape, init_h_vars, _) = run(
-        &init_embed_w,
-        &init_embed_b,
-        &init_a,
-        &init_b_gain,
-        &init_readout,
-        &inputs,
-        &contents,
-        batch,
-        d_state,
-        denom,
-    );
-    println!(
-        "\ngradient norm |d(loss)/d(h_t)| at each timestep, AT INITIALIZATION (t=0 is earliest, farthest from the loss):"
-    );
+    let (init_tape, init_h_vars, _) = run(&init_embed_w, &init_embed_b, &init_a, &init_b_gain, &init_readout, &inputs, &contents, batch, d_state, denom);
+    println!("\ngradient norm |d(loss)/d(h_t)| at each timestep, AT INITIALIZATION (t=0 is earliest, farthest from the loss):");
     for (t, &hv) in init_h_vars.iter().enumerate() {
         match init_tape.grad(hv) {
             Some(g) => println!("  t={t}: {:.6}", g.mul(g).sum().data[0].sqrt()),

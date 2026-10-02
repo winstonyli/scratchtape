@@ -174,8 +174,7 @@ fn fit_tree(features: &[Vec<f32>], labels: &[usize], idxs: &[usize], depth: usiz
             if left.is_empty() || right.is_empty() {
                 continue;
             }
-            let w_gini =
-                (left.len() as f32 * gini(labels, &left) + right.len() as f32 * gini(labels, &right)) / idxs.len() as f32;
+            let w_gini = (left.len() as f32 * gini(labels, &left) + right.len() as f32 * gini(labels, &right)) / idxs.len() as f32;
             if best.is_none_or(|(_, _, best_gini)| w_gini < best_gini) {
                 best = Some((dim, threshold, w_gini));
             }
@@ -201,7 +200,11 @@ fn predict_tree(tree: &Tree, features: &[f32]) -> usize {
     match tree {
         Tree::Leaf(class) => *class,
         Tree::Split { dim, threshold, left, right } => {
-            if features[*dim] <= *threshold { predict_tree(left, features) } else { predict_tree(right, features) }
+            if features[*dim] <= *threshold {
+                predict_tree(left, features)
+            } else {
+                predict_tree(right, features)
+            }
         }
     }
 }
@@ -296,8 +299,7 @@ fn kmeans(points: &[Vec<f32>], k: usize, iterations: usize, rng: &mut Rng) -> Ve
             assignments[i] = best;
         }
         for c in 0..k {
-            let members: Vec<&Vec<f32>> =
-                points.iter().zip(assignments.iter()).filter(|&(_, &a)| a == c).map(|(p, _)| p).collect();
+            let members: Vec<&Vec<f32>> = points.iter().zip(assignments.iter()).filter(|&(_, &a)| a == c).map(|(p, _)| p).collect();
             if !members.is_empty() {
                 let mut mean = vec![0.0f32; dim];
                 for m in &members {
@@ -359,7 +361,17 @@ fn forward(
 /// pure evaluation. Called on the held-out region to measure generalization
 /// (loss on text the model never trained on), and separately on the train
 /// region for a directly comparable in-sample number.
-fn eval_loss(rng: &mut Rng, token_emb: &Embedding, pos_emb: &Embedding, blocks: &[TransformerBlock], final_ln: &LayerNorm, output_proj: &Linear, corpus: &[usize], seq_len: usize, n_windows: usize) -> f32 {
+fn eval_loss(
+    rng: &mut Rng,
+    token_emb: &Embedding,
+    pos_emb: &Embedding,
+    blocks: &[TransformerBlock],
+    final_ln: &LayerNorm,
+    output_proj: &Linear,
+    corpus: &[usize],
+    seq_len: usize,
+    n_windows: usize,
+) -> f32 {
     let mut total = 0.0;
     for _ in 0..n_windows {
         let (input, target) = sample_window(rng, corpus, seq_len);
@@ -436,8 +448,7 @@ fn train_token_embedding(
     let mut rng = Rng::new(seed);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);
     let mut pos_emb = Embedding::new(&mut rng, seq_len, d_model);
-    let mut blocks: Vec<TransformerBlock> =
-        (0..n_blocks).map(|_| TransformerBlock::new(&mut rng, d_model, n_heads, d_ff)).collect();
+    let mut blocks: Vec<TransformerBlock> = (0..n_blocks).map(|_| TransformerBlock::new(&mut rng, d_model, n_heads, d_ff)).collect();
     let mut final_ln = LayerNorm::new(d_model);
     let mut output_proj = Linear::new(&mut rng, d_model, vocab_size);
     let opt = Sgd { lr: 0.3 };
@@ -511,10 +522,7 @@ struct TrainedModel {
 /// attention graph's top-k format for direct comparison.
 fn embedding_neighbor_graph(model: &TrainedModel, filtered_bytes: &[usize], d_model: usize, k: usize) -> Vec<Vec<(usize, f32)>> {
     let n = filtered_bytes.len();
-    let rows: Vec<Vec<f32>> = filtered_bytes
-        .iter()
-        .map(|&b| model.token_emb.table.data[b * d_model..b * d_model + d_model].to_vec())
-        .collect();
+    let rows: Vec<Vec<f32>> = filtered_bytes.iter().map(|&b| model.token_emb.table.data[b * d_model..b * d_model + d_model].to_vec()).collect();
     (0..n)
         .map(|i| {
             let mut dists: Vec<(usize, f32)> = (0..n)
@@ -540,14 +548,7 @@ fn embedding_neighbor_graph(model: &TrainedModel, filtered_bytes: &[usize], d_mo
 /// calls with different models so every seed sees the exact same sampled
 /// windows - isolates the model-training seed as the only varying input,
 /// the same control kmeans_rng=999 gives the clustering cross-seed check.
-fn attention_graph(
-    model: &TrainedModel,
-    train: &[usize],
-    filtered_bytes: &[usize],
-    seq_len: usize,
-    attn_windows: usize,
-    window_seed: u64,
-) -> (Vec<Vec<(usize, f32)>>, usize) {
+fn attention_graph(model: &TrainedModel, train: &[usize], filtered_bytes: &[usize], seq_len: usize, attn_windows: usize, window_seed: u64) -> (Vec<Vec<(usize, f32)>>, usize) {
     let byte_index: HashMap<usize, usize> = filtered_bytes.iter().enumerate().map(|(i, &b)| (b, i)).collect();
     let n_bytes = filtered_bytes.len();
     let mut weight_sum = vec![0.0f32; n_bytes * n_bytes];
@@ -562,8 +563,7 @@ fn attention_graph(
         }
         windows_used += 1;
         let mut tape = Tape::new();
-        let (_, out) =
-            forward(&mut tape, &model.token_emb, &model.pos_emb, &model.blocks, &model.final_ln, &model.output_proj, &window);
+        let (_, out) = forward(&mut tape, &model.token_emb, &model.pos_emb, &model.blocks, &model.final_ln, &model.output_proj, &window);
         let weights = out.block_outs[0].head_weights_of(&tape, 0);
         for qi in 0..seq_len {
             let qi_idx = byte_index[&window[qi]];
@@ -580,11 +580,7 @@ fn attention_graph(
             let mut targets: Vec<(usize, f32)> = (0..n_bytes)
                 .filter_map(|j| {
                     let c = weight_count[i * n_bytes + j];
-                    if c == 0 {
-                        None
-                    } else {
-                        Some((j, weight_sum[i * n_bytes + j] / c as f32))
-                    }
+                    if c == 0 { None } else { Some((j, weight_sum[i * n_bytes + j] / c as f32)) }
                 })
                 .collect();
             targets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -627,8 +623,7 @@ fn attention_graph_all_heads(
             continue;
         }
         let mut tape = Tape::new();
-        let (_, out) =
-            forward(&mut tape, &model.token_emb, &model.pos_emb, &model.blocks, &model.final_ln, &model.output_proj, &window);
+        let (_, out) = forward(&mut tape, &model.token_emb, &model.pos_emb, &model.blocks, &model.final_ln, &model.output_proj, &window);
         for block in 0..n_blocks {
             for head in 0..n_heads {
                 let weights = out.block_outs[block].head_weights_of(&tape, head);
@@ -653,11 +648,7 @@ fn attention_graph_all_heads(
                             let mut targets: Vec<(usize, f32)> = (0..n_bytes)
                                 .filter_map(|j| {
                                     let c = weight_count[block][head][i * n_bytes + j];
-                                    if c == 0 {
-                                        None
-                                    } else {
-                                        Some((j, weight_sum[block][head][i * n_bytes + j] / c as f32))
-                                    }
+                                    if c == 0 { None } else { Some((j, weight_sum[block][head][i * n_bytes + j] / c as f32)) }
                                 })
                                 .collect();
                             targets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -693,8 +684,7 @@ fn train_with_diagnostics(
     let mut rng = Rng::new(seed);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);
     let mut pos_emb = Embedding::new(&mut rng, seq_len, d_model);
-    let mut blocks: Vec<TransformerBlock> =
-        (0..n_blocks).map(|_| TransformerBlock::new(&mut rng, d_model, n_heads, d_ff)).collect();
+    let mut blocks: Vec<TransformerBlock> = (0..n_blocks).map(|_| TransformerBlock::new(&mut rng, d_model, n_heads, d_ff)).collect();
     let mut final_ln = LayerNorm::new(d_model);
     let mut output_proj = Linear::new(&mut rng, d_model, vocab_size);
     let opt = Sgd { lr: 0.3 };
@@ -722,7 +712,8 @@ fn train_with_diagnostics(
             let held_out_eval = eval_loss(&mut rng, &token_emb, &pos_emb, &blocks, &final_ln, &output_proj, held_out, seq_len, 20);
             log.push(format!(
                 "step {step:>5}: train_loss = {:.4}, eval train = {train_eval:.4}, eval held-out = {held_out_eval:.4} ({:.1}s elapsed)",
-                tape.value(loss).data[0], start_time.elapsed().as_secs_f32()
+                tape.value(loss).data[0],
+                start_time.elapsed().as_secs_f32()
             ));
         }
     }
@@ -790,13 +781,9 @@ fn main() {
     println!("\ntraining 3 seeds concurrently for cross-seed cluster stability...");
     let wall_clock_start = Instant::now();
     let (primary, seed2_model, seed3_model) = thread::scope(|scope| {
-        let primary_handle = scope.spawn(|| {
-            train_with_diagnostics(1, train, held_out, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps)
-        });
-        let seed2_handle =
-            scope.spawn(|| train_token_embedding(2, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps));
-        let seed3_handle =
-            scope.spawn(|| train_token_embedding(3, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps));
+        let primary_handle = scope.spawn(|| train_with_diagnostics(1, train, held_out, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps));
+        let seed2_handle = scope.spawn(|| train_token_embedding(2, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps));
+        let seed3_handle = scope.spawn(|| train_token_embedding(3, train, d_model, n_heads, d_ff, seq_len, n_blocks, vocab_size, steps));
         (primary_handle.join().unwrap(), seed2_handle.join().unwrap(), seed3_handle.join().unwrap())
     });
     println!("all 3 seeds trained in {:.1}s wall-clock", wall_clock_start.elapsed().as_secs_f32());
@@ -831,15 +818,10 @@ fn main() {
     let cutoff_count = distinct_bytes.len() / 5;
     let noise_floor = grad_accum[by_accum[cutoff_count]];
     let filtered_bytes: Vec<usize> = distinct_bytes.iter().copied().filter(|&b| grad_accum[b] >= noise_floor).collect();
-    let excluded: Vec<String> =
-        distinct_bytes.iter().filter(|&&b| grad_accum[b] < noise_floor).map(|&b| format!("{:?}", (b as u8) as char)).collect();
-    println!(
-        "\nexcluding {} of {} bytes as noise (accumulated |gradient| < {noise_floor:.4}): {}",
-        excluded.len(), distinct_bytes.len(), excluded.join(" ")
-    );
+    let excluded: Vec<String> = distinct_bytes.iter().filter(|&&b| grad_accum[b] < noise_floor).map(|&b| format!("{:?}", (b as u8) as char)).collect();
+    println!("\nexcluding {} of {} bytes as noise (accumulated |gradient| < {noise_floor:.4}): {}", excluded.len(), distinct_bytes.len(), excluded.join(" "));
 
-    let embedding_rows: Vec<Vec<f32>> =
-        filtered_bytes.iter().map(|&b| model.token_emb.table.data[b * d_model..b * d_model + d_model].to_vec()).collect();
+    let embedding_rows: Vec<Vec<f32>> = filtered_bytes.iter().map(|&b| model.token_emb.table.data[b * d_model..b * d_model + d_model].to_vec()).collect();
 
     // Fixed k-means-init seed, independent of the training rng - isolates
     // model-training randomness as the only thing varying across the
@@ -850,17 +832,9 @@ fn main() {
     let mut kmeans_rng = Rng::new(999);
     let assignments = kmeans(&embedding_rows, k, 50, &mut kmeans_rng);
 
-    println!(
-        "\nk-means clusters (k={k}) over the {} bytes remaining after noise filtering:",
-        filtered_bytes.len()
-    );
+    println!("\nk-means clusters (k={k}) over the {} bytes remaining after noise filtering:", filtered_bytes.len());
     for c in 0..k {
-        let members: Vec<String> = filtered_bytes
-            .iter()
-            .zip(assignments.iter())
-            .filter(|&(_, &a)| a == c)
-            .map(|(&b, _)| format!("{:?}", (b as u8) as char))
-            .collect();
+        let members: Vec<String> = filtered_bytes.iter().zip(assignments.iter()).filter(|&(_, &a)| a == c).map(|(&b, _)| format!("{:?}", (b as u8) as char)).collect();
         println!("  cluster {c}: {}", members.join(" "));
     }
 
@@ -873,10 +847,7 @@ fn main() {
     // is. That sidesteps the label-permutation problem entirely.
     let mut all_assignments: Vec<Vec<usize>> = vec![assignments.clone()];
     for seed_model in [&seed2_model, &seed3_model] {
-        let rows: Vec<Vec<f32>> = filtered_bytes
-            .iter()
-            .map(|&b| seed_model.token_emb.table.data[b * d_model..b * d_model + d_model].to_vec())
-            .collect();
+        let rows: Vec<Vec<f32>> = filtered_bytes.iter().map(|&b| seed_model.token_emb.table.data[b * d_model..b * d_model + d_model].to_vec()).collect();
         let mut seed_kmeans_rng = Rng::new(999);
         let a = kmeans(&rows, k, 50, &mut seed_kmeans_rng);
         all_assignments.push(a);
@@ -929,10 +900,7 @@ fn main() {
     let next_component = component.iter().copied().max().map_or(0, |m| m + 1);
     println!("\nconsensus clusters (connected components of >=2/3-seed agreement):");
     for c in 0..next_component {
-        let members: Vec<String> = (0..n)
-            .filter(|&i| component[i] == c)
-            .map(|i| format!("{:?}", (filtered_bytes[i] as u8) as char))
-            .collect();
+        let members: Vec<String> = (0..n).filter(|&i| component[i] == c).map(|i| format!("{:?}", (filtered_bytes[i] as u8) as char)).collect();
         if !members.is_empty() {
             println!("  component {c}: {}", members.join(" "));
         }
@@ -949,10 +917,7 @@ fn main() {
     let strict_next = strict_component.iter().copied().max().map_or(0, |m| m + 1);
     println!("\nstrict consensus clusters (connected components of 3/3-seed agreement):");
     for c in 0..strict_next {
-        let members: Vec<String> = (0..n)
-            .filter(|&i| strict_component[i] == c)
-            .map(|i| format!("{:?}", (filtered_bytes[i] as u8) as char))
-            .collect();
+        let members: Vec<String> = (0..n).filter(|&i| strict_component[i] == c).map(|i| format!("{:?}", (filtered_bytes[i] as u8) as char)).collect();
         if !members.is_empty() {
             println!("  component {c}: {}", members.join(" "));
         }
@@ -971,12 +936,9 @@ fn main() {
     let attn_windows = 20000;
     let (primary_graph, windows_used) = attention_graph(&model, train, &filtered_bytes, seq_len, attn_windows, 777);
 
-    println!(
-        "\nattention-derived relational graph (block 0, head 0), top-2 targets per byte, {windows_used} sampled windows:"
-    );
+    println!("\nattention-derived relational graph (block 0, head 0), top-2 targets per byte, {windows_used} sampled windows:");
     for (i, &b) in filtered_bytes.iter().enumerate() {
-        let top: Vec<String> =
-            primary_graph[i].iter().take(2).map(|&(j, w)| format!("{:?}({:.2})", (filtered_bytes[j] as u8) as char, w)).collect();
+        let top: Vec<String> = primary_graph[i].iter().take(2).map(|&(j, w)| format!("{:?}({:.2})", (filtered_bytes[j] as u8) as char, w)).collect();
         println!("  {:?} -> {}", (b as u8) as char, top.join(", "));
     }
 
@@ -1020,10 +982,7 @@ fn main() {
         let fmt = |t: Option<usize>| t.map_or("-".to_string(), |x| format!("{:?}", (x as u8) as char));
         println!("  {:?} -> {} | {} | {} ({label})", (b as u8) as char, fmt(t1), fmt(t2), fmt(t3));
     }
-    println!(
-        "summary: {unanimous_count} unanimous, {majority_count} majority (2/3), {none_count} all-different, {gap_count} sampling-gap, out of {} bytes",
-        filtered_bytes.len()
-    );
+    println!("summary: {unanimous_count} unanimous, {majority_count} majority (2/3), {none_count} all-different, {gap_count} sampling-gap, out of {} bytes", filtered_bytes.len());
 
     // Third independent extraction: raw embedding-space nearest neighbors,
     // no attention behavior or clustering partition involved at all - see
@@ -1036,8 +995,7 @@ fn main() {
     let primary_nn = embedding_neighbor_graph(&model, &filtered_bytes, d_model, nn_k);
     println!("\nembedding-space nearest neighbors (k={nn_k}, Euclidean distance):");
     for (i, &b) in filtered_bytes.iter().enumerate() {
-        let top: Vec<String> =
-            primary_nn[i].iter().map(|&(j, d)| format!("{:?}({d:.2})", (filtered_bytes[j] as u8) as char)).collect();
+        let top: Vec<String> = primary_nn[i].iter().map(|&(j, d)| format!("{:?}({d:.2})", (filtered_bytes[j] as u8) as char)).collect();
         println!("  {:?} -> {}", (b as u8) as char, top.join(", "));
     }
 
@@ -1061,10 +1019,7 @@ fn main() {
         let fmt = |x: usize| format!("{:?}", (x as u8) as char);
         println!("  {:?} -> {} | {} | {} ({label})", (b as u8) as char, fmt(t1), fmt(t2), fmt(t3));
     }
-    println!(
-        "summary: {nn_unanimous} unanimous, {nn_majority} majority (2/3), {nn_none} all-different, out of {} bytes",
-        filtered_bytes.len()
-    );
+    println!("summary: {nn_unanimous} unanimous, {nn_majority} majority (2/3), {nn_none} all-different, out of {} bytes", filtered_bytes.len());
 
     // Group-membership stability: exact top-1 identity wasn't cross-seed
     // stable for digits (no digit appeared in the unanimous list above),
@@ -1099,10 +1054,7 @@ fn main() {
                 _ => split += 1,
             }
         }
-        println!(
-            "  {name}: {unanimous_in} always stay in-category, {unanimous_out} always leave, {split} split, out of {} members",
-            members.len()
-        );
+        println!("  {name}: {unanimous_in} always stay in-category, {unanimous_out} always leave, {split} split, out of {} members", members.len());
     }
 
     // First formal-reasoning step in this whole line: every extraction so
@@ -1115,12 +1067,8 @@ fn main() {
     // primary_nn) - no retraining needed for this step specifically, it
     // only needs the pipeline to reach this point once per run.
     let cluster_same = |i: usize, j: usize| assignments[i] == assignments[j];
-    let attn_related = |i: usize, j: usize| {
-        primary_graph[i].iter().take(2).any(|&(k, _)| k == j) || primary_graph[j].iter().take(2).any(|&(k, _)| k == i)
-    };
-    let nn_related = |i: usize, j: usize| {
-        primary_nn[i].iter().any(|&(k, _)| k == j) || primary_nn[j].iter().any(|&(k, _)| k == i)
-    };
+    let attn_related = |i: usize, j: usize| primary_graph[i].iter().take(2).any(|&(k, _)| k == j) || primary_graph[j].iter().take(2).any(|&(k, _)| k == i);
+    let nn_related = |i: usize, j: usize| primary_nn[i].iter().any(|&(k, _)| k == j) || primary_nn[j].iter().any(|&(k, _)| k == i);
 
     let consistency_n = filtered_bytes.len();
     let mut total_pairs = 0;
@@ -1152,26 +1100,18 @@ fn main() {
             }
         }
     }
-    println!(
-        "\ncross-extraction formal consistency check (k-means / attention-graph top-2 / embedding-NN top-2), {total_pairs} byte pairs:"
-    );
+    println!("\ncross-extraction formal consistency check (k-means / attention-graph top-2 / embedding-NN top-2), {total_pairs} byte pairs:");
     println!("  cluster<->attention pairwise agreement: {:.3}", cluster_vs_attn_agree as f32 / total_pairs as f32);
     println!("  cluster<->embedding-NN pairwise agreement: {:.3}", cluster_vs_nn_agree as f32 / total_pairs as f32);
     println!("  attention<->embedding-NN pairwise agreement: {:.3}", attn_vs_nn_agree as f32 / total_pairs as f32);
     println!("  all 3 methods agree: {:.3} ({agree_all3} of {total_pairs} pairs)", agree_all3 as f32 / total_pairs as f32);
 
-    println!(
-        "\n  attention + embedding-NN both relate a pair, but clustering split them apart ({} pairs, first 15):",
-        attn_nn_agree_cluster_disagrees.len()
-    );
+    println!("\n  attention + embedding-NN both relate a pair, but clustering split them apart ({} pairs, first 15):", attn_nn_agree_cluster_disagrees.len());
     for &(i, j) in attn_nn_agree_cluster_disagrees.iter().take(15) {
         println!("    {:?} <-> {:?}", (filtered_bytes[i] as u8) as char, (filtered_bytes[j] as u8) as char);
     }
 
-    println!(
-        "\n  clustering grouped a pair together, but neither attention nor embedding-NN corroborate ({} pairs, first 15):",
-        cluster_agrees_attn_nn_disagree.len()
-    );
+    println!("\n  clustering grouped a pair together, but neither attention nor embedding-NN corroborate ({} pairs, first 15):", cluster_agrees_attn_nn_disagree.len());
     for &(i, j) in cluster_agrees_attn_nn_disagree.iter().take(15) {
         println!("    {:?} <-> {:?}", (filtered_bytes[i] as u8) as char, (filtered_bytes[j] as u8) as char);
     }
@@ -1260,8 +1200,7 @@ fn main() {
     // neighbor1 when there's no 2nd target.
     let n_nodes = filtered_bytes.len();
     let neighbor1: Vec<usize> = (0..n_nodes).map(|i| primary_graph[i].first().map(|&(j, _)| j).unwrap_or(i)).collect();
-    let neighbor2: Vec<usize> =
-        (0..n_nodes).map(|i| primary_graph[i].get(1).map(|&(j, _)| j).unwrap_or(neighbor1[i])).collect();
+    let neighbor2: Vec<usize> = (0..n_nodes).map(|i| primary_graph[i].get(1).map(|&(j, _)| j).unwrap_or(neighbor1[i])).collect();
 
     let node_features = model.token_emb.table.gather_rows(&filtered_bytes);
     let k_folds = 5;
@@ -1294,8 +1233,7 @@ fn main() {
     let mut summary = Vec::new();
     for (name, predicate, fold_seed) in categories {
         let labels: Vec<usize> = filtered_bytes.iter().map(|&b| if predicate(b) { 1 } else { 0 }).collect();
-        let (base, gnn, majority) =
-            run_kfold_probe(name, &labels, &node_features, &neighbor1, &neighbor2, d_model, k_folds, fold_seed, true);
+        let (base, gnn, majority) = run_kfold_probe(name, &labels, &node_features, &neighbor1, &neighbor2, d_model, k_folds, fold_seed, true);
         summary.push((name, majority, base, gnn));
     }
     println!("\nlinear-probe summary (category: majority-baseline | embedding-only | graph-augmented):");
@@ -1386,9 +1324,7 @@ fn main() {
             }
             let self_rate = self_count as f32 / covered as f32;
             let top_sink = sink_counts.iter().max_by_key(|&(_, &c)| c);
-            let sink_desc = top_sink
-                .map(|(&j, &c)| format!("{:?}({c})", (filtered_bytes[j] as u8) as char))
-                .unwrap_or_else(|| "-".to_string());
+            let sink_desc = top_sink.map(|(&j, &c)| format!("{:?}({c})", (filtered_bytes[j] as u8) as char)).unwrap_or_else(|| "-".to_string());
             println!("  block {block} head {head}: self-attention rate = {self_rate:.2}, top sink target = {sink_desc}");
         }
     }
@@ -1400,33 +1336,19 @@ fn main() {
     // retraining needed - all_heads already has every head's targets;
     // this just re-derives neighbor1/neighbor2 per head and reruns the
     // is-uppercase probe's graph-augmented condition against each.
-    let uppercase_labels: Vec<usize> =
-        filtered_bytes.iter().map(|&b| if ((b as u8) as char).is_ascii_uppercase() { 1 } else { 0 }).collect();
+    let uppercase_labels: Vec<usize> = filtered_bytes.iter().map(|&b| if ((b as u8) as char).is_ascii_uppercase() { 1 } else { 0 }).collect();
     // Reuses the embedding-only baseline already computed in the summary
     // loop above (same labels, same fold_seed=43) rather than recomputing
     // it - the baseline doesn't depend on which head's graph is used at
     // all, so there's nothing new to learn from rerunning it.
     let uppercase_baseline = summary.iter().find(|&&(name, ..)| name == "is-uppercase").unwrap().2;
-    println!(
-        "\nis-uppercase graph-augmented accuracy per (block, head) - embedding-only baseline = {uppercase_baseline:.3}:"
-    );
+    println!("\nis-uppercase graph-augmented accuracy per (block, head) - embedding-only baseline = {uppercase_baseline:.3}:");
     for block in 0..n_blocks {
         for head in 0..n_heads {
             let graph = &all_heads[block][head];
             let head_neighbor1: Vec<usize> = (0..n_nodes).map(|i| graph[i].first().map(|&(j, _)| j).unwrap_or(i)).collect();
-            let head_neighbor2: Vec<usize> =
-                (0..n_nodes).map(|i| graph[i].get(1).map(|&(j, _)| j).unwrap_or(head_neighbor1[i])).collect();
-            let (_, gnn_acc, _) = run_kfold_probe(
-                "is-uppercase",
-                &uppercase_labels,
-                &node_features,
-                &head_neighbor1,
-                &head_neighbor2,
-                d_model,
-                k_folds,
-                43,
-                false,
-            );
+            let head_neighbor2: Vec<usize> = (0..n_nodes).map(|i| graph[i].get(1).map(|&(j, _)| j).unwrap_or(head_neighbor1[i])).collect();
+            let (_, gnn_acc, _) = run_kfold_probe("is-uppercase", &uppercase_labels, &node_features, &head_neighbor1, &head_neighbor2, d_model, k_folds, 43, false);
             let delta = gnn_acc - uppercase_baseline;
             println!("  block {block} head {head}: graph-augmented = {gnn_acc:.3} ({delta:+.3})");
         }
@@ -1439,29 +1361,15 @@ fn main() {
     // Does the intersection category get restored by the SAME heads that
     // helped plain is-uppercase (block 3 head 5, block 3 head 0), or does
     // the doubly-constrained category need a different head entirely?
-    let uppercase_vowel_labels: Vec<usize> =
-        filtered_bytes.iter().map(|&b| matches!((b as u8) as char, 'A' | 'E' | 'I' | 'O' | 'U')).map(|m| m as usize).collect();
+    let uppercase_vowel_labels: Vec<usize> = filtered_bytes.iter().map(|&b| matches!((b as u8) as char, 'A' | 'E' | 'I' | 'O' | 'U')).map(|m| m as usize).collect();
     let uppercase_vowel_baseline = summary.iter().find(|&&(name, ..)| name == "is-uppercase-vowel").unwrap().2;
-    println!(
-        "\nis-uppercase-vowel graph-augmented accuracy per (block, head) - embedding-only baseline = {uppercase_vowel_baseline:.3}:"
-    );
+    println!("\nis-uppercase-vowel graph-augmented accuracy per (block, head) - embedding-only baseline = {uppercase_vowel_baseline:.3}:");
     for block in 0..n_blocks {
         for head in 0..n_heads {
             let graph = &all_heads[block][head];
             let head_neighbor1: Vec<usize> = (0..n_nodes).map(|i| graph[i].first().map(|&(j, _)| j).unwrap_or(i)).collect();
-            let head_neighbor2: Vec<usize> =
-                (0..n_nodes).map(|i| graph[i].get(1).map(|&(j, _)| j).unwrap_or(head_neighbor1[i])).collect();
-            let (_, gnn_acc, _) = run_kfold_probe(
-                "is-uppercase-vowel",
-                &uppercase_vowel_labels,
-                &node_features,
-                &head_neighbor1,
-                &head_neighbor2,
-                d_model,
-                k_folds,
-                46,
-                false,
-            );
+            let head_neighbor2: Vec<usize> = (0..n_nodes).map(|i| graph[i].get(1).map(|&(j, _)| j).unwrap_or(head_neighbor1[i])).collect();
+            let (_, gnn_acc, _) = run_kfold_probe("is-uppercase-vowel", &uppercase_vowel_labels, &node_features, &head_neighbor1, &head_neighbor2, d_model, k_folds, 46, false);
             let delta = gnn_acc - uppercase_vowel_baseline;
             println!("  block {block} head {head}: graph-augmented = {gnn_acc:.3} ({delta:+.3})");
         }
@@ -1486,10 +1394,7 @@ fn main() {
         }
         let correct = (0..n_nodes).filter(|&i| predictions[i] == labels[i]).count();
         let (p, r, f1) = precision_recall_f1(&labels, &predictions);
-        println!(
-            "  {name}: accuracy={:.3} ({correct}/{n_nodes}), precision={p:.3}, recall={r:.3}, f1={f1:.3}",
-            correct as f32 / n_nodes as f32
-        );
+        println!("  {name}: accuracy={:.3} ({correct}/{n_nodes}), precision={p:.3}, recall={r:.3}, f1={f1:.3}", correct as f32 / n_nodes as f32);
     }
 
     // First KR&R query capability: real multi-hop traversal instead of
@@ -1512,12 +1417,7 @@ fn main() {
             continue;
         };
         println!("  from {:?}:", target as char);
-        for (rel_name, adj) in [
-            ("cluster", &cluster_adj),
-            ("attention", &attn_adj),
-            ("embedding-NN", &nn_adj),
-            ("combined (any)", &combined_adj),
-        ] {
+        for (rel_name, adj) in [("cluster", &cluster_adj), ("attention", &attn_adj), ("embedding-NN", &nn_adj), ("combined (any)", &combined_adj)] {
             let one_hop = bfs_reachable(idx, 1, adj).len() - 1;
             let two_hop = bfs_reachable(idx, 2, adj).len() - 1;
             println!("    {rel_name}: 1-hop reaches {one_hop}, 2-hop reaches {two_hop} (of {} total)", n_nodes - 1);

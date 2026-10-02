@@ -29,8 +29,7 @@ const VOCAB_SIZE: usize = 256;
 fn main() {
     let corpus_a = encode_bytes(CORPUS_A);
 
-    let text = fs::read_to_string(CHECKPOINT_PATH)
-        .unwrap_or_else(|_| panic!("couldn't read {CHECKPOINT_PATH} - run checkpoint_save first"));
+    let text = fs::read_to_string(CHECKPOINT_PATH).unwrap_or_else(|_| panic!("couldn't read {CHECKPOINT_PATH} - run checkpoint_save first"));
     let flat: Vec<f32> = text.split_whitespace().map(|s| s.parse().expect("bad float in checkpoint")).collect();
     println!("read {} floats from {CHECKPOINT_PATH}", flat.len());
 
@@ -39,8 +38,7 @@ fn main() {
     let mut offset = 0usize;
     let token_emb = Embedding::from_flat(&flat, &mut offset, VOCAB_SIZE, D_MODEL);
     let pos_emb = Embedding::from_flat(&flat, &mut offset, SEQ_LEN, D_MODEL);
-    let blocks: Vec<TransformerBlock> =
-        (0..N_BLOCKS).map(|_| TransformerBlock::from_flat(&flat, &mut offset, D_MODEL, N_HEADS, D_FF)).collect();
+    let blocks: Vec<TransformerBlock> = (0..N_BLOCKS).map(|_| TransformerBlock::from_flat(&flat, &mut offset, D_MODEL, N_HEADS, D_FF)).collect();
     let final_ln = LayerNorm::from_flat(&flat, &mut offset, D_MODEL);
     let output_proj = Linear::from_flat(&flat, &mut offset, D_MODEL, VOCAB_SIZE);
     assert_eq!(offset, flat.len(), "checkpoint had leftover/missing floats - architecture mismatch");

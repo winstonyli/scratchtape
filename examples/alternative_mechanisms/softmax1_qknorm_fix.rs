@@ -98,8 +98,7 @@ impl CustomBlock {
             let k_out = self.k_heads[h].forward(tape, normed1);
             let v_out = self.v_heads[h].forward(tape, normed1);
 
-            let (q_for_scores, k_for_scores) =
-                if use_qknorm { (Self::l2_normalize_rows(tape, q_out.y), Self::l2_normalize_rows(tape, k_out.y)) } else { (q_out.y, k_out.y) };
+            let (q_for_scores, k_for_scores) = if use_qknorm { (Self::l2_normalize_rows(tape, q_out.y), Self::l2_normalize_rows(tape, k_out.y)) } else { (q_out.y, k_out.y) };
 
             // batch_size=1 throughout - batched_matmul(..., transpose_b=true)
             // does Q@K^T in one call, same as TransformerBlock::forward_full,
@@ -224,7 +223,20 @@ fn causal_mask(seq_len: usize) -> NdArray {
     NdArray::new(data, vec![seq_len, seq_len])
 }
 
-fn run(label: &str, use_softmax1: bool, use_qknorm: bool, d_model: usize, n_heads: usize, d_ff: usize, seq_len: usize, n_blocks: usize, vocab_size: usize, corpus: &[usize], lr: f32, max_steps: usize) {
+fn run(
+    label: &str,
+    use_softmax1: bool,
+    use_qknorm: bool,
+    d_model: usize,
+    n_heads: usize,
+    d_ff: usize,
+    seq_len: usize,
+    n_blocks: usize,
+    vocab_size: usize,
+    corpus: &[usize],
+    lr: f32,
+    max_steps: usize,
+) {
     let d_k = d_model / n_heads;
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);

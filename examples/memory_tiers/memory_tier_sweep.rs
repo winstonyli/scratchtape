@@ -56,14 +56,12 @@ fn main() {
     let corpus_a = encode_bytes(CORPUS_A);
     let corpus_b = encode_bytes(CORPUS_B);
 
-    let weights_text = fs::read_to_string(CHECKPOINT_PATH)
-        .unwrap_or_else(|_| panic!("couldn't read {CHECKPOINT_PATH} - run memory_tier_save first"));
+    let weights_text = fs::read_to_string(CHECKPOINT_PATH).unwrap_or_else(|_| panic!("couldn't read {CHECKPOINT_PATH} - run memory_tier_save first"));
     let flat: Vec<f32> = weights_text.split_whitespace().map(|s| s.parse().expect("bad float in checkpoint")).collect();
     let mut offset = 0usize;
     let base_token_emb = Embedding::from_flat(&flat, &mut offset, VOCAB_SIZE, D_MODEL);
     let base_pos_emb = Embedding::from_flat(&flat, &mut offset, SEQ_LEN, D_MODEL);
-    let base_blocks: Vec<TransformerBlock> =
-        (0..N_BLOCKS).map(|_| TransformerBlock::from_flat(&flat, &mut offset, D_MODEL, N_HEADS, D_FF)).collect();
+    let base_blocks: Vec<TransformerBlock> = (0..N_BLOCKS).map(|_| TransformerBlock::from_flat(&flat, &mut offset, D_MODEL, N_HEADS, D_FF)).collect();
     let base_final_ln = LayerNorm::from_flat(&flat, &mut offset, D_MODEL);
     let base_output_proj = Linear::from_flat(&flat, &mut offset, D_MODEL, VOCAB_SIZE);
     assert_eq!(offset, flat.len(), "checkpoint had leftover/missing floats - architecture mismatch");
@@ -71,8 +69,7 @@ fn main() {
     let loss_a_baseline = eval_loss(&base_token_emb, &base_pos_emb, &base_blocks, &base_final_ln, &base_output_proj, &corpus_a, SEQ_LEN);
     println!("loaded baseline: loss on A = {loss_a_baseline:.6}");
 
-    let replay_text = fs::read_to_string(REPLAY_PATH)
-        .unwrap_or_else(|_| panic!("couldn't read {REPLAY_PATH} - run memory_tier_save first"));
+    let replay_text = fs::read_to_string(REPLAY_PATH).unwrap_or_else(|_| panic!("couldn't read {REPLAY_PATH} - run memory_tier_save first"));
     let replay_flat: Vec<usize> = replay_text.split_whitespace().map(|s| s.parse().expect("bad token id in replay file")).collect();
     let replay_buffer: Vec<(Vec<usize>, Vec<usize>)> = (0..REPLAY_WINDOWS)
         .map(|i| {
@@ -114,9 +111,6 @@ fn main() {
         let loss_a = eval_loss(&token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &corpus_a, SEQ_LEN);
         let loss_b = eval_loss(&token_emb, &pos_emb, &blocks, &final_ln, &output_proj, &corpus_b, SEQ_LEN);
         let drift = l2_distance(&baseline_flat, &flat_of(&token_emb, &pos_emb, &blocks, &final_ln, &output_proj));
-        println!(
-            "  {replay_prob:.2}       | {loss_a:.4}    | {:+.4}          | {loss_b:.4}    | {drift:.4}",
-            loss_a - loss_a_baseline
-        );
+        println!("  {replay_prob:.2}       | {loss_a:.4}    | {:+.4}          | {loss_b:.4}    | {drift:.4}", loss_a - loss_a_baseline);
     }
 }

@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use scratchtape::tensor::NdArray;
 
 /// Baseline for the current naive i-k-j triple-loop matmul, to compare

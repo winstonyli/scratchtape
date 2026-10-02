@@ -65,7 +65,21 @@ pub fn layer_norm(x: &Handle, rows: usize, d: usize, params: &Handle, off: usize
     let out = LnOut { y: empty(rows * d), mean: empty(rows), rstd: empty(rows) };
     let (count, dim) = per_row(rows);
     super::count_launch();
-    k_ln_fwd::launch(client(), count, dim, whole(x), whole(params), whole(&out.y), whole(&out.mean), whole(&out.rstd), d as u32, off as u32, eps, (rows / m.k) as u32, m.stride as u32);
+    k_ln_fwd::launch(
+        client(),
+        count,
+        dim,
+        whole(x),
+        whole(params),
+        whole(&out.y),
+        whole(&out.mean),
+        whole(&out.rstd),
+        d as u32,
+        off as u32,
+        eps,
+        (rows / m.k) as u32,
+        m.stride as u32,
+    );
     out
 }
 

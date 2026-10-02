@@ -152,7 +152,19 @@ fn raw_score_range(block_out: &scratchtape::nn::TransformerBlockOut, tape: &Tape
 /// model - use_softmax1 is the only thing that differs between calls,
 /// isolating it as the sole variable rather than comparing across runs
 /// that also happened to get different random initializations.
-fn run(label: &str, use_softmax1: bool, d_model: usize, n_heads: usize, d_ff: usize, seq_len: usize, n_blocks: usize, vocab_size: usize, corpus: &[usize], lr: f32, max_steps: usize) {
+fn run(
+    label: &str,
+    use_softmax1: bool,
+    d_model: usize,
+    n_heads: usize,
+    d_ff: usize,
+    seq_len: usize,
+    n_blocks: usize,
+    vocab_size: usize,
+    corpus: &[usize],
+    lr: f32,
+    max_steps: usize,
+) {
     let mut rng = Rng::new(1);
     let mut token_emb = Embedding::new(&mut rng, vocab_size, d_model);
     let mut pos_emb = Embedding::new(&mut rng, seq_len, d_model);
@@ -163,9 +175,7 @@ fn run(label: &str, use_softmax1: bool, d_model: usize, n_heads: usize, d_ff: us
 
     let d_k = d_model / n_heads;
     println!("\n=== {label} (use_softmax1={use_softmax1}) ===");
-    println!(
-        "columns: step | loss | mean attn row-sum per block (0..3) | block0 raw score [min,max] | block0 Q/K weight L2 norm (summed over heads)"
-    );
+    println!("columns: step | loss | mean attn row-sum per block (0..3) | block0 raw score [min,max] | block0 Q/K weight L2 norm (summed over heads)");
 
     for step in 0..max_steps {
         let (input, target) = sample_window(&mut rng, corpus, seq_len);

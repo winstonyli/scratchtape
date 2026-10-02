@@ -147,7 +147,10 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> f32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() >= 5, "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout] [warmup_windows] [momentum]");
+    assert!(
+        args.len() >= 5,
+        "usage: training_recipe_check <name> <softmax1 0|1> <batch> <lr> [windows] [checkpoint_secs] [cpu|gpu] [seed] [weight_decay] [all|weights] [dropout] [warmup_windows] [momentum]"
+    );
     let name = &args[1];
     let softmax1 = args[2] == "1";
     let batch: usize = args[3].parse().unwrap();
@@ -194,7 +197,9 @@ fn main() {
 
     // Resume: header "<config> | <step> <rng state>", then the parameters,
     // then (momentum runs) the velocity.
-    let config = format!("softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed} wd={weight_decay} decay_all={decay_all} dropout={dropout} warmup={warmup_windows} momentum={momentum}");
+    let config = format!(
+        "softmax1={softmax1} batch={batch} lr={lr} windows={windows} seed={seed} wd={weight_decay} decay_all={decay_all} dropout={dropout} warmup={warmup_windows} momentum={momentum}"
+    );
     let resume_path = format!("runs/{name}.resume");
     let mut first = 0;
     let mut resumed_velocity = None;

@@ -40,14 +40,12 @@ fn main() {
     let corpus_a = encode_bytes(CORPUS_A);
     let corpus_b = encode_bytes(CORPUS_B);
 
-    let weights_text = fs::read_to_string(CHECKPOINT_PATH)
-        .unwrap_or_else(|_| panic!("couldn't read {CHECKPOINT_PATH} - run memory_tier_save first"));
+    let weights_text = fs::read_to_string(CHECKPOINT_PATH).unwrap_or_else(|_| panic!("couldn't read {CHECKPOINT_PATH} - run memory_tier_save first"));
     let flat: Vec<f32> = weights_text.split_whitespace().map(|s| s.parse().expect("bad float in checkpoint")).collect();
     let mut offset = 0usize;
     let mut token_emb = Embedding::from_flat(&flat, &mut offset, VOCAB_SIZE, D_MODEL);
     let mut pos_emb = Embedding::from_flat(&flat, &mut offset, SEQ_LEN, D_MODEL);
-    let mut blocks: Vec<TransformerBlock> =
-        (0..N_BLOCKS).map(|_| TransformerBlock::from_flat(&flat, &mut offset, D_MODEL, N_HEADS, D_FF)).collect();
+    let mut blocks: Vec<TransformerBlock> = (0..N_BLOCKS).map(|_| TransformerBlock::from_flat(&flat, &mut offset, D_MODEL, N_HEADS, D_FF)).collect();
     let mut final_ln = LayerNorm::from_flat(&flat, &mut offset, D_MODEL);
     let mut output_proj = Linear::from_flat(&flat, &mut offset, D_MODEL, VOCAB_SIZE);
     assert_eq!(offset, flat.len(), "checkpoint had leftover/missing floats - architecture mismatch");

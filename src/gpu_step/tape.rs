@@ -29,16 +29,53 @@ pub struct DVar(usize);
 
 #[derive(Clone)]
 enum Op {
-    Embed { ids: Handle, t: usize, vocab: usize, tok_off: usize, pos_off: usize },
-    LayerNorm { x: usize, fwd: LnOut, off: usize },
+    Embed {
+        ids: Handle,
+        t: usize,
+        vocab: usize,
+        tok_off: usize,
+        pos_off: usize,
+    },
+    LayerNorm {
+        x: usize,
+        fwd: LnOut,
+        off: usize,
+    },
     /// y = act(x @ W + b) (+ residual). W [inp, out] at w_off, b right after.
-    Linear { x: usize, inp: usize, w_off: usize, relu: bool, residual: Option<usize> },
+    Linear {
+        x: usize,
+        inp: usize,
+        w_off: usize,
+        relu: bool,
+        residual: Option<usize>,
+    },
     /// c[z] = a[z] @ b[z] (b stored transposed if trans_b), z < batch,
     /// each operand and c laid out in its node as its `Layout` says.
-    BatchedMatmul { a: usize, b: usize, lay: [Layout; 3], batch: usize, m: usize, k: usize, n: usize, trans_b: bool },
-    Softmax { x: usize, scale: f32 },
-    Dropout { x: usize, rate: f32, seed: u32 },
-    CrossEntropy { logits: usize, targets: Handle, fwd: CeOut, vocab: usize },
+    BatchedMatmul {
+        a: usize,
+        b: usize,
+        lay: [Layout; 3],
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_b: bool,
+    },
+    Softmax {
+        x: usize,
+        scale: f32,
+    },
+    Dropout {
+        x: usize,
+        rate: f32,
+        seed: u32,
+    },
+    CrossEntropy {
+        logits: usize,
+        targets: Handle,
+        fwd: CeOut,
+        vocab: usize,
+    },
 }
 
 /// Where a batched matmul's matrices sit in a node's [rows, cols] buffer.
@@ -281,10 +318,28 @@ impl<'p> DeviceTape<'p> {
                     // colsum(dz), dx (+)= dz Wᵀ
                     let rpm = rows / m.k;
                     let (xs, dzs) = (MatRef { stride: rpm * inp, ..MatRef::new(&xv) }, MatRef { stride: rpm * out, ..MatRef::new(&dz) });
-                    matmul(MatRef { trans: true, ..xs }, dzs, MatRef { off: w_off, stride: m.stride, ..MatRef::new(&grads) }, m.k, inp, rpm, out, Epilogue { accumulate: true, ..Default::default() });
+                    matmul(
+                        MatRef { trans: true, ..xs },
+                        dzs,
+                        MatRef { off: w_off, stride: m.stride, ..MatRef::new(&grads) },
+                        m.k,
+                        inp,
+                        rpm,
+                        out,
+                        Epilogue { accumulate: true, ..Default::default() },
+                    );
                     col_sum(&dz, rows, out, &grads, w_off + inp * out, m);
                     let (dx, acc) = self.grad_slot(x, true);
-                    matmul(dzs, MatRef { off: w_off, stride: m.stride, trans: true, ..MatRef::new(&p) }, MatRef { stride: rpm * inp, ..MatRef::new(&dx) }, m.k, rpm, out, inp, Epilogue { accumulate: acc, ..Default::default() });
+                    matmul(
+                        dzs,
+                        MatRef { off: w_off, stride: m.stride, trans: true, ..MatRef::new(&p) },
+                        MatRef { stride: rpm * inp, ..MatRef::new(&dx) },
+                        m.k,
+                        rpm,
+                        out,
+                        inp,
+                        Epilogue { accumulate: acc, ..Default::default() },
+                    );
                     if let Some(r) = residual {
                         self.add_grad(r, dz);
                     }
@@ -696,7 +751,20 @@ mod tests {
             let g = dev.read(&dev.grads);
             let mut want: Vec<(String, Var)> = vec![("token table".into(), to.table), ("position table".into(), po.table)];
             for (i, o) in bouts.iter().enumerate() {
-                for (name, v) in [("ln1 gamma", o.ln1_out.gamma), ("ln1 beta", o.ln1_out.beta), ("qkv w", o.qkv_out.w), ("qkv b", o.qkv_out.b), ("out_proj w", o.out_proj_out.w), ("out_proj b", o.out_proj_out.b), ("ln2 gamma", o.ln2_out.gamma), ("ln2 beta", o.ln2_out.beta), ("ffn1 w", o.ffn1_out.w), ("ffn1 b", o.ffn1_out.b), ("ffn2 w", o.ffn2_out.w), ("ffn2 b", o.ffn2_out.b)] {
+                for (name, v) in [
+                    ("ln1 gamma", o.ln1_out.gamma),
+                    ("ln1 beta", o.ln1_out.beta),
+                    ("qkv w", o.qkv_out.w),
+                    ("qkv b", o.qkv_out.b),
+                    ("out_proj w", o.out_proj_out.w),
+                    ("out_proj b", o.out_proj_out.b),
+                    ("ln2 gamma", o.ln2_out.gamma),
+                    ("ln2 beta", o.ln2_out.beta),
+                    ("ffn1 w", o.ffn1_out.w),
+                    ("ffn1 b", o.ffn1_out.b),
+                    ("ffn2 w", o.ffn2_out.w),
+                    ("ffn2 b", o.ffn2_out.b),
+                ] {
                     want.push((format!("block {i} {name}"), v));
                 }
             }

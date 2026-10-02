@@ -56,13 +56,7 @@ fn ravel_index(idx: &[usize], strides: &[usize]) -> usize {
 
 impl NdArray {
     pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
-        assert_eq!(
-            data.len(),
-            shape.iter().product::<usize>(),
-            "data len {} does not match shape {:?}",
-            data.len(),
-            shape
-        );
+        assert_eq!(data.len(), shape.iter().product::<usize>(), "data len {} does not match shape {:?}", data.len(), shape);
         Self { data, shape }
     }
 
@@ -85,10 +79,7 @@ impl NdArray {
     }
 
     pub fn relu(&self) -> Self {
-        Self {
-            data: self.data.iter().map(|&x| x.max(0.0)).collect(),
-            shape: self.shape.clone(),
-        }
+        Self { data: self.data.iter().map(|&x| x.max(0.0)).collect(), shape: self.shape.clone() }
     }
 
     pub fn sum(&self) -> Self {
@@ -96,10 +87,7 @@ impl NdArray {
     }
 
     pub fn exp(&self) -> Self {
-        Self {
-            data: self.data.iter().map(|&x| x.exp()).collect(),
-            shape: self.shape.clone(),
-        }
+        Self { data: self.data.iter().map(|&x| x.exp()).collect(), shape: self.shape.clone() }
     }
 
     /// Folds each row of the last axis with `f` from `init`, keeping that
@@ -112,11 +100,7 @@ impl NdArray {
         let width = self.shape[nd - 1];
         let mut out_shape = self.shape.clone();
         out_shape[nd - 1] = 1;
-        let data = if width == 0 {
-            vec![init; out_shape.iter().product()]
-        } else {
-            self.data.chunks_exact(width).map(|row| row.iter().fold(init, |acc, &x| f(acc, x))).collect()
-        };
+        let data = if width == 0 { vec![init; out_shape.iter().product()] } else { self.data.chunks_exact(width).map(|row| row.iter().fold(init, |acc, &x| f(acc, x))).collect() };
         Self { data, shape: out_shape }
     }
 
@@ -150,10 +134,7 @@ impl NdArray {
         for a in arrays {
             assert_eq!(a.shape.len(), nd, "concat_last_axis: rank mismatch");
             for d in 0..nd - 1 {
-                assert_eq!(
-                    a.shape[d], arrays[0].shape[d],
-                    "concat_last_axis: shapes must match on all but the last axis"
-                );
+                assert_eq!(a.shape[d], arrays[0].shape[d], "concat_last_axis: shapes must match on all but the last axis");
             }
             total_last += a.shape[nd - 1];
         }
@@ -229,17 +210,11 @@ impl NdArray {
     /// negative, no cancellation possible), and adding a defensive check here
     /// would just be validating an invariant that already holds upstream.
     pub fn sqrt(&self) -> Self {
-        Self {
-            data: self.data.iter().map(|&x| x.sqrt()).collect(),
-            shape: self.shape.clone(),
-        }
+        Self { data: self.data.iter().map(|&x| x.sqrt()).collect(), shape: self.shape.clone() }
     }
 
     pub fn scale(&self, c: f32) -> Self {
-        Self {
-            data: self.data.iter().map(|&x| x * c).collect(),
-            shape: self.shape.clone(),
-        }
+        Self { data: self.data.iter().map(|&x| x * c).collect(), shape: self.shape.clone() }
     }
 
     /// Elementwise natural log. -inf at exactly 0, NaN below 0 (IEEE 754
@@ -247,10 +222,7 @@ impl NdArray {
     /// to keep inputs away from exactly 0 (softmax's max subtraction stops
     /// overflow but not a probability underflowing to 0).
     pub fn log(&self) -> Self {
-        Self {
-            data: self.data.iter().map(|&x| x.ln()).collect(),
-            shape: self.shape.clone(),
-        }
+        Self { data: self.data.iter().map(|&x| x.ln()).collect(), shape: self.shape.clone() }
     }
 
     /// One-hot encoding of class indices - plain constant data, not a Tape
