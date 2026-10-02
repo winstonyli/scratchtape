@@ -1071,6 +1071,25 @@ it means here.
   setting that helps per model (1.650 vs 1.686) at a small ensemble cost
   (1.558), and ramping α changes nothing. Details and caveats in
   `docs/fusion_results.md`.
+- Lin, Stich, Patel, Jaggi 2020, *Don't Use Large Mini-Batches, Use Local SGD*
+  ([arXiv 1808.07217](https://arxiv.org/abs/1808.07217), ICLR 2020):
+  post-local SGD (local SGD after a warm phase of large-batch SGD)
+  generalizes much better than large-batch training. Our batch-128 vs
+  averaged gap (1.755 vs 1.651 on aesop) points the same way; we did not
+  try their warm-start variant.
+- Xue et al. 2023, *To Repeat or Not To Repeat: Insights from Scaling LLM
+  under Token-Crisis* ([arXiv 2305.13230](https://arxiv.org/abs/2305.13230)):
+  repeating data across epochs degrades language models, and dropout is
+  the one regularizer that clearly helps, with careful tuning as the
+  model grows. Our novels6 dropout sweep (0.1 best at 4M windows) is a
+  small-scale case of this.
+- Liu et al. 2023, *Dropout Reduces Underfitting*
+  ([arXiv 2303.01500](https://arxiv.org/abs/2303.01500)): dropout early in
+  training reduces gradient-direction variance and lowers training loss
+  ("early dropout"); for models that overfit, switching it on only late
+  ("late dropout") helps. Untested here: our gap widens late in long
+  runs (0.105 at 4M windows, 0.124 at 8M), so a dropout schedule is a
+  cheap follow-up.
 - Douillard et al. 2023, *DiLoCo* ([arXiv 2311.08105](https://arxiv.org/abs/2311.08105)):
   replicas from one init train locally and periodically average weights.
   Tried in its simplest form (plain mean of the K models every H steps,

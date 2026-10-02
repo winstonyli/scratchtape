@@ -442,9 +442,13 @@ Next, in order:
    fits train less and generalizes better, up to a plateau by H = 100.
    So the gain comes from letting the models drift apart between syncs
    (local-SGD noise acting as a regularizer), not from having four
-   models' data per step. A lead, not checked here: the literature on
-   "post-local SGD" (Lin et al., 2018) reports local SGD generalizing
-   better than large-batch SGD; look it up before citing.
+   models' data per step. Checked 2026-10-02 (abstract re-fetched): Lin,
+   Stich, Patel and Jaggi, "Don't Use Large Mini-Batches, Use Local SGD"
+   (ICLR 2020, arXiv 1808.07217), report that post-local SGD (local SGD
+   started after a warm phase of ordinary large-batch SGD) generalizes
+   much better than large-batch training. That matches the direction of
+   our batch-128 vs averaged gap; we ran local SGD from the start and
+   did not test their warm-start variant.
 
    **Round 11 (2026-10-01): a corpus past 373 KB.** `novels6` = six
    Gutenberg novels (Frankenstein, Pride and Prejudice, A Tale of Two
