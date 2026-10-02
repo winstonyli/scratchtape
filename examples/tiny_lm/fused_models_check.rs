@@ -33,13 +33,15 @@
 //
 //   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups] [checkpoint_secs]
 //
-// Every 8000 windows it prints each model's held-out CE (training_recipe_check's
-// deterministic 371 windows), their mean, and the ensemble's: the CE of
-// the models' averaged probabilities, from per-row losses read back at
-// evals only. At the end each model is re-scored alone (K = 1 on the
-// device) and must match its fused score to 1e-4; parameters go to
-// runs/<name>_m<m>.ckpt (flatten_all order). No resume: a 1M-window run
-// at K 4 takes minutes.
+// Every 8000 windows (with averaging, only at sync points) it prints each
+// model's held-out CE over every non-overlapping 64-byte window of the
+// corpus's held-out split (common::split_corpus; 371 windows for
+// aesops_fables), their mean, and the ensemble's: the CE of the models'
+// averaged probabilities, from per-row losses read back at evals only. At
+// the end it prints the train-probe CE (the same number of windows from
+// the start of the training text), then each model is re-scored alone
+// (K = 1 on the device) and must match its fused score to 1e-4; parameters
+// go to runs/<name>_m<m>.ckpt (flatten_all order).
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, pack, read, upload_f32};
