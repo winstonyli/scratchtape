@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [store=<train windows in the memory>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [store=<train windows in the memory>]
 //             [threads=<search threads>] [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -18,7 +18,8 @@
 //                   p' = (1-lambda) * p + lambda * p_knn.
 // `tap` picks which block's output the tiers get as the position's hidden state (default: the last block, i.e. the
 // final residual stream before the final LayerNorm). With `stride` > 1 the model alone is scored on the same
-// subsample, so tiers are always compared to the plain model on identical positions (Gate 0's `expect` needs stride 1).
+// subsample, so tiers are always compared to the plain model on identical positions (Gate 0's `expect` needs stride 1). `offset` picks which of the `stride` interleaved subsamples, so tuning and
+// testing can use disjoint windows.
 //
 // Gate 0: the CE computed here from the logits must match the device's own row losses (1e-4) and, with
 // `expect=`, the number recorded for the checkpoint (to its 4 printed digits).
@@ -318,7 +319,7 @@ fn main() {
         let (k, v) = a.split_once('=').unwrap_or_else(|| panic!("expected key=value, got {a}"));
         match k {
             "tier" => specs.push(v.to_string()),
-            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "store" | "threads" => {
+            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "threads" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -331,6 +332,8 @@ fn main() {
     assert!(tap < cfg.n_blocks, "tap must be a block index below {}", cfg.n_blocks);
     let stride = size("stride", "1");
     assert!(stride >= 1 && (stride == 1 || !opt.contains_key("expect")), "stride >= 1, and `expect` needs stride 1");
+    let offset = size("offset", "0");
+    assert!(offset < stride, "offset must be below stride");
     let corpus = get("corpus", "novels6");
 
     let flat: Vec<f32> = std::fs::read_to_string(ckpt).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
@@ -373,7 +376,7 @@ fn main() {
     let need_hidden = tiers.iter().flatten().any(|t| t.needs_hidden());
     let (mut ce_model, mut ce_device) = (0.0f64, 0.0f64);
     let mut ce_tier = vec![0.0f64; tiers.len()];
-    let starts: Vec<usize> = (0..held_out.len() - SEQ_LEN).step_by(SEQ_LEN * stride).collect();
+    let starts: Vec<usize> = (offset * SEQ_LEN..held_out.len() - SEQ_LEN).step_by(SEQ_LEN * stride).collect();
     for (ci, chunk) in starts.chunks(CHUNK).enumerate() {
         let f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden);
         let rows = f.ids.len();
@@ -399,7 +402,7 @@ fn main() {
     }
     let n = (starts.len() * SEQ_LEN) as f64;
     let (ce_model, ce_device) = (ce_model / n, ce_device / n);
-    println!("checkpoint {ckpt}: {} windows (stride {stride}), {} positions; tap = block {tap}", starts.len(), n as usize);
+    println!("checkpoint {ckpt}: {} windows (stride {stride}, offset {offset}), {} positions; tap = block {tap}", starts.len(), n as usize);
     println!("model alone: CE {ce_model:.4} (device row losses {ce_device:.4})");
     assert!((ce_model - ce_device).abs() < 1e-4, "gate 0: CE from logits {ce_model:.5} vs device row losses {ce_device:.5}");
     if let Some(expect) = opt.get("expect") {

@@ -1,7 +1,7 @@
 # Tiered AI: first cross-tier experiments
 
 Direction and tier map: README, "Direction: tiered AI". Related work: README, "Tiered and neuro-symbolic
-architectures". Status: step 0 and Experiment A built and measured (2026-10-02); Experiment B measured once (first sweep).
+architectures". Status: step 0 and Experiment A built and measured (2026-10-02); Experiment B measured on a tune/test split.
 
 ## What exists and what does not
 
@@ -86,6 +86,16 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   not bracketed. The gain is ~1.7x the lexicon's, from a different source (train-text continuations of similar
   states), but note: a single subsample, hyperparameters picked on the same positions they are scored on (a small
   optimistic bias), a 21% datastore (more keys probably help), and nothing yet on a disjoint tuning split.
+
+- **Experiment B, tune/test split (`scripts/tier_knn_sweep.sh`; logs `runs/tier_knn_2m_o0.log`, `_o8.log`):**
+  1.92M keys (30000 train windows, 43% of train positions), k in {32, 64}, lambda in {0.1, 0.2, 0.3}, temp in
+  {20, 30, 50}, tuned on every 16th held-out window from offset 0 (model alone 1.2565) and tested on the disjoint
+  offset 8 (1.2524). Best on tune **k=64, lambda 0.3, temp 30: -0.0168**; the same setting on test **-0.0181**,
+  so the gain is not tuning bias. More keys and larger k both help (k=32 at 1M keys: -0.0103; at 1.92M keys:
+  -0.0147), and the optimum is still at the grid edge (k cap 64, lambda 0.3). **Stacked** `lexicon:0.3+knn:64:0.2:30`:
+  tune -0.0215, test **-0.0212** (lexicon alone -0.0076 / -0.0053, knn alone at those settings -0.0160 / -0.0169):
+  the tiers largely add. Cost: ~25 min per 31488-position subsample at 4 threads on a shared CPU (brute-force
+  search, 1.92M x 256 per query), so a full-held-out run is out of reach without an index or the GPU.
 
 ## Order
 
