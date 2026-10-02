@@ -1,7 +1,7 @@
 # Tiered AI: first cross-tier experiments
 
 Direction and tier map: README, "Direction: tiered AI". Related work: README, "Tiered and neuro-symbolic
-architectures". Status: step 0 and Experiment A built and measured (2026-10-02); Experiment B not built.
+architectures". Status: step 0 and Experiment A built and measured (2026-10-02); Experiment B measured once (first sweep).
 
 ## What exists and what does not
 
@@ -72,8 +72,20 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   is rejected at only 1676 of them (0.5%), and the next-best allowed byte is then right 1065 times (64%).
 - Reading: the model already spells almost everything, so a train-split lexicon adds little; the high optimal eps
   (0.3) means a lot of held-out words are outside the lexicon (names in the held-out tails), not that the mask
-  is wrong. Not measured: the held-out out-of-vocabulary rate, and a lexicon that also scores word frequency or
+  is wrong. Held-out OOV (measured, printed by `tier_eval` at every run): 1294 of 92358 word
+  tokens (1.40%), covering 1.97% of held-out bytes, are absent from the train lexicon. That is the leak-free cost
+  of the mask and explains the high optimum eps. Not measured: a lexicon that also scores word frequency or
   context (a bigram tier) rather than only masking.
+
+- **Experiment B (kNN memory, first sweep; log `runs/tier_knn_1m.log`):** 960000 keys (15000 evenly spaced train
+  windows, 21% of train positions; key = final residual stream, block 3 output), scored on every 16th held-out
+  window (492 windows, 31488 positions; model alone **1.2565** on this subsample, not 1.2408). Grid k in {8, 32},
+  lambda in {0.05..0.4}, temp in {10, 30, 100} (squared-L2 distances: nearest ~41, 32nd ~70). Best **k=32,
+  lambda=0.2, temp=30: 1.2462 (-0.0103)**; k=8 best -0.0065 (lambda 0.1, temp 30). lambda 0.4 hurts everywhere
+  except k=32/temp 30 (flat). Larger k was better, and k=32 is the grid's edge (max supported 64), so the optimum is
+  not bracketed. The gain is ~1.7x the lexicon's, from a different source (train-text continuations of similar
+  states), but note: a single subsample, hyperparameters picked on the same positions they are scored on (a small
+  optimistic bias), a 21% datastore (more keys probably help), and nothing yet on a disjoint tuning split.
 
 ## Order
 
