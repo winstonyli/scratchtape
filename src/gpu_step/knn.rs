@@ -580,4 +580,56 @@ mod tests {
             }
         }
     }
+
+    /// Spike for a fused matmul + threshold filter: a 16x16 accumulator tile stored to shared memory, read back per lane.
+    /// out[0..256] = the tile as seen through shared memory; out[256] = number of entries below `thr`.
+    #[cube(launch)]
+    fn k_tile_to_shared(a: &[f16], b: &[f16], out: &mut [f32], thr: f32) {
+        let c = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0);
+        let at = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &a[0..a.len()], 16u32);
+        let bt = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &b[0..b.len()], 16u32);
+        cmma::execute(&at, &bt, &c, &c);
+        let mut tile = Shared::<[f32]>::new_slice(256usize);
+        cmma::store(&mut tile, &c, 16u32, cmma::MatrixLayout::RowMajor);
+        sync_cube();
+        let mut below = 0.0f32;
+        for i in 0..256u32 {
+            if i % CUBE_DIM == UNIT_POS {
+                let v = tile[i as usize];
+                out[i as usize] = v;
+                if v < thr {
+                    below += 1.0;
+                }
+            }
+        }
+        let total = plane_sum(below);
+        if UNIT_POS == 0 {
+            out[256usize] = total;
+        }
+    }
+
+    #[test]
+    fn matrix_core_tile_goes_through_shared_memory() {
+        if !client().features().matmul.cmma.contains(&f16_config()) {
+            return;
+        }
+        let mut rng = Rng::new(3);
+        let a: Vec<f16> = (0..256).map(|_| f16::from_f32(rng.next_gaussian())).collect();
+        let b: Vec<f16> = (0..256).map(|_| f16::from_f32(rng.next_gaussian())).collect();
+        let (ah, bh) = (client().create_from_slice(f16::as_bytes(&a)), client().create_from_slice(f16::as_bytes(&b)));
+        let out = upload_f32(&vec![-1.0f32; 257]);
+        let plane = client().properties().hardware.plane_size_max;
+        let thr = 0.0f32;
+        k_tile_to_shared::launch(client(), CubeCount::Static(1, 1, 1), CubeDim::new_1d(plane), buf(&ah, 256), buf(&bh, 256), buf(&out, 257), thr);
+        let got = read(&out);
+        let mut below = 0;
+        for i in 0..16 {
+            for j in 0..16 {
+                let want: f32 = (0..16).map(|k| a[i * 16 + k].to_f32() * b[k * 16 + j].to_f32()).sum();
+                assert!((got[i * 16 + j] - want).abs() < 1e-3, "tile[{i},{j}]: {} vs {want}", got[i * 16 + j]);
+                below += (want < thr) as usize;
+            }
+        }
+        assert_eq!(got[256] as usize, below);
+    }
 }

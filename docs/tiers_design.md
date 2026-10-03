@@ -344,3 +344,12 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
 Open questions for the user: is the lexicon a reasonable first "KR&R" content, or should the CPU tier hold
 something else (rules the LM must satisfy, e.g. quote/bracket matching)? Is the final residual stream the right
 "working memory" to expose to the long-term tier?
+
+## Fused matmul + threshold filter: matrix-core tile into shared memory (2026-10-02)
+
+Spike for the fused-kernel option (survey 3). `cmma::store` into `Shared::<[f32]>::new_slice(256)`, then `sync_cube()`, then
+per-lane reads and a `plane_sum` count of entries below a threshold: the tile matches the CPU product (1e-3) and the count
+matches (test `matrix_core_tile_goes_through_shared_memory`, f16 x f16 -> f32, 16x16x16, passes on the RX 9060 XT). So the
+main unknown is settled: the accumulator tile can be filtered in-kernel without writing `dist` to global memory. Still
+unmeasured: the speed of a full fused kernel (threshold lookup, survivor compaction via `Atomic<u32>::fetch_add` or
+`plane_exclusive_sum`, a per-tile survivor buffer feeding a smaller top-k). Guess ~2x on search; not started.
