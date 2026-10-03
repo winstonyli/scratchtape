@@ -244,8 +244,9 @@ impl KnnStore {
         // The kernel's starting threshold per query (infinity: none).
         let thr_q: Vec<f32> = (0..q).map(|r| if thresholds { widen(thr[r * THRESH_RANK + THRESH_RANK - 1]) } else { f32::INFINITY }).collect();
         let thr_buf = upload_f32(&thr_q);
+        let t_pass1 = t_start.elapsed();
         if timing {
-            t_mm += t_start.elapsed();
+            t_mm += t_pass1;
         }
         let mut base = 0usize;
         for t in &self.tiles {
@@ -273,10 +274,11 @@ impl KnnStore {
         let t_read = t0.elapsed();
         if timing {
             eprintln!(
-                "knn timing: {q} queries x {} keys{}: matmul+thresholds {:.0} ms, top-k {:.0} ms, readback {:.0} ms, total {:.0} ms",
+                "knn timing: {q} queries x {} keys{}: matmul+thresholds {:.0} ms (thresholds alone {:.0}), top-k {:.0} ms, readback {:.0} ms, total {:.0} ms",
                 self.len(),
                 if thresholds { "" } else { " (no thresholds)" },
                 t_mm.as_secs_f64() * 1e3,
+                t_pass1.as_secs_f64() * 1e3,
                 t_topk.as_secs_f64() * 1e3,
                 t_read.as_secs_f64() * 1e3,
                 t_start.elapsed().as_secs_f64() * 1e3
@@ -410,6 +412,21 @@ fn k_topk(
             worst = thr_q;
         }
         let (lo_q, hi_q) = (lo[qi as usize], hi[qi as usize]);
+        // Live entries in the list (the rest is INF padding, which an insertion need not move): the first INF, by binary
+        // search, since the list is sorted and earlier slices or tiles may have filled part of it.
+        let mut c_lo = 0u32;
+        let mut c_hi = c_lo + KM;
+        for _it in 0..9 {
+            if c_lo < c_hi {
+                let mid = (c_lo + c_hi) / 2;
+                if best_d[(base + mid) as usize] < f32::INFINITY {
+                    c_lo = mid + 1;
+                } else {
+                    c_hi = mid;
+                }
+            }
+        }
+        let mut cnt = c_lo;
         for jl in 0..chunk {
             let jj = start + jl;
             if jj < len {
@@ -440,8 +457,16 @@ fn k_topk(
                         }
                     }
                     let p = lo_i;
-                    for s in 0..KM - 1 - p {
-                        let i = KM - 1 - s;
+                    // Entries p..top move down one place (top = the last live entry; with a full list it falls off).
+                    let mut top = cnt;
+                    if top > KM - 1 {
+                        top = KM - 1;
+                    }
+                    if cnt < KM {
+                        cnt += 1;
+                    }
+                    for s in 0..top - p {
+                        let i = top - s;
                         best_d[(base + i) as usize] = best_d[(base + i - 1) as usize];
                         best_v[(base + i) as usize] = best_v[(base + i - 1) as usize];
                     }

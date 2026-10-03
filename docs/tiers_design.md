@@ -332,6 +332,15 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   per block (32 parts) against 1.4-2.4 s with insertions: even with thresholds, insertions are ~70% of top-k. Parts for a
   1024-query block, best of 2 rounds: 16: 1.63 s, 24: 1.44, 32: 1.48 (second round 2.08, 1.79, 1.76), so 24-32 is ~10-15%
   better than 16; `parts` is now `32768 / queries` clamped to 8..=32 (`KNN_PARTS` forces a value).
+- **Top-k insertion shifts only live entries (2026-10-02).** `k_topk` used to shift the whole INF-padded tail on every
+  insertion (~200 entries); it now finds the live count once (binary search for the first INF, so it resumes across
+  slices and tiles) and shifts only to it. With thresholds a part sees ~120 survivors, so lists stay short. Same slice
+  (`part=5/96`, warm 32, online; `runs/tier_cnt.sh`; contended machine, CPU ~30%, Defender off), CE identical (1.0943):
+  top-k per 1024-query block **1.38-1.45 s -> 0.82-0.85 s** (~1.7x; first block of each run is warm-up). Whole slice
+  15.7 / 22.3 / 17.7 s (3 baseline runs) -> 13.7 / 14.9 s; noisy. Split of a block now (`KNN_TIMING=1`, which also prints
+  the pass-1 time): total ~2.2 s = matmul ~0.6 + **pass-1 thresholds ~0.6** + top-k ~0.9. The threshold kernel (`k_thresh`)
+  is one thread per query (1024 threads) scanning ~74k sample keys serially: it now costs as much as the matmul. Fused
+  matmul+filter kernel stays parked: dist traffic is ~0.06 s per block, and the gain would be the scan floor (~0.5 s) only.
 
 ## Order
 
