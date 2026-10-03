@@ -628,10 +628,11 @@ fn main() {
             (build.elapsed() - t_fwd - gpu.flush_time[0] - gpu.flush_time[1]).as_secs_f64()
         );
         println!(
-            "memory: {} keys of {} floats from {n_train} train + {n_held} unscored held-out windows{} (tap = block {tap}), searched on the GPU",
+            "memory: {} keys of {} floats from {n_train} train + {n_held} unscored held-out windows{} (tap = block {tap}), searched on the GPU in {}",
             gpu.len(),
             cfg.d,
-            if online { ", then written online as scored" } else { "" }
+            if online { ", then written online as scored" } else { "" },
+            if gpu.is_f16() { "f16 on matrix cores (KNN_F32=1 for exact f32)" } else { "f32" }
         );
         let n_train_keys = n_train * SEQ_LEN;
         let online = online.then(|| {

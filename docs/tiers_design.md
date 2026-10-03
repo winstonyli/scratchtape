@@ -312,7 +312,7 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   memory. Run: 2502 s (42 min), 98% in the kNN search (~5 s per 32-window chunk), build 29 s, CPU tiers 27 s; the machine
   was shared (CPU ~60% from other sessions), Defender real-time off.
 
-- **f16 matrix cores for the search (`KNN_F16=1`, off by default).** Keys and queries are rounded to f16 and multiplied
+- **f16 matrix cores for the search (default since 2026-10-02; `KNN_F32=1` selects the exact f32 path).** Keys and queries are rounded to f16 and multiplied
   on the matrix cores (cubecl cmma, f16 x f16 -> f32, 16x16 tiles, one plane per tile; the spike's kernel); norms come
   from the rounded vectors, so a distance is exactly the squared distance between the rounded vectors. Unit test
   `f16_search_matches_cpu_brute_force_on_rounded_vectors` (padding included). Timing, same slice (`part=5/96`, warm 32;
@@ -325,7 +325,7 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   CPU 17% at launch).** All six specs and the model alone match the f32 run (`tier_full4`) to the 4th decimal
   (lexicon+words+memory 1.1313, -0.0451; memory alone 1.1352, -0.0412). Wall time of the scoring loop **2502 s -> 1355 s**
   (23 min; search 1306 s), build 30 s. So `KNN_F16=1` costs nothing measurable at the reported precision and nearly halves
-  the full run; it is still off by default.
+  the full run; it is now the default (falls back to f32 if the device lacks the f16 matrix-core configuration or d, tile are not multiples of 16).
 
 ## Order
 

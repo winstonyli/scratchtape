@@ -48,7 +48,7 @@ pub struct KnnStore {
     pending_keys: Vec<f32>,
     pending_vals: Vec<u8>,
     sample_keys: Vec<f32>,
-    /// Keys and queries as f16 on the matrix cores (`KNN_F16=1`): about 2x faster matmul and half the key memory, but
+    /// Keys and queries as f16 on the matrix cores (the default; `KNN_F32=1` selects the exact f32 path): about 2x faster matmul and half the key memory, but
     /// distances carry f16 rounding (~1e-3 relative); norms are taken from the rounded vectors so a distance is exactly
     /// the squared distance between the rounded vectors.
     f16: bool,
@@ -60,7 +60,9 @@ pub struct KnnStore {
 
 impl KnnStore {
     pub fn new(d: usize, tile: usize) -> Self {
-        Self::with_precision(d, tile, std::env::var_os("KNN_F16").is_some())
+        // f16 matrix cores unless `KNN_F32` is set, or the shapes or the device do not allow them.
+        let f16 = std::env::var_os("KNN_F32").is_none() && d % 16 == 0 && tile % 16 == 0 && client().features().matmul.cmma.contains(&f16_config());
+        Self::with_precision(d, tile, f16)
     }
 
     pub fn with_precision(d: usize, tile: usize, f16: bool) -> Self {
@@ -126,6 +128,11 @@ impl KnnStore {
         } else {
             (upload_f32(keys), keys.chunks_exact(self.d).map(|k| k.iter().map(|x| x * x).sum()).collect())
         }
+    }
+
+    /// Whether keys and queries are f16 on the matrix cores.
+    pub fn is_f16(&self) -> bool {
+        self.f16
     }
 
     pub fn len(&self) -> usize {
@@ -460,7 +467,7 @@ mod tests {
         let keys: Vec<f32> = (0..n * d).map(|_| rng.next_gaussian()).collect();
         let vals: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
         let queries: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
-        let mut store = KnnStore::new(d, 300);
+        let mut store = KnnStore::with_precision(d, 300, false);
         store.add(&keys[..400 * d], &vals[..400]);
         store.add(&keys[400 * d..], &vals[400..]);
         store.finish();
@@ -488,7 +495,7 @@ mod tests {
         let keys: Vec<f32> = (0..n * d).map(|_| rng.next_gaussian()).collect();
         let vals: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
         let queries: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
-        let mut store = KnnStore::new(d, 300);
+        let mut store = KnnStore::with_precision(d, 300, false);
         store.add(&keys, &vals);
         store.finish();
         // Keys below 100 are always allowed; query r also sees [lo_r, hi_r), some with fewer than KMAX allowed keys.
@@ -519,7 +526,7 @@ mod tests {
         let keys: Vec<f32> = (0..n * d).map(|_| rng.next_gaussian()).collect();
         let vals: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
         let queries: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
-        let mut store = KnnStore::new(d, 16384);
+        let mut store = KnnStore::with_precision(d, 16384, false);
         store.add(&keys, &vals);
         store.finish();
         assert!(store.sample_keys.len() / d >= n / SAMPLE_STRIDE);
