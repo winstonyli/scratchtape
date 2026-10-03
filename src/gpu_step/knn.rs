@@ -98,18 +98,43 @@ impl KnnStore {
             let lo = client().create_from_slice(u32::as_bytes(&ranges[q0..q0 + q].iter().map(|r| r.0).collect::<Vec<_>>()));
             let hi = client().create_from_slice(u32::as_bytes(&ranges[q0..q0 + q].iter().map(|r| r.1).collect::<Vec<_>>()));
             let mut base = 0usize;
+            // KNN_TIMING=1: sync between stages (a read of a small buffer waits for the queue) and report their wall time.
+            let timing = std::env::var_os("KNN_TIMING").is_some();
+            let (mut t_mm, mut t_topk) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            let t_start = std::time::Instant::now();
             for t in &self.tiles {
+                let t0 = std::time::Instant::now();
                 let (a, b, o) = (MatRef::new(&t.keys), MatRef { trans: true, ..MatRef::new(&qh) }, MatRef::new(&dist));
                 matmul(a, b, o, 1, t.len, self.d, q, Epilogue::default());
+                if timing {
+                    read(&hi);
+                    t_mm += t0.elapsed();
+                }
+                let t0 = std::time::Instant::now();
                 for j0 in (0..t.len).step_by(SLICE) {
                     super::count_launch();
                     let n = SLICE.min(t.len - j0);
                     #[rustfmt::skip]
                     k_topk::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * q), buf(&t.norms, t.len), buf(&t.vals, t.len), buf(&best_d, q * KMAX), buf(&best_v, q * KMAX), buf(&lo, q), buf(&hi, q), always, q as u32, (base + j0) as u32, j0 as u32, n as u32);
                 }
+                if timing {
+                    read(&hi);
+                    t_topk += t0.elapsed();
+                }
                 base += t.len;
             }
+            let t0 = std::time::Instant::now();
             let (bd, bv) = (read(&best_d), read(&best_v));
+            if timing {
+                eprintln!(
+                    "knn timing: {q} queries x {} keys: matmul {:.0} ms, top-k {:.0} ms, readback {:.0} ms, total {:.0} ms",
+                    self.len(),
+                    t_mm.as_secs_f64() * 1e3,
+                    t_topk.as_secs_f64() * 1e3,
+                    t0.elapsed().as_secs_f64() * 1e3,
+                    t_start.elapsed().as_secs_f64() * 1e3
+                );
+            }
             for r in 0..q {
                 let qn: f32 = block[r * self.d..(r + 1) * self.d].iter().map(|x| x * x).sum();
                 for j in 0..KMAX {

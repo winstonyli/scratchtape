@@ -246,6 +246,13 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   measured. Contended: CPU 35% at launch, another process (`WizardGraphicalClient`) on the eGPU, Defender real-time off.
   So the suspected per-window flush and CPU softmax are not the bottleneck; the search is.
 
+- **Where the search time goes (`KNN_TIMING=1`, staged syncs in `KnnStore::search_masked`; 4.53M keys, k=256).** Per
+  2048-query block: matmul 1.3 s (16%), **top-k 6.4-7.9 s (84%)**, readback 3 ms. A 256-query block still takes 5.4 s
+  of top-k (matmul 0.4 s): top-k time barely depends on the number of queries, so the kernel (one thread per query, a
+  serial scan over all 4.5M keys) is latency-bound and leaves the GPU mostly idle; the matmul is already efficient.
+  Contended run (CPU 85%, `WizardGraphicalClient` on the eGPU). Fix to try: split each query's key range across
+  several threads (partial top-k per slice, then merge), which should scale until the GPU is saturated.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
