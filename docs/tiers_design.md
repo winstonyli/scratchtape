@@ -354,6 +354,14 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   Unexplained: contention during the run was not measured (the eGPU users and CPU load were checked only before launch),
   and the full run's memory is larger (5.04M keys at the end vs 4.5M). Do not quote the full-run speedup until it is
   reproduced under a logged quiet machine.
+- **Run in flight (started 2026-10-02 22:06, session ended while it ran).** `scripts/tier_full7.sh` (same stack as
+  tier_full6, `KNN_TIMING=1`): `runs/tier_eval_run.exe`, PID 41004, log `runs/tier_full7.log`, load samples in
+  `runs/tier_full7_load.log` (`scripts/load_log.ps1`, stops when the run exits; if it died early the log just ends).
+  Expected ~25 min. Question: is the 1464 s (2.86 s/chunk) vs ~1.3-1.7 s/chunk on slices contention? Slices at parts 5, 60,
+  90 of 96 all took 12.2-12.7 s (so not store growth or position in the held-out set); the load log at launch showed
+  `manifold` and `WizardGraphicalClient` on the eGPU and CPU 46-47%. To finish: compare slow `knn timing` blocks in the log
+  to the load-log timestamps (blocks are not timestamped; use cumulative block times from the run start), then record the result
+  here. Check `tasklist | grep tier_eval_run` before launching anything else (orphan rule).
 
 ## Order
 
