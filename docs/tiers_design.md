@@ -186,7 +186,12 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   under `warm=32` (-0.0328 vs -0.0276 on the same subsample, `runs/tier_warm_knn.log`). (3) Every "vs model" number
   in the earlier rows is valid only for the standard protocol; the 7-gram's 1.3567 is scored the same windowed way
   (`ngram_baseline.rs`), so that comparison is like for like, but model + tiers on the fair protocol has no 7-gram
-  number yet.
+  number yet. **Now measured** (`runs/ngram_novels6.log`, `ngram_baseline novels6`): the order-7 Kneser-Ney model scores
+  1.3567 windowed and **1.3237 with the full left context** (the stream number, the n-gram counterpart of `warm`; it
+  needs only 6 bytes, so `warm=32` is the same). The model alone at `warm=32` (1.1764) is therefore **0.147 under
+  the 7-gram on the fair protocol**, against 0.116 under it on the windowed one (1.2408 vs 1.3567): the windowed
+  numbers understated the model's lead, and the earlier 7-gram comparisons in the README and `fusion_results.md`
+  (all windowed on both sides) remain like for like.
 - **Causal in-document memory (`memory=causal`; `runs/tier_causal*.log`, `tier_full3_causal.log`).** The memory is
   the train keys plus the held-out windows before the scored one in the same book (past-only; GPU search masks each
   query's allowed key ranges, `KnnStore::search_masked`, unit-tested against a CPU brute force). On the `warm=32`
@@ -213,6 +218,26 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
 
   The memory is the largest single tier, the causal in-document memory beats the flat one by 0.011, and the CPU
   tiers add about 0.004-0.007 on top of the memory.
+
+- **Recency (`recent=<windows>`, past-only memory; `runs/tier_recent.log`).** Limiting a query to the last n
+  windows of its book never helped: held-out keys only (warm 32 subsample, model 1.1844): n=8 and 32 hurt (+0.195,
+  +0.138: too few keys for k=256), n=128 -0.0115, n=512 -0.0246, unlimited **-0.0305** (best at lambda 0.2, temp 40; an
+  earlier -0.0201 was an under-wide grid). With train keys: n=512 -0.0436, n=2048 -0.0448, unlimited -0.0448. So the
+  whole document so far is the best memory; there is no recency effect to exploit at this scale.
+
+- **Online memory (`memory=online`; `runs/tier_online_*.log`).** The memory starts as the train keys and each scored
+  chunk's scored positions are appended after scoring (write latency one 32-window chunk; stride 1, `warm=32`,
+  `part=3/6`, `store=100000`; model alone 1.1453). Same slice, same specs:
+
+  | memory | knn:256:0.5:15 | 0.4:15 | 0.5:25 |
+  |---|---|---|---|
+  | flat (train keys) | -0.0316 | -0.0323 | -0.0314 |
+  | online (written as read) | -0.0374 | -0.0374 | -0.0361 |
+  | causal (past-only held windows, precomputed) | **-0.0407** | -0.0403 | -0.0386 |
+
+  Online recovers about 0.006 of the 0.009 causal-over-flat gain; the rest is the chunk write latency (the 32 most
+  recent windows are invisible) plus keys being written from the scored positions only (t >= 32). Online is the
+  deployable form (no held-out text needed in advance), so the realistic in-document memory gain is ~-0.037.
 
 ## Order
 

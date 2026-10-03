@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal] [warm=<t0>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -29,6 +29,10 @@
 // `warm=<t0>` scores each byte only at window position >= t0 (windows then start every 64 - t0 bytes), so the model
 // always has at least t0 bytes of context: the plain protocol (warm 0) gives the early positions of every window almost
 // none, which a tier reading longer context (the `h` flag) can exploit; `warm=32` is the control for that.
+// `memory=online` is the same idea written as it is read: the memory starts as the train keys and each scored chunk's
+// scored positions are appended after scoring, so a query sees the past text of its own book up to the previous chunk
+// (32 windows of write latency) and nothing else; it needs stride 1. `recent=<n>` (causal) limits a query to the n
+// windows before its own.
 // `memory=causal` makes the memory a past-only in-document one: the train keys plus ALL held-out windows (in order), where
 // a query in window w sees the train keys and only those held-out windows before w in the same book (`store` counts
 // train windows; 0 for no train keys). `stride`/`offset`/`part` still choose what is scored.
@@ -326,8 +330,9 @@ impl Tier for Words {
 /// The datastore (`gpu_step::knn`): `tap` hidden states of train positions and the bytes that followed them.
 /// Shared by all knn specs, which reuse one neighbour search per chunk.
 struct Store {
-    gpu: KnnStore,
+    gpu: RefCell<KnnStore>,
     causal: Option<Causal>,
+    online: Option<RefCell<Online>>,
     /// (chunk searched, per row the KMAX nearest (squared distance, value), ascending)
     found: RefCell<(Option<usize>, Vec<(f32, u8)>)>,
 }
@@ -338,6 +343,17 @@ struct Causal {
     n_train: usize,
     /// First held-out window of the book that window w belongs to.
     first_window: Vec<usize>,
+    /// A query sees at most this many windows before its own (`recent=`; usize::MAX for the whole book so far).
+    recent: usize,
+}
+
+/// A memory written as the text is read: after each scored chunk its scored positions are appended, so a query sees the
+/// train keys and, from its own book, everything written before its chunk (a write latency of one chunk).
+struct Online {
+    n_train: usize,
+    /// Where each book's held-out text starts (bytes), and the first key written from it (None until then).
+    docs: Vec<usize>,
+    doc_first_key: Vec<Option<usize>>,
 }
 
 impl Store {
@@ -345,17 +361,45 @@ impl Store {
         if self.found.borrow().0 == Some(chunk) {
             return;
         }
-        let ranges: Option<(Vec<(u32, u32)>, u32)> = self.causal.as_ref().map(|c| {
+        let mut ranges: Option<(Vec<(u32, u32)>, u32)> = self.causal.as_ref().map(|c| {
             let r = (0..rows)
                 .map(|r| {
                     let w = starts[r / SEQ_LEN] / SEQ_LEN;
-                    ((c.n_train + c.first_window[w] * SEQ_LEN) as u32, (c.n_train + w * SEQ_LEN) as u32)
+                    let first = c.first_window[w].max(w.saturating_sub(c.recent));
+                    ((c.n_train + first * SEQ_LEN) as u32, (c.n_train + w * SEQ_LEN) as u32)
                 })
                 .collect();
             (r, c.n_train as u32)
         });
-        let found = self.gpu.search_masked(hidden, rows, ranges.as_ref().map(|(r, a)| (r.as_slice(), *a)));
+        if let Some(on) = &self.online {
+            let on = on.borrow();
+            let hi = self.gpu.borrow().len() as u32;
+            let r = (0..rows)
+                .map(|r| {
+                    let d = on.docs.partition_point(|&b| b <= starts[r / SEQ_LEN]) - 1;
+                    (on.doc_first_key[d].map_or(hi, |k| k as u32), hi)
+                })
+                .collect();
+            ranges = Some((r, on.n_train as u32));
+        }
+        let found = self.gpu.borrow().search_masked(hidden, rows, ranges.as_ref().map(|(r, a)| (r.as_slice(), *a)));
         *self.found.borrow_mut() = (Some(chunk), found);
+    }
+
+    /// Online memory only: appends the chunk's scored positions (window position >= warm) as new keys.
+    fn write_chunk(&self, hidden: &[f32], targets: &[usize], starts: &[usize], warm: usize, d: usize) {
+        let Some(on) = &self.online else { return };
+        let (mut on, mut gpu) = (on.borrow_mut(), self.gpu.borrow_mut());
+        for (j, &s) in starts.iter().enumerate() {
+            let doc = on.docs.partition_point(|&b| b <= s) - 1;
+            if on.doc_first_key[doc].is_none() {
+                on.doc_first_key[doc] = Some(gpu.len());
+            }
+            let rows = j * SEQ_LEN + warm..(j + 1) * SEQ_LEN;
+            gpu.add(&hidden[rows.start * d..rows.end * d], &targets[rows].iter().map(|&t| t as u8).collect::<Vec<_>>());
+            // Flush per window so `len()` is the number of keys written so far.
+            gpu.finish();
+        }
     }
 }
 
@@ -400,7 +444,7 @@ impl Tier for Knn {
     }
     fn report(&self) -> String {
         let n = self.positions.max(1) as f64;
-        format!("knn ({} keys): mean squared distance to nearest {:.1}, to k-th {:.1}", self.store.gpu.len(), self.nearest / n, self.kth / n)
+        format!("knn ({} keys): mean squared distance to nearest {:.1}, to k-th {:.1}", self.store.gpu.borrow().len(), self.nearest / n, self.kth / n)
     }
 }
 
@@ -431,6 +475,10 @@ fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>) -> Vec<Box
             }
         })
         .collect()
+}
+
+fn from_is_train(v: &str) -> bool {
+    v == "train"
 }
 
 fn softmax(logits: &[f32]) -> Vec<f64> {
@@ -472,7 +520,8 @@ fn main() {
         let (k, v) = a.split_once('=').unwrap_or_else(|| panic!("expected key=value, got {a}"));
         match k {
             "tier" => specs.push(v.to_string()),
-            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" => {
+            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
+            | "recent" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -522,11 +571,13 @@ fn main() {
 
     let store = if specs.iter().any(|s| s.contains("knn")) {
         let want = size("store", "15000");
-        let causal = match get("memory", "flat").as_str() {
-            "flat" => false,
-            "causal" => true,
-            m => panic!("memory is flat or causal, got {m}"),
+        let (causal, online) = match get("memory", "flat").as_str() {
+            "flat" => (false, false),
+            "causal" => (true, false),
+            "online" => (false, true),
+            m => panic!("memory is flat, causal or online, got {m}"),
         };
+        assert!(!online || (stride == 1 && from_is_train(&get("store_from", "train"))), "memory=online needs stride 1 and store_from=train");
         let from = if causal { "both".to_string() } else { get("store_from", "train") };
         assert!(["train", "held", "both"].contains(&from.as_str()), "store_from is train, held or both");
         assert!(from == "train" || causal || stride > 1, "store_from=held needs stride > 1 so some held-out windows are left unscored");
@@ -552,14 +603,24 @@ fn main() {
             n_held = starts.len();
         }
         gpu.finish();
-        println!("memory: {} keys of {} floats from {n_train} train + {n_held} unscored held-out windows (tap = block {tap}), searched on the GPU", gpu.len(), cfg.d);
+        println!(
+            "memory: {} keys of {} floats from {n_train} train + {n_held} unscored held-out windows{} (tap = block {tap}), searched on the GPU",
+            gpu.len(),
+            cfg.d,
+            if online { ", then written online as scored" } else { "" }
+        );
+        let n_train_keys = n_train * SEQ_LEN;
+        let online = online.then(|| {
+            let docs = held_out_docs(&corpus);
+            RefCell::new(Online { n_train: n_train_keys, doc_first_key: vec![None; docs.len()], docs })
+        });
         let causal = causal.then(|| {
             let docs = held_out_docs(&corpus);
             let windows = (held_out.len() - 1) / SEQ_LEN;
             let first_window = (0..windows).map(|w| docs[docs.partition_point(|&b| b <= w * SEQ_LEN) - 1].div_ceil(SEQ_LEN)).collect();
-            Causal { n_train: n_train * SEQ_LEN, first_window }
+            Causal { n_train: n_train_keys, first_window, recent: size("recent", &usize::MAX.to_string()) }
         });
-        Some(Rc::new(Store { gpu, causal, found: RefCell::new((None, vec![])) }))
+        Some(Rc::new(Store { gpu: RefCell::new(gpu), causal, online, found: RefCell::new((None, vec![])) }))
     } else {
         None
     };
@@ -596,6 +657,9 @@ fn main() {
                 }
                 ce_tier[i] -= p[f.targets[r]].max(1e-300).ln();
             }
+        }
+        if let Some(st) = &store {
+            st.write_chunk(&f.hidden, &f.targets, chunk, warm, cfg.d);
         }
     }
     let n = (starts.len() * unit) as f64;
