@@ -308,7 +308,7 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
 
   Against the offline causal stack at stride 2 (1.1311, -0.0467 vs 1.1778) the deployable online stack gives up 0.0016
   nats/byte (-0.0451 vs -0.0467) and needs no held-out text in advance. The online memory alone is -0.0412 on the full
-  text (-0.0374 on the earlier one-sixth slice, which was a harder, document-poor part), against -0.0425 for the causal
+  text (-0.0374 on the earlier one-sixth slice, mostly one book; the difference is not explained), against -0.0425 for the causal
   memory. Run: 2502 s (42 min), 98% in the kNN search (~5 s per 32-window chunk), build 29 s, CPU tiers 27 s; the machine
   was shared (CPU ~60% from other sessions), Defender real-time off.
 
