@@ -261,6 +261,20 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   which is why more parts get slower. Next lever: cut insertions, e.g. a per-query threshold from a sampled pass 1
   (only keys under it are candidates; fall back when fewer than k qualify), or binary-search insertion.
 
+- **Faster search: thresholds + 16 parts (`src/gpu_step/knn.rs`).** Binary-search insertion alone changed nothing (6.1 vs
+  6.1 s), so the cost is the shifting/divergence of insertions, not the rank count. What worked: a pass 1 over every
+  61st key (sample on the host, uploaded when it grows) gives each query a threshold (its 32nd nearest sample key ~ the
+  1950th nearest key); the main pass inserts only keys under it, and a block with any query that has fewer than 256 keys
+  under its threshold is searched again without thresholds (exact either way; test
+  `thresholded_search_matches_cpu_brute_force`, masks included). Two bugs found on the way, both from structure in the
+  keys: a stride of 64 equals the window length, so the sample was only window position 0 (stride 61 fixed it), and
+  position-0 keys are exact duplicates (they see only their own byte), so a threshold equal to a tie distance excluded
+  the ties (`widen` adds 1e-4 relative). With neither, every block fell back. Result, 2048 queries x 4.53M keys, same
+  contended machine (CPU ~40%, another process on the eGPU): block 6.7-7.1 s -> **3.5-3.7 s** (top-k 5.3 -> 1.6-2.2 s;
+  matmul 1.4 s and the sample pass ~0.15 s are now the floor); the 6-chunk slice 49 s -> 22.6 s. CE unchanged
+  (1.0949). Parts sweep with thresholds: 2: 3.6 s, 4: 2.7, 8: 2.2, 16: 1.9, 32: 1.6, 64: 1.6 (host merge/readback grows
+  with parts: 6 -> 110 ms), so the default is 16.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
