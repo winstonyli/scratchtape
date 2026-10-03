@@ -9,6 +9,7 @@ use super::matmul::{Epilogue, MatRef, matmul};
 use super::{EW_DIM, buf, client, cubes, read, upload_f32};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
+use half::f16;
 use std::cell::RefCell;
 
 /// Neighbours kept per query.
@@ -47,6 +48,10 @@ pub struct KnnStore {
     pending_keys: Vec<f32>,
     pending_vals: Vec<u8>,
     sample_keys: Vec<f32>,
+    /// Keys and queries as f16 on the matrix cores (`KNN_F16=1`): about 2x faster matmul and half the key memory, but
+    /// distances carry f16 rounding (~1e-3 relative); norms are taken from the rounded vectors so a distance is exactly
+    /// the squared distance between the rounded vectors.
+    f16: bool,
     /// Wall time spent in `flush` so far: host copy + norms, then upload (diagnostic).
     pub flush_time: [std::time::Duration; 2],
     /// Device copy of `sample_keys` as (keys, norms, len) chunks, with the sample count it was built from.
@@ -55,6 +60,14 @@ pub struct KnnStore {
 
 impl KnnStore {
     pub fn new(d: usize, tile: usize) -> Self {
+        Self::with_precision(d, tile, std::env::var_os("KNN_F16").is_some())
+    }
+
+    pub fn with_precision(d: usize, tile: usize, f16: bool) -> Self {
+        if f16 {
+            assert!(d % 16 == 0 && tile % 16 == 0, "f16 matrix cores need d and tile to be multiples of 16");
+            assert!(client().features().matmul.cmma.contains(&f16_config()), "this device reports no f16 x f16 -> f32 matrix-core configuration");
+        }
         KnnStore {
             d,
             tile,
@@ -62,6 +75,7 @@ impl KnnStore {
             pending_keys: vec![],
             pending_vals: vec![],
             sample_keys: vec![],
+            f16,
             flush_time: [std::time::Duration::ZERO; 2],
             sample_dev: RefCell::new((0, vec![])),
         }
@@ -93,12 +107,25 @@ impl KnnStore {
             self.sample_keys.extend_from_slice(&keys[i * self.d..(i + 1) * self.d]);
         }
         let vals: Vec<u8> = self.pending_vals.drain(..n).collect();
-        let norms: Vec<f32> = keys.chunks_exact(self.d).map(|k| k.iter().map(|x| x * x).sum()).collect();
         let vals_f: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
+        let (key_h, norms) = self.upload_keys(&keys);
         self.flush_time[0] += t0.elapsed();
         let t0 = std::time::Instant::now();
-        self.tiles.push(Tile { keys: upload_f32(&keys), norms: upload_f32(&norms), vals: upload_f32(&vals_f), len: n });
+        self.tiles.push(Tile { keys: key_h, norms: upload_f32(&norms), vals: upload_f32(&vals_f), len: n });
         self.flush_time[1] += t0.elapsed();
+    }
+
+    /// Device copy of `keys` (row-major [n, d]) in the store's precision, and the norms of what was stored. The f16 copy
+    /// is padded with zero rows to a multiple of 16 (the matrix-core tile).
+    fn upload_keys(&self, keys: &[f32]) -> (Handle, Vec<f32>) {
+        if self.f16 {
+            let mut k16: Vec<f16> = keys.iter().map(|&x| f16::from_f32(x)).collect();
+            let norms = k16.chunks_exact(self.d).map(|k| k.iter().map(|x| x.to_f32() * x.to_f32()).sum()).collect();
+            k16.resize(keys.len().div_ceil(self.d).next_multiple_of(16) * self.d, f16::ZERO);
+            (client().create_from_slice(f16::as_bytes(&k16)), norms)
+        } else {
+            (upload_f32(keys), keys.chunks_exact(self.d).map(|k| k.iter().map(|x| x * x).sum()).collect())
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -134,6 +161,19 @@ impl KnnStore {
         out
     }
 
+    /// dist[j, i] = key_j . query_i for the `len` keys in `keys`, as [rows, qp] (qp = q unless f16-padded).
+    fn dots(&self, keys: &Handle, len: usize, qh: &Handle, dist: &Handle, q: usize, qp: usize) {
+        if self.f16 {
+            let rows = len.next_multiple_of(16);
+            let plane = client().properties().hardware.plane_size_max;
+            #[rustfmt::skip]
+            k_dots_cmma::launch(client(), CubeCount::Static((qp / 16) as u32, (rows / 16) as u32, 1), CubeDim::new_1d(plane), buf(keys, rows * self.d), buf(qh, self.d * qp), buf(dist, self.tile * qp), self.d as u32, qp as u32);
+        } else {
+            let (a, b, o) = (MatRef::new(keys), MatRef { trans: true, ..MatRef::new(qh) }, MatRef::new(dist));
+            matmul(a, b, o, 1, len, self.d, q, Epilogue::default());
+        }
+    }
+
     /// Uploads the sample keys if more arrived since the last call.
     fn sample_chunks(&self) -> Vec<(Handle, Handle, usize)> {
         let n = self.sample_keys.len() / self.d;
@@ -143,8 +183,8 @@ impl KnnStore {
                 .sample_keys
                 .chunks(self.tile * self.d)
                 .map(|c| {
-                    let norms: Vec<f32> = c.chunks_exact(self.d).map(|k| k.iter().map(|x| x * x).sum()).collect();
-                    (upload_f32(c), upload_f32(&norms), norms.len())
+                    let (keys, norms) = self.upload_keys(c);
+                    (keys, upload_f32(&norms), norms.len())
                 })
                 .collect();
             dev.0 = n;
@@ -155,10 +195,24 @@ impl KnnStore {
     /// One block of `q` queries. With `thresholds`, returns None when some query's threshold left fewer than `KMAX` keys.
     #[allow(clippy::too_many_arguments)]
     fn search_block(&self, block: &[f32], q: usize, ranges: &[(u32, u32)], always: u32, parts: usize, thresholds: bool) -> Option<Vec<(f32, u8)>> {
-        let qh = upload_f32(block);
+        // Queries as the matmul wants them: f32 [q, d], or (f16) rounded, transposed to [d, qp] and padded to a multiple of 16.
+        let qp = if self.f16 { q.next_multiple_of(16) } else { q };
+        let rounded: Vec<f32>;
+        let (qh, block) = if self.f16 {
+            let mut t = vec![f16::ZERO; self.d * qp];
+            for r in 0..q {
+                for c in 0..self.d {
+                    t[c * qp + r] = f16::from_f32(block[r * self.d + c]);
+                }
+            }
+            rounded = (0..q * self.d).map(|i| t[(i % self.d) * qp + i / self.d].to_f32()).collect();
+            (client().create_from_slice(f16::as_bytes(&t)), &rounded[..])
+        } else {
+            (upload_f32(block), block)
+        };
         let best_d = upload_f32(&vec![f32::INFINITY; parts * q * KMAX]);
         let best_v = upload_f32(&vec![0.0f32; parts * q * KMAX]);
-        let dist = client().empty(self.tile * q * 4);
+        let dist = client().empty(self.tile * qp * 4);
         let lo = client().create_from_slice(u32::as_bytes(&ranges.iter().map(|r| r.0).collect::<Vec<_>>()));
         let hi = client().create_from_slice(u32::as_bytes(&ranges.iter().map(|r| r.1).collect::<Vec<_>>()));
         // KNN_TIMING=1: sync between stages (a read of a small buffer waits for the queue) and report their wall time.
@@ -170,11 +224,10 @@ impl KnnStore {
         let sample = if thresholds { self.sample_chunks() } else { vec![] };
         let mut gbase = 0usize;
         for (sk, sn, len) in &sample {
-            let (a, b, o) = (MatRef::new(sk), MatRef { trans: true, ..MatRef::new(&qh) }, MatRef::new(&dist));
-            matmul(a, b, o, 1, *len, self.d, q, Epilogue::default());
+            self.dots(sk, *len, &qh, &dist, q, qp);
             super::count_launch();
             #[rustfmt::skip]
-            k_thresh::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * q), buf(sn, *len), buf(&thr_d, q * THRESH_RANK), buf(&lo, q), buf(&hi, q), always, q as u32, gbase as u32, *len as u32);
+            k_thresh::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * qp), buf(sn, *len), buf(&thr_d, q * THRESH_RANK), buf(&lo, q), buf(&hi, q), always, q as u32, qp as u32, gbase as u32, *len as u32);
             gbase += len;
         }
         let thr = if thresholds { read(&thr_d) } else { vec![] };
@@ -187,8 +240,7 @@ impl KnnStore {
         let mut base = 0usize;
         for t in &self.tiles {
             let t0 = std::time::Instant::now();
-            let (a, b, o) = (MatRef::new(&t.keys), MatRef { trans: true, ..MatRef::new(&qh) }, MatRef::new(&dist));
-            matmul(a, b, o, 1, t.len, self.d, q, Epilogue::default());
+            self.dots(&t.keys, t.len, &qh, &dist, q, qp);
             if timing {
                 read(&hi);
                 t_mm += t0.elapsed();
@@ -198,7 +250,7 @@ impl KnnStore {
                 super::count_launch();
                 let n = SLICE.min(t.len - j0);
                 #[rustfmt::skip]
-                k_topk::launch(client(), cubes(parts * q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * q), buf(&t.norms, t.len), buf(&t.vals, t.len), buf(&best_d, parts * q * KMAX), buf(&best_v, parts * q * KMAX), buf(&lo, q), buf(&hi, q), buf(&thr_buf, q), always, q as u32, parts as u32, (base + j0) as u32, j0 as u32, n as u32);
+                k_topk::launch(client(), cubes(parts * q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * qp), buf(&t.norms, t.len), buf(&t.vals, t.len), buf(&best_d, parts * q * KMAX), buf(&best_v, parts * q * KMAX), buf(&lo, q), buf(&hi, q), buf(&thr_buf, q), always, q as u32, qp as u32, parts as u32, (base + j0) as u32, j0 as u32, n as u32);
             }
             if timing {
                 read(&hi);
@@ -245,18 +297,49 @@ fn widen(t: f32) -> f32 {
     t + 1e-4 * (t.abs() + 1.0)
 }
 
+fn f16_config() -> cubecl::features::MmaConfig {
+    cubecl::features::MmaConfig {
+        a_type: cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16),
+        b_type: cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16),
+        cd_type: cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F32),
+        m: 16,
+        k: 16,
+        n: 16,
+    }
+}
+
+/// out[M, N] (f32) = a[M, K] @ b[K, N] (f16, row-major) on matrix cores: one plane per cube computes one 16x16 tile
+/// (the spike's `k_matmul_cmma`). M, N, K are multiples of 16.
+#[cube(launch)]
+fn k_dots_cmma(a: &[f16], b: &[f16], out: &mut [f32], #[comptime] k: u32, n: u32) {
+    let row0 = CUBE_POS_Y * 16;
+    let col0 = CUBE_POS_X * 16;
+    let c = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0);
+    #[unroll]
+    for kk in 0..k / 16 {
+        let a_off = (row0 * k + kk * 16) as usize;
+        let b_off = (kk * 16 * n + col0) as usize;
+        let at = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &a[a_off..a.len()], k);
+        let bt = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &b[b_off..b.len()], n);
+        cmma::execute(&at, &bt, &c, &c);
+    }
+    let o_off = (row0 * n + col0) as usize;
+    let len = out.len();
+    cmma::store(&mut out[o_off..len], &c, n, cmma::MatrixLayout::RowMajor);
+}
+
 /// Pass 1: each query's `THRESH_RANK` nearest sample keys (ascending, in `best`, `TR` per query). The sample chunk's
 /// key i has store-wide index (gs0 + i) * SAMPLE_STRIDE; keys outside the query's allowed ranges are skipped.
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
-fn k_thresh(d: &[f32], norms: &[f32], best: &mut [f32], lo: &[u32], hi: &[u32], always: u32, q: u32, gs0: u32, len: u32) {
+fn k_thresh(d: &[f32], norms: &[f32], best: &mut [f32], lo: &[u32], hi: &[u32], always: u32, q: u32, ld: u32, gs0: u32, len: u32) {
     let qi = ABSOLUTE_POS as u32;
     if qi < q {
         let base = qi * TR;
         let (lo_q, hi_q) = (lo[qi as usize], hi[qi as usize]);
         for j in 0..len {
             let g = (gs0 + j) * SS;
-            let mut dist = norms[j as usize] - 2.0 * d[(j * q + qi) as usize];
+            let mut dist = norms[j as usize] - 2.0 * d[(j * ld + qi) as usize];
             if g >= always {
                 if g < lo_q {
                     dist = f32::INFINITY;
@@ -298,6 +381,7 @@ fn k_topk(
     thr: &[f32],
     always: u32,
     q: u32,
+    ld: u32,
     parts: u32,
     gj0: u32,
     j0: u32,
@@ -321,7 +405,7 @@ fn k_topk(
             if jj < len {
                 let j = j0 + jj;
                 let g = gj0 + jj;
-                let mut dist = norms[j as usize] - 2.0 * d[(j * q + qi) as usize];
+                let mut dist = norms[j as usize] - 2.0 * d[(j * ld + qi) as usize];
                 if g >= always {
                     if g < lo_q {
                         dist = f32::INFINITY;
@@ -454,6 +538,35 @@ mod tests {
                     let g = got[r * KMAX + j].0;
                     assert!((g - all[j]).abs() < 1e-3 * (1.0 + all[j]), "query {r} rank {j}: gpu {g} vs cpu {}", all[j]);
                 }
+            }
+        }
+    }
+
+    /// The f16 matrix-core path equals a CPU brute force over the f16-rounded keys and queries (padding: 48 queries is not
+    /// a multiple of 16 tiles of keys either, the last tile is short).
+    #[test]
+    fn f16_search_matches_cpu_brute_force_on_rounded_vectors() {
+        if !client().features().matmul.cmma.contains(&f16_config()) {
+            return;
+        }
+        let (d, n, rows) = (32, 50000, 50);
+        let mut rng = Rng::new(9);
+        let keys: Vec<f32> = (0..n * d).map(|_| rng.next_gaussian()).collect();
+        let vals: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let queries: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
+        let round = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| f16::from_f32(x).to_f32()).collect() };
+        let (kr, qr) = (round(&keys), round(&queries));
+        let mut store = KnnStore::with_precision(d, 16384, true);
+        store.add(&keys, &vals);
+        store.finish();
+        let got = store.search(&queries, rows);
+        for r in 0..rows {
+            let q = &qr[r * d..(r + 1) * d];
+            let mut all: Vec<f32> = (0..n).map(|i| kr[i * d..(i + 1) * d].iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum()).collect();
+            all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            for j in 0..KMAX {
+                let g = got[r * KMAX + j].0;
+                assert!((g - all[j]).abs() < 2e-3 * (1.0 + all[j]), "query {r} rank {j}: gpu {g} vs cpu {}", all[j]);
             }
         }
     }

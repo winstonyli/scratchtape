@@ -3583,6 +3583,7 @@ dependencies = [
  "criterion",
  "cubecl",
  "cubecl-runtime",
+ "half",
  "pollster",
  "wgpu",
 ]

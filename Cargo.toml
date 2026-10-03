@@ -22,6 +22,7 @@ pollster = "0.4"
 # Runtime trait.
 cubecl = { version = "=0.11.0-pre.4", features = ["wgpu", "vulkan"] }
 cubecl-runtime = "=0.11.0-pre.4"
+half = "2"
 
 [dev-dependencies]
 criterion = "0.5"

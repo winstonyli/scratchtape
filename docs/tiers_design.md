@@ -312,6 +312,15 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   memory. Run: 2502 s (42 min), 98% in the kNN search (~5 s per 32-window chunk), build 29 s, CPU tiers 27 s; the machine
   was shared (CPU ~60% from other sessions), Defender real-time off.
 
+- **f16 matrix cores for the search (`KNN_F16=1`, off by default).** Keys and queries are rounded to f16 and multiplied
+  on the matrix cores (cubecl cmma, f16 x f16 -> f32, 16x16 tiles, one plane per tile; the spike's kernel); norms come
+  from the rounded vectors, so a distance is exactly the squared distance between the rounded vectors. Unit test
+  `f16_search_matches_cpu_brute_force_on_rounded_vectors` (padding included). Timing, same slice (`part=5/96`, warm 32;
+  CPU ~30%): matmul per 1024-query block 0.9-1.1 s -> **0.53 s** (~1.8x; the README's 2-3x was an upper bound), slice
+  17.2 s -> 13.4 s, CE 1.0949 -> 1.0950 (a 1e-4 change). Key memory halves (4.6 GB -> 2.3 GB), which matters for larger
+  memories on the 16 GB card. Top-k (1.5 s per block) is now ~75% of the search. Not default because results differ in
+  the 4th decimal; the f32 path stays the exact reference.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
