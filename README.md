@@ -39,7 +39,11 @@ memory's gain is document-specific: unseen text of the same books helps most
 score gives early window positions almost no context; with every byte given at
 least 32 bytes (`warm=32`) the model alone is 1.1778, and then lexicon + word
 bigram + a past-only in-document memory reach 1.1311 (-0.0467), of which the
-memory is -0.0425 (the CPU tiers alone -0.0201). Existing work by tier: the transformer and its GPU-resident
+memory is -0.0425 (the CPU tiers alone -0.0201). The deployable form writes the memory as the text is read
+(online, no held-out text in advance): on the whole held-out text lexicon + word bigram + online memory give 1.1313
+(-0.0451) against 1.1764 for the model alone at stride 1 (the memory alone -0.0412). The memory search is exact
+and takes ~5 s per 32-window chunk of 4.5M keys (2.5x faster than the first version: sampled per-query thresholds,
+multi-thread top-k, unscored rows skipped). Existing work by tier: the transformer and its GPU-resident
 step (tier 1); the symbolic-structure and reasoning examples (tier 2);
 replay buffers, checkpoints and consolidation in `examples/memory_tiers/`
 (the long-term side, so far at toy or Aesop-quarters scale). Experiments
