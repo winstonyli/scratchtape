@@ -341,6 +341,12 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   the pass-1 time): total ~2.2 s = matmul ~0.6 + **pass-1 thresholds ~0.6** + top-k ~0.9. The threshold kernel (`k_thresh`)
   is one thread per query (1024 threads) scanning ~74k sample keys serially: it now costs as much as the matmul. Fused
   matmul+filter kernel stays parked: dist traffic is ~0.06 s per block, and the gain would be the scan floor (~0.5 s) only.
+- **Pass 1 was upload-bound, not scan-bound (2026-10-02).** Splitting `k_thresh` across parts changed nothing (kept: it is
+  correct and cheap). Staged syncs (`KNN_TIMING=1` now prints `knn pass 1: ...`) showed ~340 ms per block in "sample
+  upload": an online memory grows every chunk, and `sample_chunks` re-converted and re-uploaded the whole ~74k-key sample
+  (host f16 conversion + 38 MB). Now only the last partial chunk is rebuilt. Same slice: pass 1 ~370-420 ms -> ~70-90 ms,
+  block total ~2.2 s -> ~1.3 s (matmul ~0.5, pass 1 ~0.08, top-k ~0.7), CE identical (1.0943). Test
+  `search_stays_exact_while_the_store_grows` covers search / add / search across sample-chunk boundaries.
 
 ## Order
 

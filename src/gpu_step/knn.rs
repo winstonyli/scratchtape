@@ -184,19 +184,18 @@ impl KnnStore {
         }
     }
 
-    /// Uploads the sample keys if more arrived since the last call.
+    /// Uploads the sample keys if more arrived since the last call: full chunks stay on the device (the sample only
+    /// grows at the end), so an online memory re-uploads just the last partial chunk.
     fn sample_chunks(&self) -> Vec<(Handle, Handle, usize)> {
         let n = self.sample_keys.len() / self.d;
         let mut dev = self.sample_dev.borrow_mut();
         if dev.0 != n {
-            dev.1 = self
-                .sample_keys
-                .chunks(self.tile * self.d)
-                .map(|c| {
-                    let (keys, norms) = self.upload_keys(c);
-                    (keys, upload_f32(&norms), norms.len())
-                })
-                .collect();
+            let keep = dev.0 / self.tile;
+            dev.1.truncate(keep);
+            for c in self.sample_keys[keep * self.tile * self.d..].chunks(self.tile * self.d) {
+                let (keys, norms) = self.upload_keys(c);
+                dev.1.push((keys, upload_f32(&norms), norms.len()));
+            }
             dev.0 = n;
         }
         dev.1.clone()
@@ -228,23 +227,46 @@ impl KnnStore {
         // KNN_TIMING=1: sync between stages (a read of a small buffer waits for the queue) and report their wall time.
         let timing = std::env::var_os("KNN_TIMING").is_some();
         let (mut t_mm, mut t_topk) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        if timing {
+            read(&hi);
+        }
         let t_start = std::time::Instant::now();
+        let mut stage = [std::time::Duration::ZERO; 3];
         // Pass 1: each query's threshold from the sample.
-        let thr_d = upload_f32(&vec![f32::INFINITY; q * THRESH_RANK]);
+        let thr_d = upload_f32(&vec![f32::INFINITY; parts * q * THRESH_RANK]);
         let sample = if thresholds { self.sample_chunks() } else { vec![] };
+        if timing {
+            read(&hi);
+            stage[0] = t_start.elapsed();
+        }
         let mut gbase = 0usize;
         for (sk, sn, len) in &sample {
+            let t0 = std::time::Instant::now();
             self.dots(sk, *len, &qh, &dist, q, qp);
+            if timing {
+                read(&hi);
+                stage[1] += t0.elapsed();
+            }
             super::count_launch();
             #[rustfmt::skip]
-            k_thresh::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * qp), buf(sn, *len), buf(&thr_d, q * THRESH_RANK), buf(&lo, q), buf(&hi, q), always, q as u32, qp as u32, gbase as u32, *len as u32);
+            k_thresh::launch(client(), cubes(parts * q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * qp), buf(sn, *len), buf(&thr_d, parts * q * THRESH_RANK), buf(&lo, q), buf(&hi, q), always, q as u32, qp as u32, parts as u32, gbase as u32, *len as u32);
             gbase += len;
         }
+        let t0 = std::time::Instant::now();
         let thr = if thresholds { read(&thr_d) } else { vec![] };
         // The kernel's starting threshold per query (infinity: none).
-        let thr_q: Vec<f32> = (0..q).map(|r| if thresholds { widen(thr[r * THRESH_RANK + THRESH_RANK - 1]) } else { f32::INFINITY }).collect();
+        let thr_q: Vec<f32> = (0..q).map(|r| if thresholds { widen(rank_of_parts(&thr, r, q, parts)) } else { f32::INFINITY }).collect();
         let thr_buf = upload_f32(&thr_q);
+        stage[2] = t0.elapsed();
         let t_pass1 = t_start.elapsed();
+        if timing {
+            eprintln!(
+                "knn pass 1: sample upload {:.0} ms, sample matmuls {:.0} ms, k_thresh + readback {:.0} ms",
+                stage[0].as_secs_f64() * 1e3,
+                stage[1].as_secs_f64() * 1e3,
+                stage[2].as_secs_f64() * 1e3
+            );
+        }
         if timing {
             t_mm += t_pass1;
         }
@@ -340,38 +362,51 @@ fn k_dots_cmma(a: &[f16], b: &[f16], out: &mut [f32], #[comptime] k: u32, n: u32
     cmma::store(&mut out[o_off..len], &c, n, cmma::MatrixLayout::RowMajor);
 }
 
-/// Pass 1: each query's `THRESH_RANK` nearest sample keys (ascending, in `best`, `TR` per query). The sample chunk's
+/// The `THRESH_RANK`-th smallest of query r's per-part lists in `thr` (`parts` lists of `THRESH_RANK`, thread order).
+fn rank_of_parts(thr: &[f32], r: usize, q: usize, parts: usize) -> f32 {
+    let mut c: Vec<f32> = (0..parts).flat_map(|p| thr[(p * q + r) * THRESH_RANK..][..THRESH_RANK].iter().copied()).collect();
+    *c.select_nth_unstable_by(THRESH_RANK - 1, |a, b| a.partial_cmp(b).unwrap()).1
+}
+
+/// Pass 1: the `THRESH_RANK` nearest sample keys of each (query, part) thread (ascending, in `best`, `TR` per thread;
+/// thread t scans part t / q of the chunk for query t % q, as in `k_topk`; the host merges the parts). The sample chunk's
 /// key i has store-wide index (gs0 + i) * SAMPLE_STRIDE; keys outside the query's allowed ranges are skipped.
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
-fn k_thresh(d: &[f32], norms: &[f32], best: &mut [f32], lo: &[u32], hi: &[u32], always: u32, q: u32, ld: u32, gs0: u32, len: u32) {
-    let qi = ABSOLUTE_POS as u32;
-    if qi < q {
-        let base = qi * TR;
+fn k_thresh(d: &[f32], norms: &[f32], best: &mut [f32], lo: &[u32], hi: &[u32], always: u32, q: u32, ld: u32, parts: u32, gs0: u32, len: u32) {
+    let t = ABSOLUTE_POS as u32;
+    if t < q * parts {
+        let qi = t % q;
+        let chunk = (len + parts - 1) / parts;
+        let start = (t / q) * chunk;
+        let base = t * TR;
         let (lo_q, hi_q) = (lo[qi as usize], hi[qi as usize]);
-        for j in 0..len {
-            let g = (gs0 + j) * SS;
-            let mut dist = norms[j as usize] - 2.0 * d[(j * ld + qi) as usize];
-            if g >= always {
-                if g < lo_q {
-                    dist = f32::INFINITY;
-                }
-                if g >= hi_q {
-                    dist = f32::INFINITY;
-                }
-            }
-            if dist < best[(base + TR - 1) as usize] {
-                let mut p = 0u32;
-                for i in 0..TR {
-                    if best[(base + i) as usize] <= dist {
-                        p += 1;
+        for jl in 0..chunk {
+            let j = start + jl;
+            if j < len {
+                let g = (gs0 + j) * SS;
+                let mut dist = norms[j as usize] - 2.0 * d[(j * ld + qi) as usize];
+                if g >= always {
+                    if g < lo_q {
+                        dist = f32::INFINITY;
+                    }
+                    if g >= hi_q {
+                        dist = f32::INFINITY;
                     }
                 }
-                for s in 0..TR - 1 - p {
-                    let i = TR - 1 - s;
-                    best[(base + i) as usize] = best[(base + i - 1) as usize];
+                if dist < best[(base + TR - 1) as usize] {
+                    let mut p = 0u32;
+                    for i in 0..TR {
+                        if best[(base + i) as usize] <= dist {
+                            p += 1;
+                        }
+                    }
+                    for s in 0..TR - 1 - p {
+                        let i = TR - 1 - s;
+                        best[(base + i) as usize] = best[(base + i - 1) as usize];
+                    }
+                    best[(base + p) as usize] = dist;
                 }
-                best[(base + p) as usize] = dist;
             }
         }
     }
@@ -547,6 +582,33 @@ mod tests {
     }
 
     /// Enough keys for the threshold pass to engage (sample of n / 64 keys), with masks, against a CPU brute force.
+    #[test]
+    fn search_stays_exact_while_the_store_grows() {
+        // Tiles of 64 make sample chunks of 64 sample keys (3904 keys): growth crosses chunk boundaries between searches.
+        let (d, rows) = (16, 20);
+        let mut rng = Rng::new(11);
+        let keys: Vec<f32> = (0..30000 * d).map(|_| rng.next_gaussian()).collect();
+        let vals: Vec<u8> = (0..30000).map(|i| (i % 251) as u8).collect();
+        let queries: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
+        let mut store = KnnStore::with_precision(d, 64, false);
+        let mut n = 0;
+        for step in [3000, 4000, 1000, 9000, 13000] {
+            store.add(&keys[n * d..(n + step) * d], &vals[n..n + step]);
+            n += step;
+            store.finish();
+            let got = store.search(&queries, rows);
+            for r in 0..rows {
+                let q = &queries[r * d..(r + 1) * d];
+                let mut all: Vec<f32> = (0..n).map(|i| keys[i * d..(i + 1) * d].iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum()).collect();
+                all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                for j in 0..KMAX {
+                    let g = got[r * KMAX + j].0;
+                    assert!((g - all[j]).abs() < 1e-3 * (1.0 + all[j]), "n {n} query {r} rank {j}: gpu {g} vs cpu {}", all[j]);
+                }
+            }
+        }
+    }
+
     #[test]
     fn thresholded_search_matches_cpu_brute_force() {
         let (d, n, rows) = (16, 60000, 48);
