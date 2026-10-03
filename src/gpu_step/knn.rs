@@ -19,7 +19,9 @@ const KM: u32 = KMAX as u32;
 const QBLOCK: usize = 2048;
 /// Threads per query: each scans its own contiguous part of a slice into its own top list, and the lists are merged on
 /// the host. One thread per query left the GPU idle (the scan is serial over millions of keys; docs/tiers_design.md).
-const PARTS_DEFAULT: usize = 16;
+/// Threads in flight per top-k launch to aim for: a block of q queries uses `THREADS / q` parts (clamped to 8..=32; more parts
+/// cost host merge time). Measured on 1024-query blocks: 8 parts 3.7 s, 16: 2.9 s, 32: 2.3 s of top-k (contended).
+const THREADS: usize = 32768;
 /// Keys per top-k launch: one launch must stay short (a long one trips the OS's GPU watchdog; with KMAX = 256 a
 /// whole 16384-key tile lost the device when one thread scanned all of it). Each thread scans SLICE / PARTS keys.
 const SLICE: usize = 4096;
@@ -156,12 +158,13 @@ impl KnnStore {
             None => (vec![(0, u32::MAX); rows], 0),
         };
         assert_eq!(ranges.len(), rows);
-        let parts: usize = std::env::var("KNN_PARTS").ok().and_then(|v| v.parse().ok()).unwrap_or(PARTS_DEFAULT);
+        let forced: Option<usize> = std::env::var("KNN_PARTS").ok().and_then(|v| v.parse().ok());
         let mut out = Vec::with_capacity(rows * KMAX);
         for q0 in (0..rows).step_by(QBLOCK) {
             let q = QBLOCK.min(rows - q0);
             let block = &queries[q0 * self.d..(q0 + q) * self.d];
             let rg = &ranges[q0..q0 + q];
+            let parts = forced.unwrap_or((THREADS / q).clamp(8, 32));
             let found = self.search_block(block, q, rg, always, parts, true).unwrap_or_else(|| self.search_block(block, q, rg, always, parts, false).unwrap());
             out.extend(found);
         }

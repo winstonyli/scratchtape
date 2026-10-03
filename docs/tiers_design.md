@@ -327,6 +327,12 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   (23 min; search 1306 s), build 30 s. So `KNN_F16=1` costs nothing measurable at the reported precision and nearly halves
   the full run; it is now the default (falls back to f32 if the device lacks the f16 matrix-core configuration or d, tile are not multiples of 16).
 
+- **Top-k floor and parts (f16, 1024-query blocks of the `part=5/96` slice; contended: another process on the eGPU, CPU
+  27-100% from other sessions, so read these as rough).** With insertions disabled the scan alone costs **0.5-0.6 s**
+  per block (32 parts) against 1.4-2.4 s with insertions: even with thresholds, insertions are ~70% of top-k. Parts for a
+  1024-query block, best of 2 rounds: 16: 1.63 s, 24: 1.44, 32: 1.48 (second round 2.08, 1.79, 1.76), so 24-32 is ~10-15%
+  better than 16; `parts` is now `32768 / queries` clamped to 8..=32 (`KNN_PARTS` forces a value).
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
