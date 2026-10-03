@@ -293,6 +293,11 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   host copy; overlapping them (queue the next forward before reading the last) could recover a few seconds. Sharing the
   store across memory modes in one process would save the whole build per extra mode (needs `KnnStore::truncate`).
 
+- **Run in flight (started 2026-10-02 18:40, PID 38072):** `scripts/tier_full4.sh` -> `runs/tier_full4_online.log`.
+  Full held-out, `warm=32 stride=1 memory=online`, six specs (lexicon, words, lexicon+words, knn, words+knn,
+  lexicon+words+knn). Expected ~30-45 min (30 s build + ~6 x 4-5 min of search); CPU ~60% from other sessions at
+  launch, Defender real-time off. Result goes in the next entry.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
