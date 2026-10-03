@@ -239,6 +239,13 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   recent windows are invisible) plus keys being written from the scored positions only (t >= 32). Online is the
   deployable form (no held-out text needed in advance), so the realistic in-document memory gain is ~-0.037.
 
+- **Eval speed (phase timers in `tier_eval`; `runs/tier_time_{online,flat}.log`, `part=5/24`, 21 chunks of 32 windows, 4.5M
+  keys, one knn spec).** 160 s per run, **99.9% in tier prepare** (the GPU kNN search plus its readback; ~7.6 s per
+  2048-query chunk); row scoring 0.1 s, online writes ~0 s. Online and flat cost the same. The forward pass is queued
+  asynchronously, so its time lands in prepare too; the split inside the search (matmul, top-k, readback) is not yet
+  measured. Contended: CPU 35% at launch, another process (`WizardGraphicalClient`) on the eGPU, Defender real-time off.
+  So the suspected per-window flush and CPU softmax are not the bottleneck; the search is.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).

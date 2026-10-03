@@ -631,12 +631,20 @@ fn main() {
     let mut ce_tier = vec![0.0f64; tiers.len()];
     let n_win = (held_out.len() - 1) / SEQ_LEN;
     let starts: Vec<usize> = (offset * unit..held_out.len() - SEQ_LEN).step_by(unit * stride).filter(|s| s / SEQ_LEN * part_n / n_win == part_i).collect();
+    // Wall time per phase: forward launch + readback, tier prepare (kNN search + readback), per-row scoring, online writes.
+    let mut phase = [std::time::Duration::ZERO; 4];
+    let t_all = std::time::Instant::now();
     for (ci, chunk) in starts.chunks(CHUNK).enumerate() {
+        let t0 = std::time::Instant::now();
         let f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden);
         let rows = f.ids.len();
+        phase[0] += t0.elapsed();
+        let t0 = std::time::Instant::now();
         for tier in tiers.iter_mut().flatten() {
             tier.prepare(ci, &f.hidden, rows, chunk);
         }
+        phase[1] += t0.elapsed();
+        let t0 = std::time::Instant::now();
         for r in 0..rows {
             let t = r % SEQ_LEN;
             if t < warm {
@@ -658,10 +666,23 @@ fn main() {
                 ce_tier[i] -= p[f.targets[r]].max(1e-300).ln();
             }
         }
+        phase[2] += t0.elapsed();
+        let t0 = std::time::Instant::now();
         if let Some(st) = &store {
             st.write_chunk(&f.hidden, &f.targets, chunk, warm, cfg.d);
         }
+        phase[3] += t0.elapsed();
     }
+    let total = t_all.elapsed().as_secs_f64();
+    let pct = |d: std::time::Duration| format!("{:.1}s ({:.0}%)", d.as_secs_f64(), 100.0 * d.as_secs_f64() / total);
+    println!(
+        "timing: {total:.1}s over {} chunks: forward {}, tier prepare {}, row scoring {}, online writes {}",
+        starts.chunks(CHUNK).count(),
+        pct(phase[0]),
+        pct(phase[1]),
+        pct(phase[2]),
+        pct(phase[3])
+    );
     let n = (starts.len() * unit) as f64;
     let (ce_model, ce_device) = (ce_model / n, ce_device / n);
     println!("checkpoint {ckpt}: {} windows (stride {stride}, offset {offset}, part {part_i}/{part_n}), {} positions; tap = block {tap}", starts.len(), n as usize);
