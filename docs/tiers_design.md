@@ -280,6 +280,11 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   from ~11-12 min to **281 s (online), 248 s (causal), 232 s (flat)**, still 99% in the kNN search. Machine busy (CPU
   ~100% from other sessions at launch), so these are upper bounds.
 
+- **Skip unscored rows (`warm>0`).** `Store::prepare` now searches only rows at window position >= warm (the others were
+  searched and never scored). Same slice (`part=5/96`, warm 32): CE identical (flat 1.0949, online 1.0943), 22.6 s ->
+  **14.1 s** flat (16.3 s online). Top-k does not halve with half the queries (1.5 s for 1024 vs 2.2 s for 2048: fewer
+  threads, latency-bound), so a wider `PARTS` for small blocks may help. Contended machine (CPU ~32%).
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).

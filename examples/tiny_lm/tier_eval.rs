@@ -333,6 +333,8 @@ struct Store {
     gpu: RefCell<KnnStore>,
     causal: Option<Causal>,
     online: Option<RefCell<Online>>,
+    /// Rows at window positions below this are never scored, so they are not searched.
+    warm: usize,
     /// (chunk searched, per row the KMAX nearest (squared distance, value), ascending)
     found: RefCell<(Option<usize>, Vec<(f32, u8)>)>,
 }
@@ -382,7 +384,16 @@ impl Store {
                 .collect();
             ranges = Some((r, on.n_train as u32));
         }
-        let found = self.gpu.borrow().search_masked(hidden, rows, ranges.as_ref().map(|(r, a)| (r.as_slice(), *a)));
+        // Only the scored rows (window position >= warm) are searched; the others keep (infinity, 0) entries.
+        let scored: Vec<usize> = (0..rows).filter(|r| r % SEQ_LEN >= self.warm).collect();
+        let d = hidden.len() / rows;
+        let q: Vec<f32> = scored.iter().flat_map(|&r| hidden[r * d..(r + 1) * d].iter().copied()).collect();
+        let rg = ranges.as_ref().map(|(r, a)| (scored.iter().map(|&i| r[i]).collect::<Vec<_>>(), *a));
+        let part = self.gpu.borrow().search_masked(&q, scored.len(), rg.as_ref().map(|(r, a)| (r.as_slice(), *a)));
+        let mut found = vec![(f32::INFINITY, 0u8); rows * KMAX];
+        for (j, &r) in scored.iter().enumerate() {
+            found[r * KMAX..(r + 1) * KMAX].copy_from_slice(&part[j * KMAX..(j + 1) * KMAX]);
+        }
         *self.found.borrow_mut() = (Some(chunk), found);
     }
 
@@ -620,7 +631,7 @@ fn main() {
             let first_window = (0..windows).map(|w| docs[docs.partition_point(|&b| b <= w * SEQ_LEN) - 1].div_ceil(SEQ_LEN)).collect();
             Causal { n_train: n_train_keys, first_window, recent: size("recent", &usize::MAX.to_string()) }
         });
-        Some(Rc::new(Store { gpu: RefCell::new(gpu), causal, online, found: RefCell::new((None, vec![])) }))
+        Some(Rc::new(Store { gpu: RefCell::new(gpu), causal, online, warm, found: RefCell::new((None, vec![])) }))
     } else {
         None
     };
