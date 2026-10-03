@@ -15,9 +15,12 @@ pub const KMAX: usize = 256;
 const KM: u32 = KMAX as u32;
 /// Queries per block (bounds the [tile, block] distance buffer).
 const QBLOCK: usize = 2048;
+/// Threads per query: each scans its own contiguous part of a slice into its own top list, and the lists are merged on
+/// the host. One thread per query left the GPU idle (the scan is serial over millions of keys; docs/tiers_design.md).
+const PARTS_DEFAULT: usize = 8;
 /// Keys per top-k launch: one launch must stay short (a long one trips the OS's GPU watchdog; with KMAX = 256 a
-/// whole 16384-key tile lost the device).
-const SLICE: usize = 1024;
+/// whole 16384-key tile lost the device when one thread scanned all of it). Each thread scans SLICE / PARTS keys.
+const SLICE: usize = 4096;
 
 struct Tile {
     keys: Handle,
@@ -87,13 +90,14 @@ impl KnnStore {
             None => (vec![(0, u32::MAX); rows], 0),
         };
         assert_eq!(ranges.len(), rows);
+        let parts: usize = std::env::var("KNN_PARTS").ok().and_then(|v| v.parse().ok()).unwrap_or(PARTS_DEFAULT);
         let mut out = Vec::with_capacity(rows * KMAX);
         for q0 in (0..rows).step_by(QBLOCK) {
             let q = QBLOCK.min(rows - q0);
             let block = &queries[q0 * self.d..(q0 + q) * self.d];
             let qh = upload_f32(block);
-            let best_d = upload_f32(&vec![f32::INFINITY; q * KMAX]);
-            let best_v = upload_f32(&vec![0.0f32; q * KMAX]);
+            let best_d = upload_f32(&vec![f32::INFINITY; parts * q * KMAX]);
+            let best_v = upload_f32(&vec![0.0f32; parts * q * KMAX]);
             let dist = client().empty(self.tile * q * 4);
             let lo = client().create_from_slice(u32::as_bytes(&ranges[q0..q0 + q].iter().map(|r| r.0).collect::<Vec<_>>()));
             let hi = client().create_from_slice(u32::as_bytes(&ranges[q0..q0 + q].iter().map(|r| r.1).collect::<Vec<_>>()));
@@ -115,7 +119,7 @@ impl KnnStore {
                     super::count_launch();
                     let n = SLICE.min(t.len - j0);
                     #[rustfmt::skip]
-                    k_topk::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * q), buf(&t.norms, t.len), buf(&t.vals, t.len), buf(&best_d, q * KMAX), buf(&best_v, q * KMAX), buf(&lo, q), buf(&hi, q), always, q as u32, (base + j0) as u32, j0 as u32, n as u32);
+                    k_topk::launch(client(), cubes(parts * q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * q), buf(&t.norms, t.len), buf(&t.vals, t.len), buf(&best_d, parts * q * KMAX), buf(&best_v, parts * q * KMAX), buf(&lo, q), buf(&hi, q), always, q as u32, parts as u32, (base + j0) as u32, j0 as u32, n as u32);
                 }
                 if timing {
                     read(&hi);
@@ -125,21 +129,24 @@ impl KnnStore {
             }
             let t0 = std::time::Instant::now();
             let (bd, bv) = (read(&best_d), read(&best_v));
+            let t_read = t0.elapsed();
             if timing {
                 eprintln!(
                     "knn timing: {q} queries x {} keys: matmul {:.0} ms, top-k {:.0} ms, readback {:.0} ms, total {:.0} ms",
                     self.len(),
                     t_mm.as_secs_f64() * 1e3,
                     t_topk.as_secs_f64() * 1e3,
-                    t0.elapsed().as_secs_f64() * 1e3,
+                    t_read.as_secs_f64() * 1e3,
                     t_start.elapsed().as_secs_f64() * 1e3
                 );
             }
             for r in 0..q {
                 let qn: f32 = block[r * self.d..(r + 1) * self.d].iter().map(|x| x * x).sum();
-                for j in 0..KMAX {
-                    out.push(((bd[r * KMAX + j] + qn).max(0.0), bv[r * KMAX + j] as u8));
-                }
+                let mut c: Vec<(f32, f32)> = (0..parts).flat_map(|p| (0..KMAX).map(move |j| (p * q + r) * KMAX + j)).map(|i| (bd[i], bv[i])).collect();
+                c.select_nth_unstable_by(KMAX - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
+                c.truncate(KMAX);
+                c.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                out.extend(c.iter().map(|&(dd, v)| ((dd + qn).max(0.0), v as u8)));
             }
         }
         out
@@ -151,40 +158,47 @@ impl KnnStore {
 /// store-wide indices start at gj0 (keys outside a query's allowed ranges count as infinitely far).
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
-fn k_topk(d: &[f32], norms: &[f32], vals: &[f32], best_d: &mut [f32], best_v: &mut [f32], lo: &[u32], hi: &[u32], always: u32, q: u32, gj0: u32, j0: u32, len: u32) {
-    let qi = ABSOLUTE_POS as u32;
-    if qi < q {
-        let base = qi * KM;
+fn k_topk(d: &[f32], norms: &[f32], vals: &[f32], best_d: &mut [f32], best_v: &mut [f32], lo: &[u32], hi: &[u32], always: u32, q: u32, parts: u32, gj0: u32, j0: u32, len: u32) {
+    // Thread t scans part t / q of the slice for query t % q (neighbouring threads: neighbouring queries, coalesced).
+    let t = ABSOLUTE_POS as u32;
+    if t < q * parts {
+        let qi = t % q;
+        let chunk = (len + parts - 1) / parts;
+        let start = (t / q) * chunk;
+        let base = t * KM;
         let mut worst = best_d[(base + KM - 1) as usize];
         let (lo_q, hi_q) = (lo[qi as usize], hi[qi as usize]);
-        for jj in 0..len {
-            let j = j0 + jj;
-            let g = gj0 + jj;
-            let mut dist = norms[j as usize] - 2.0 * d[(j * q + qi) as usize];
-            if g >= always {
-                if g < lo_q {
-                    dist = f32::INFINITY;
-                }
-                if g >= hi_q {
-                    dist = f32::INFINITY;
-                }
-            }
-            if dist < worst {
-                // Insert at the rank of `dist` (the number of kept entries not above it), shifting the tail down.
-                let mut p = 0u32;
-                for i in 0..KM {
-                    if best_d[(base + i) as usize] <= dist {
-                        p += 1;
+        for jl in 0..chunk {
+            let jj = start + jl;
+            if jj < len {
+                let j = j0 + jj;
+                let g = gj0 + jj;
+                let mut dist = norms[j as usize] - 2.0 * d[(j * q + qi) as usize];
+                if g >= always {
+                    if g < lo_q {
+                        dist = f32::INFINITY;
+                    }
+                    if g >= hi_q {
+                        dist = f32::INFINITY;
                     }
                 }
-                for s in 0..KM - 1 - p {
-                    let i = KM - 1 - s;
-                    best_d[(base + i) as usize] = best_d[(base + i - 1) as usize];
-                    best_v[(base + i) as usize] = best_v[(base + i - 1) as usize];
+                if dist < worst {
+                    // Insert at the rank of `dist` (the number of kept entries not above it), shifting the tail down.
+                    let mut p = 0u32;
+                    for i in 0..KM {
+                        if best_d[(base + i) as usize] <= dist {
+                            p += 1;
+                        }
+                    }
+                    for s in 0..KM - 1 - p {
+                        let i = KM - 1 - s;
+                        best_d[(base + i) as usize] = best_d[(base + i - 1) as usize];
+                        best_v[(base + i) as usize] = best_v[(base + i - 1) as usize];
+                    }
+                    best_d[(base + p) as usize] = dist;
+                    best_v[(base + p) as usize] = vals[j as usize];
+                    worst = best_d[(base + KM - 1) as usize];
                 }
-                best_d[(base + p) as usize] = dist;
-                best_v[(base + p) as usize] = vals[j as usize];
-                worst = best_d[(base + KM - 1) as usize];
             }
         }
     }

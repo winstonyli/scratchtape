@@ -253,6 +253,14 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   Contended run (CPU 85%, `WizardGraphicalClient` on the eGPU). Fix to try: split each query's key range across
   several threads (partial top-k per slice, then merge), which should scale until the GPU is saturated.
 
+- **Top-k is insertion-bound, not scan-bound (`KNN_PARTS`, same 2048 x 4.53M block; contended, CPU 40-85%).** Splitting
+  each query's slice over 8 threads (`PARTS`, lists merged on the host; SLICE 4096) is exact (same CE 1.0949) but only
+  cut top-k 6.4 -> 5.5 s. Sweep: 1 part 6.1 s, 8 parts 5.5 s, 32 parts **18.5 s** (128 parts did not finish). Scan-only
+  (insertions disabled): 1 part ~2 s, 8 parts ~0.6-0.9 s. So ~4-5 s is the sorted-list insertions (rank count over 256
+  entries + shift, divergent within a wave, global memory), and each extra part adds its own ~k(1+ln(n/k)) insertions,
+  which is why more parts get slower. Next lever: cut insertions, e.g. a per-query threshold from a sampled pass 1
+  (only keys under it are candidates; fall back when fewer than k qualify), or binary-search insertion.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
