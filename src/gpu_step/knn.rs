@@ -47,13 +47,24 @@ pub struct KnnStore {
     pending_keys: Vec<f32>,
     pending_vals: Vec<u8>,
     sample_keys: Vec<f32>,
+    /// Wall time spent in `flush` so far: host copy + norms, then upload (diagnostic).
+    pub flush_time: [std::time::Duration; 2],
     /// Device copy of `sample_keys` as (keys, norms, len) chunks, with the sample count it was built from.
     sample_dev: RefCell<(usize, Vec<(Handle, Handle, usize)>)>,
 }
 
 impl KnnStore {
     pub fn new(d: usize, tile: usize) -> Self {
-        KnnStore { d, tile, tiles: vec![], pending_keys: vec![], pending_vals: vec![], sample_keys: vec![], sample_dev: RefCell::new((0, vec![])) }
+        KnnStore {
+            d,
+            tile,
+            tiles: vec![],
+            pending_keys: vec![],
+            pending_vals: vec![],
+            sample_keys: vec![],
+            flush_time: [std::time::Duration::ZERO; 2],
+            sample_dev: RefCell::new((0, vec![])),
+        }
     }
 
     /// Appends keys (row-major [n, d]) and their values; full tiles are uploaded as they fill.
@@ -75,6 +86,7 @@ impl KnnStore {
     }
 
     fn flush(&mut self, n: usize) {
+        let t0 = std::time::Instant::now();
         let keys: Vec<f32> = self.pending_keys.drain(..n * self.d).collect();
         let first = self.len();
         for i in (first.next_multiple_of(SAMPLE_STRIDE) - first..n).step_by(SAMPLE_STRIDE) {
@@ -83,7 +95,10 @@ impl KnnStore {
         let vals: Vec<u8> = self.pending_vals.drain(..n).collect();
         let norms: Vec<f32> = keys.chunks_exact(self.d).map(|k| k.iter().map(|x| x * x).sum()).collect();
         let vals_f: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
+        self.flush_time[0] += t0.elapsed();
+        let t0 = std::time::Instant::now();
         self.tiles.push(Tile { keys: upload_f32(&keys), norms: upload_f32(&norms), vals: upload_f32(&vals_f), len: n });
+        self.flush_time[1] += t0.elapsed();
     }
 
     pub fn len(&self) -> usize {

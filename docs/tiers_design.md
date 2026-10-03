@@ -285,6 +285,14 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   **14.1 s** flat (16.3 s online). Top-k does not halve with half the queries (1.5 s for 1024 vs 2.2 s for 2048: fewer
   threads, latency-bound), so a wider `PARTS` for small blocks may help. Contended machine (CPU ~32%).
 
+- **Store build time (`memory build:` line in `tier_eval`).** Building the 4.53M-key memory costs ~42 s per launch
+  (CPU ~55% from other sessions): forward + hidden readback 34.8 s (82%), host copy + norms 2.2 s, upload 4.0 s, other
+  1.4 s. The build forwarded 32 windows per launch and also read back logits and row losses it never uses; skipping
+  those reads and forwarding 64 windows per launch gives **30.0 s** (forward + readback 24.0 s), identical CE (1.0797).
+  Remaining: ~22 ms per 64-window launch of GPU compute plus a 4 MB readback over USB4, each launch serialised with the
+  host copy; overlapping them (queue the next forward before reading the last) could recover a few seconds. Sharing the
+  store across memory modes in one process would save the whole build per extra mode (needs `KnnStore::truncate`).
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).

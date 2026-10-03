@@ -508,7 +508,7 @@ struct Forward {
     hidden: Vec<f32>,
 }
 
-fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], tap: usize, want_hidden: bool) -> Forward {
+fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], tap: usize, want_hidden: bool, want_logits: bool) -> Forward {
     let (mut ids, mut targets) = (vec![], vec![]);
     for &s in starts {
         ids.extend(&data[s..s + SEQ_LEN]);
@@ -516,7 +516,7 @@ fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], t
     }
     let mut dt = DeviceTape::new(dev);
     let (outs, logits, loss) = model_forward(&mut dt, cfg, &ids, &targets, starts.len());
-    let (logits, row_loss) = (read(dt.value(logits)), read(dt.row_losses(loss)));
+    let (logits, row_loss) = if want_logits { (read(dt.value(logits)), read(dt.row_losses(loss))) } else { (vec![], vec![]) };
     let hidden = if want_hidden { read(dt.value(outs[tap])) } else { vec![] };
     Forward { ids, targets, logits, row_loss, hidden }
 }
@@ -594,9 +594,14 @@ fn main() {
         assert!(from == "train" || causal || stride > 1, "store_from=held needs stride > 1 so some held-out windows are left unscored");
         let mut gpu = KnnStore::new(cfg.d, 16384);
         let (mut n_train, mut n_held) = (0, 0);
+        let build = std::time::Instant::now();
+        let mut t_fwd = std::time::Duration::ZERO;
         let mut load = |data: &[usize], starts: &[usize]| {
-            for chunk in starts.chunks(CHUNK) {
-                let f = forward(&dev, &cfg, data, chunk, tap, true);
+            // Only the hidden states are needed (no logits or losses), so launches can be twice as large.
+            for chunk in starts.chunks(2 * CHUNK) {
+                let t0 = std::time::Instant::now();
+                let f = forward(&dev, &cfg, data, chunk, tap, true, false);
+                t_fwd += t0.elapsed();
                 gpu.add(&f.hidden, &f.targets.iter().map(|&t| t as u8).collect::<Vec<_>>());
             }
         };
@@ -614,6 +619,14 @@ fn main() {
             n_held = starts.len();
         }
         gpu.finish();
+        println!(
+            "memory build: {:.1}s = forward + hidden readback {:.1}s, host copy + norms {:.1}s, upload {:.1}s, other {:.1}s",
+            build.elapsed().as_secs_f64(),
+            t_fwd.as_secs_f64(),
+            gpu.flush_time[0].as_secs_f64(),
+            gpu.flush_time[1].as_secs_f64(),
+            (build.elapsed() - t_fwd - gpu.flush_time[0] - gpu.flush_time[1]).as_secs_f64()
+        );
         println!(
             "memory: {} keys of {} floats from {n_train} train + {n_held} unscored held-out windows{} (tap = block {tap}), searched on the GPU",
             gpu.len(),
@@ -647,7 +660,7 @@ fn main() {
     let t_all = std::time::Instant::now();
     for (ci, chunk) in starts.chunks(CHUNK).enumerate() {
         let t0 = std::time::Instant::now();
-        let f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden);
+        let f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden, true);
         let rows = f.ids.len();
         phase[0] += t0.elapsed();
         let t0 = std::time::Instant::now();
