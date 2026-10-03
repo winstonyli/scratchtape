@@ -321,6 +321,12 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   memories on the 16 GB card. Top-k (1.5 s per block) is now ~75% of the search. Not default because results differ in
   the 4th decimal; the f32 path stays the exact reference.
 
+- **Full held-out stack with the f16 search (`scripts/tier_full5.sh`, `runs/tier_full5_f16.log`; 2026-10-02 20:04,
+  CPU 17% at launch).** All six specs and the model alone match the f32 run (`tier_full4`) to the 4th decimal
+  (lexicon+words+memory 1.1313, -0.0451; memory alone 1.1352, -0.0412). Wall time of the scoring loop **2502 s -> 1355 s**
+  (23 min; search 1306 s), build 30 s. So `KNN_F16=1` costs nothing measurable at the reported precision and nearly halves
+  the full run; it is still off by default.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
