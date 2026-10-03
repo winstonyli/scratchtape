@@ -275,6 +275,11 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   (1.0949). Parts sweep with thresholds: 2: 3.6 s, 4: 2.7, 8: 2.2, 16: 1.9, 32: 1.6, 64: 1.6 (host merge/readback grows
   with parts: 6 -> 110 ms), so the default is 16.
 
+- **End-to-end check of the faster search (`scripts/tier_online.sh` rerun, same slice).** Every CE matches the earlier
+  run (the one 1.1046 -> 1.1045 is the 4th decimal; all deltas identical to 4 places), and the wall time per run fell
+  from ~11-12 min to **281 s (online), 248 s (causal), 232 s (flat)**, still 99% in the kNN search. Machine busy (CPU
+  ~100% from other sessions at launch), so these are upper bounds.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
