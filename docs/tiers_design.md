@@ -347,6 +347,13 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   (host f16 conversion + 38 MB). Now only the last partial chunk is rebuilt. Same slice: pass 1 ~370-420 ms -> ~70-90 ms,
   block total ~2.2 s -> ~1.3 s (matmul ~0.5, pass 1 ~0.08, top-k ~0.7), CE identical (1.0943). Test
   `search_stays_exact_while_the_store_grows` covers search / add / search across sample-chunk boundaries.
+- **Full held-out rerun with the top-k and pass-1 fixes (2026-10-02, `scripts/tier_full6.sh`, `runs/tier_full6.log`).** CE
+  identical to the f16 run (full stack 1.1313; memory alone 1.1352), but **1464 s vs 1355 s: not faster**, although the
+  `part=5/96` slice ran 15.7 -> 10.4 s (same exe, minutes later; CPU ~54% from other sessions at that check). The full run
+  costs 2.86 s per chunk (492 chunks) against ~1.3-1.7 s per chunk on the slice, so the slice speedup did not carry over.
+  Unexplained: contention during the run was not measured (the eGPU users and CPU load were checked only before launch),
+  and the full run's memory is larger (5.04M keys at the end vs 4.5M). Do not quote the full-run speedup until it is
+  reproduced under a logged quiet machine.
 
 ## Order
 
