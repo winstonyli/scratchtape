@@ -2,6 +2,7 @@
 name = "scratchtape"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 # First non-dev dependencies this project takes. wgpu: cross-platform GPU

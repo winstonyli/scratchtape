@@ -6,8 +6,8 @@
 
 1. **`src/config.rs`, `get_libs`**: call `llvm_config(prefix_os, "--libnames")`
    instead of `"--libs"`. On Windows, `--libs` prints full paths, and
-   `split_whitespace` breaks them at the space in
-   `C:\Users\First Last\AppData\Local\tracel\...`. The symptom is
+   `split_whitespace` breaks them at a space in the
+   user profile path (`C:\Users\First Last\AppData\Local\tracel\...`). The symptom is
    `could not find native static library 'First'`. Every bundler version
    through 23.1.0-3 still has this bug.
 

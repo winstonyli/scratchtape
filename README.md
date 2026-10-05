@@ -14,6 +14,48 @@ message narrates what was tried, what was measured, and what the result
 actually was — including the negative ones. `git log` reads like a lab
 notebook; this README is the map, not a replacement for it.
 
+## Scope
+
+This is a personal research and learning project, not a library or a
+framework. It trains small byte-level language models (d_model 32 to 256) on a few
+hundred kilobytes of public-domain text, and its
+results are about mechanisms (attention variants, local-SGD averaging,
+memory tiers), not benchmark scores. It makes no stability promises, and
+nothing here is packaged for reuse.
+
+## Requirements
+
+- **Rust:** edition 2024. The dependency tree declares a minimum of Rust
+  1.95; the project is developed on a recent nightly (rustc 1.100) and has
+  not been tried on other toolchains.
+- **CPU:** x86-64 with AVX2 and FMA. `.cargo/config.toml` builds with
+  `+avx2,+fma`, and older CPUs fail with an illegal-instruction error.
+- **OS:** Windows 11. The CPU engine (`tensor`, `tape`, `nn`, `optim`) is
+  portable Rust, but `gpu_lease.rs` needs `%LOCALAPPDATA%` and the
+  `scripts/` drivers assume Git Bash; nothing has been run on Linux or macOS.
+- **GPU (optional):** everything under `src/gpu*` and `examples/gpu/` needs
+  a Vulkan-capable discrete GPU. It was developed on an AMD Radeon RX 9060
+  XT in a USB4 eGPU enclosure (host: Ryzen 7 7840U laptop) and has not been
+  run on any other card. Without a discrete GPU the CPU examples still run,
+  and the GPU tests are `#[ignore]`d.
+  - `gpu.rs` (the raw wgpu matmul) picks DX12 on Windows and falls back to
+    any backend; `WGPU_BACKEND=dx12|vulkan` overrides it.
+  - `gpu_step/` (cubecl) uses Vulkan on the first discrete GPU, the route to
+    the card's matrix cores. `WGPU_BACKEND=dx12` selects DX12 instead, and
+    needs the Windows SDK's `dxcompiler.dll` on `PATH`; without it wgpu
+    silently falls back to FXC and the step runs ~170x slower
+    (`docs/gpu_step_design.md`).
+- **Disk and time:** the largest runs (`fused_models_check`, `tier_eval`)
+  take minutes to hours and write checkpoints under `runs/` (gitignored).
+
+## AI-assisted development
+
+Most of this code was written with Claude Code (Anthropic's coding agent):
+254 of the 255 commits carry a `Co-Authored-By: Claude` trailer (Sonnet 5,
+Sonnet 5.5 and Opus 5.5 versions). The direction, the experiments to run,
+and the decision to keep or retract a result are the author's. The
+trailers are the only record of the split; `git log` is the audit trail.
+
 ## Direction: tiered AI
 
 The overarching idea (the user's, 2026-10-02): each tier of the system
@@ -52,7 +94,7 @@ are chosen by what they say about the tiers and how they connect.
 ## Quick start
 
 ```bash
-cargo test --release              # 24 gradient-check / correctness tests (+1 GPU-only: -- --ignored)
+cargo test --release              # 35 gradient-check / correctness tests (+18 GPU-only: -- --ignored)
 cargo build --release --examples  # build everything under examples/
 cargo run --release --example tiny_lm
 ```
@@ -1243,8 +1285,10 @@ because raw forgetting deltas hid a floor effect.
   `RequestAdapterOptions::default()`, which picked the integrated Radeon
   780M. Fixed 2026-09-23 to `HighPerformance` (RX 9060 XT), and the chosen
   adapter is now logged. New lead: wgpu on this machine defaults to
-  Vulkan, but DX12 has ~7× lower per-call overhead (128×128 round trip
-  1.1 ms vs 7.8 ms), so `gpu.rs` now defaults to DX12 on Windows
+  Vulkan, but DX12 has lower per-call overhead on small matmuls (128×128
+  round trip 1.1 ms vs 7.8 ms, ~7×; 512: 6.6 vs 30 ms, ~4.5×; about even at
+  1024; an idle-GPU rerun the next day gave 1.6–5.8× across four shapes,
+  `examples/gpu/gpu_dispatch_overhead.rs`), so `gpu.rs` now defaults to DX12 on Windows
   (`WGPU_BACKEND` overrides). That holds for this project's short,
   overhead-bound dispatches only: humble-cortex found Vulkan 1.4–1.6×
   faster for long compute-bound kernels, and a size sweep here was
@@ -1528,3 +1572,9 @@ because raw forgetting deltas hid a floor effect.
 
 The crate is `scratchtape`: from-scratch, and literally built around a
 `Tape` struct at its center — not a metaphor.
+
+## License
+
+MIT, see [`LICENSE`](LICENSE). Third-party dependencies keep their own licenses
+(permissive, plus two MPL-2.0 crates pulled in by cubecl). The four texts in
+`data/` are public-domain works, with Project Gutenberg headers removed.
