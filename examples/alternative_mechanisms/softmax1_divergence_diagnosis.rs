@@ -1,5 +1,5 @@
 // RETRACTED 2026-09-23: everything below diagnosed a bug, not softmax1.
-// Tape::softmax1 (from 20e5038) subtracted the row max but kept the
+// Tape::softmax1 (from 6f22b36) subtracted the row max but kept the
 // literal +1, computing exp(x)/(sum exp(x) + exp(max x)); its detached-
 // max gradient didn't match that function, pushing row-shifting
 // parameters with no effect on the loss (see Tape::softmax1's doc
@@ -11,7 +11,7 @@
 // is kept below as the record of what was believed and why.
 //
 // Actually diagnoses the softmax1-in-a-real-transformer divergence
-// ([d54c8f2] "Try softmax1 against the attention-frequency-sink
+// ([45a5d9a] "Try softmax1 against the attention-frequency-sink
 // finding: diverges regardless of lr, parked") instead of resting on
 // that commit's closing comparison to the PC-precision instabilities.
 // That comparison was never tested - this builds the instrumentation
@@ -70,7 +70,7 @@
 // time, versus this file's own step-775 NaN under identical settings.
 //
 // Reuses the already-tested, already-in-the-library TransformerBlock::forward_full
-// hook (added in d54c8f2 specifically for this, never exercised beyond
+// hook (added in 45a5d9a specifically for this, never exercised beyond
 // a smoke test) - no new engine code, just instrumentation around an
 // existing capability.
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
@@ -252,7 +252,7 @@ fn main() {
     let corpus = encode_bytes(include_str!("../../data/aesops_fables.txt"));
     let (d_model, n_heads, d_ff, seq_len, n_blocks) = (128, 8, 256, 64, 4);
     let vocab_size = 256;
-    // lr=0.03 from d54c8f2's own sweep: NaN'd around step 507-1600
+    // lr=0.03 from 45a5d9a's own sweep: NaN'd around step 507-1600
     // depending on the exact run - late enough to see a real trend
     // develop before divergence, unlike lr=0.3's ~110-216 step blowup.
     let lr = 0.03;

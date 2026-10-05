@@ -12,7 +12,7 @@ Windows time-slices separate processes, so K models belong in the same
 launches (HFTA, MLSys 2021, arXiv 2102.02344). The aim is the overfitting
 gap that decay and dropout barely moved.
 
-Built (commits 9dea605, 3a78555):
+Built (commits 4e0a95e, 68d5d83):
 
 - `DeviceParams::upload_models(flat, k)`. Model m's params and grads sit
   at m·stride, and activations hold K equal row slices.

@@ -12,7 +12,7 @@ use common::{ForwardOut, apply_grad, decode_bytes, encode_bytes, precision_recal
 
 /// Stratified k-fold linear-probe comparison (frozen embedding-only vs
 /// graph-augmented with attention-graph neighbor mean), extracted from the
-/// original is-vowel probe ([178af66]) so the same held-out rigor applies
+/// original is-vowel probe ([889b8cc]) so the same held-out rigor applies
 /// to other externally-checkable categories without re-deriving the fold
 /// logic each time. Returns (mean baseline accuracy, mean graph-augmented
 /// accuracy, majority-class baseline accuracy) for the caller to compare
@@ -317,7 +317,7 @@ fn kmeans(points: &[Vec<f32>], k: usize, iterations: usize, rng: &mut Rng) -> Ve
     assignments
 }
 
-/// Plain softmax, no QK-norm - back from softmax1+QK-norm ([e4820bd]),
+/// Plain softmax, no QK-norm - back from softmax1+QK-norm ([22437d0]),
 /// whose promotion evidence fell (README "Correction", "Measured
 /// directly"): the diversity gain was an argmax artifact of the original
 /// L2 QK-norm making every head a near-exact mean-pool, and the loss
@@ -328,7 +328,7 @@ fn kmeans(points: &[Vec<f32>], k: usize, iterations: usize, rng: &mut Rng) -> Ve
 /// plain softmax is stable but ties plain softmax on held-out loss (1.740
 /// vs 1.738), so it isn't worth its parameters here.
 /// attention_uniformity_check.rs has all three conditions. Results in
-/// this file recorded between [e4820bd] and this change used the L2
+/// this file recorded between [22437d0] and this change used the L2
 /// softmax1+QK-norm model.
 fn forward(
     tape: &mut Tape,
@@ -747,7 +747,7 @@ fn main() {
     // Same model scale as tiny_lm_scaled.rs - isolates the corpus-size axis
     // on its own, rather than compounding it with a model-size change too.
     // Model-size scale-up tried twice and reverted both times:
-    // - 2x model, SAME 16000 steps ([3ed92e9]): worse held-out loss (2.10
+    // - 2x model, SAME 16000 steps ([39c5a25]): worse held-out loss (2.10
     //   vs 1.93) and more fragmentation (35 strict-consensus components vs
     //   32) - a compute-optimal-scaling confound, not evidence capacity
     //   doesn't help.
@@ -764,7 +764,7 @@ fn main() {
 
     // Originally 4x tiny_lm_corpus's step count to test the undertraining
     // theory from the cross-seed stability check (confirmed: stability rose
-    // broadly). Bumped again to 64000 ([e4820bd]) for softmax1+QK-norm's
+    // broadly). Bumped again to 64000 ([22437d0]) for softmax1+QK-norm's
     // slower convergence; kept after reverting to plain softmax, which also
     // improves over 16000 -> 64000 (held-out 1.93 -> 1.74, seed 1) and is
     // the budget every current comparison was measured at.
@@ -776,7 +776,7 @@ fn main() {
     // same total compute, wall-clock bounded by the slowest one instead of
     // the sum of all three, on a machine with cores to spare (16 here).
     // Not GPU, not minibatching - both already measured net-negative at
-    // this model's scale ([479e3b9], [29dad53]) - this is a different axis
+    // this model's scale ([d348ffc], [35feafd]) - this is a different axis
     // (parallelizing independent runs, not speeding up one run).
     println!("\ntraining 3 seeds concurrently for cross-seed cluster stability...");
     let wall_clock_start = Instant::now();
@@ -1182,7 +1182,7 @@ fn main() {
     }
 
     // Fourth extraction, building on the second (attention graph): GNN
-    // message-passing over the attention graph ([178af66]), is-vowel
+    // message-passing over the attention graph ([889b8cc]), is-vowel
     // prediction as an externally-checkable
     // probe (not model-derived). Originally inconclusive by a stated data
     // limit, not by finding: only 34 labeled nodes / 7 positive examples

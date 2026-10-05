@@ -408,7 +408,7 @@ impl Tape {
     /// m = max(max(x), 0) and use exp(-m) for the phantom term:
     /// exp(x-m) / (sum exp(x-m) + exp(-m)). Detaching m is valid only
     /// because that full [x, 0] softmax is shift-invariant. The version
-    /// used from 20e5038 until this fix shifted by max(x) but kept "+1",
+    /// used from 6f22b36 until this fix shifted by max(x) but kept "+1",
     /// which computes exp(x) / (sum exp(x) + exp(max x)) - a phantom key
     /// at the row's max, not at 0 - so the forward pass was shift-invariant
     /// while the detached-max gradient was not. Parameters that shift a

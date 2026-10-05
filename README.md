@@ -209,7 +209,7 @@ distinct targets instead of concentrating, real evidence for the
 original theory on the model it was always about.
 
 That first pass used one seed — the same shape of claim this project's
-own methodology already flagged as unreliable ([ccd411e] found the
+own methodology already flagged as unreliable ([43366bd] found the
 original single-seed 'a'-sink itself was seed-arbitrary), and never
 checked whether the fix costs anything in modeling quality. Reran with
 3 fresh seeds, each a control/treatment pair from identical seed/data/
@@ -402,7 +402,7 @@ divergence" came from capping logits at ±0.25, which also removed
 selectivity. Net: softmax1 isn't viable in this setup (SGD, lr 0.3)
 without bounding the logit scale some other way, and the promotion is
 reversed: `tiny_lm_corpus.rs` is back on plain softmax. Every
-`tiny_lm_corpus.rs` result recorded between `e4820bd` and this change
+`tiny_lm_corpus.rs` result recorded between `22437d0` and this change
 came from the L2 softmax1+QK-norm model. For context, recent work puts
 softmax1's upside at small scale in the hundredths of a nat (abstention
 ~0.019 nats at 10M params, shrinking with scale; Wang 2026). Gated or
@@ -410,7 +410,7 @@ sink-logit variants (Qwen's gated attention, NeurIPS 2025; a learnable
 phantom key) get abstention without unbounded logits. One seed.
 
 **Correction: the runaway was a `Tape::softmax1` bug, present since
-`20e5038`.** Writing a finite-difference test for a new sink-logit op
+`6f22b36`.** Writing a finite-difference test for a new sink-logit op
 exposed it. softmax1 subtracted the row max for overflow safety but kept
 the literal "+1", computing exp(x)/(Σexp(x) + exp(max x)) — a phantom key
 pinned at the row's max, not at 0 (0.44 instead of 0.71 on a test row).
@@ -1536,7 +1536,7 @@ because raw forgetting deltas hid a floor effect.
   **The eGPU "hangs" are contention, and the utilization counter can't
   show it.** Re-timing `gpu_dispatch_overhead` stalled inside
   `device.poll` after 19–287 round trips, on DX12 and Vulkan alike. The
-  wgpu 23 build at `a37604c` stalled the same way (after 31), so the port
+  wgpu 23 build at `122243f` stalled the same way (after 31), so the port
   isn't the cause. Five other processes had work on the eGPU: three
   humble-cortex `conv_pc2_isolated_*` checks, sojourn and manifold.
   Windows' `GPU Engine … Utilization Percentage` counter reports millions

@@ -437,7 +437,7 @@ Each milestone leaves a runnable check behind.
 
      | | synced best, 4 runs | pipelined best |
      |---|---|---|
-     | before (2b4034a) | 3.37 / 3.53 / 3.53 / 3.61 | 3.43 |
+     | before (fdd950c) | 3.37 / 3.53 / 3.53 / 3.61 | 3.43 |
      | head views | 3.38 / 3.41 / 3.47 / 3.74 | 3.36 |
 
      **Negative result: the ~1 ms between wall step and kernel time is

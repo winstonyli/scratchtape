@@ -1,5 +1,5 @@
 // First integration of the three memory-tier scaffolding stages
-// ([20e5038] forgetting, [c2f0ad2] replay, [d151b29] checkpointing) - each
+// ([6f22b36] forgetting, [6c18594] replay, [4418ca4] checkpointing) - each
 // was previously its own isolated demo (catastrophic_forgetting.rs never
 // touches checkpointing, checkpoint_save.rs/checkpoint_load.rs never touch
 // replay). This pair of programs (memory_tier_save.rs / memory_tier_load.rs)

@@ -22,7 +22,7 @@
 // match tiny_lm_corpus.rs's.
 //
 // First result, with the original L2-normalized QK-norm (32-head means;
-// that variant is gone from the library, see commit 1d84ca5):
+// that variant is gone from the library, see commit 690b0d4):
 // softmax1+QK-norm KL=0.0043, peak=1.16, mass=0.94, null-argmax agreement
 // 0.93 - effectively a causal mean-pool; its sink tables are the null's.
 // Plain softmax KL=2.24, peak=21.4, agreement 0.36 - genuinely selective,
