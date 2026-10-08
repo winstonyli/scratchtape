@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [dump=<path>] [wdump=<path>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [dump=<path>] [wdump=<path>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -39,6 +39,8 @@
 // `memory=causal` makes the memory a past-only in-document one: the train keys plus ALL held-out windows (in order), where
 // a query in window w sees the train keys and only those held-out windows before w in the same book (`store` counts
 // train windows; 0 for no train keys). `stride`/`offset`/`part` still choose what is scored.
+// `whiten=<alpha>` (default off) centres the memory's keys and queries and multiplies them by Sigma^(-alpha/2) (Sigma: the covariance of
+// 128k train positions, total variance kept); alpha 0.5 gave the best stack (docs/tiers_design.md).
 // `store_from` chooses the memory's contents: `train` (default; `store` evenly spaced train windows), `held` (every
 // held-out window NOT scored, i.e. whose index is not offset mod stride, which needs stride > 1: text the model never
 // trained on, but from the same books as the scored windows, some of it adjacent), or `both`.
@@ -654,8 +656,138 @@ fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], t
     let mut dt = DeviceTape::new(dev);
     let (outs, logits, loss) = model_forward(&mut dt, cfg, &ids, &targets, starts.len());
     let (logits, row_loss) = if want_logits { (read(dt.value(logits)), read(dt.row_losses(loss))) } else { (vec![], vec![]) };
-    let hidden = if want_hidden { read(dt.value(outs[tap])) } else { vec![] };
+    let mut hidden = if want_hidden { read(dt.value(outs[tap])) } else { vec![] };
+    if let (Some((mu, w)), true) = (WHITEN.get(), want_hidden) {
+        apply_whitener(&mut hidden, mu, w, cfg.d);
+    }
     Forward { ids, targets, logits, row_loss, hidden }
+}
+
+/// `whiten=<alpha>`: keys and queries are centred and multiplied by Sigma^(-alpha/2) (symmetric, total variance kept, so
+/// distances keep their scale), Sigma estimated from a sample of train positions. Set once before the memory is built.
+static WHITEN: std::sync::OnceLock<(Vec<f32>, Vec<f32>)> = std::sync::OnceLock::new();
+
+fn apply_whitener(hidden: &mut [f32], mu: &[f32], w: &[f32], d: usize) {
+    let rows = hidden.len() / d;
+    let per = rows.div_ceil(8).max(1);
+    std::thread::scope(|s| {
+        for block in hidden.chunks_mut(per * d) {
+            s.spawn(move || {
+                let mut x = vec![0f32; d];
+                for row in block.chunks_mut(d) {
+                    for j in 0..d {
+                        x[j] = row[j] - mu[j];
+                    }
+                    for (i, o) in row.iter_mut().enumerate() {
+                        *o = x.iter().zip(&w[i * d..(i + 1) * d]).map(|(a, b)| a * b).sum();
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Cyclic Jacobi eigendecomposition of the symmetric d x d matrix `a`: (eigenvalues, V) with a = V diag(lam) V^T, V row-major.
+fn jacobi_eigen(mut a: Vec<f64>, d: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut v = vec![0f64; d * d];
+    for i in 0..d {
+        v[i * d + i] = 1.0;
+    }
+    for _ in 0..30 {
+        let off: f64 = (0..d).flat_map(|i| (0..d).filter(move |&j| j != i).map(move |j| (i, j))).map(|(i, j)| a[i * d + j].powi(2)).sum();
+        if off < 1e-18 * (0..d).map(|i| a[i * d + i].powi(2)).sum::<f64>() {
+            break;
+        }
+        for p in 0..d - 1 {
+            for q in p + 1..d {
+                let apq = a[p * d + q];
+                if apq.abs() < 1e-300 {
+                    continue;
+                }
+                let theta = (a[q * d + q] - a[p * d + p]) / (2.0 * apq);
+                let t = if theta == 0.0 { 1.0 } else { theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt()) };
+                let (c, s) = (1.0 / (t * t + 1.0).sqrt(), t / (t * t + 1.0).sqrt());
+                for k in 0..d {
+                    let (akp, akq) = (a[k * d + p], a[k * d + q]);
+                    a[k * d + p] = c * akp - s * akq;
+                    a[k * d + q] = s * akp + c * akq;
+                }
+                for k in 0..d {
+                    let (apk, aqk) = (a[p * d + k], a[q * d + k]);
+                    a[p * d + k] = c * apk - s * aqk;
+                    a[q * d + k] = s * apk + c * aqk;
+                }
+                for k in 0..d {
+                    let (vkp, vkq) = (v[k * d + p], v[k * d + q]);
+                    v[k * d + p] = c * vkp - s * vkq;
+                    v[k * d + q] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    ((0..d).map(|i| a[i * d + i]).collect(), v)
+}
+
+/// W = c V diag(lam^(-alpha/2)) V^T for the covariance `cov` (a ridge of 1e-3 of the mean eigenvalue keeps tiny
+/// eigenvalues from exploding), with c chosen so that W cov W has the trace of cov. Also returns the ridged eigenvalues.
+fn whitening_matrix(cov: &[f64], d: usize, alpha: f64) -> (Vec<f32>, Vec<f64>) {
+    let (lam, v) = jacobi_eigen(cov.to_vec(), d);
+    let mean_lam = lam.iter().map(|l| l.max(0.0)).sum::<f64>() / d as f64;
+    let lam: Vec<f64> = lam.iter().map(|l| l.max(0.0) + 1e-3 * mean_lam).collect();
+    let scale = (lam.iter().sum::<f64>() / lam.iter().map(|l| l.powf(1.0 - alpha)).sum::<f64>()).sqrt();
+    let g: Vec<f64> = lam.iter().map(|l| scale * l.powf(-alpha / 2.0)).collect();
+    let mut w = vec![0f32; d * d];
+    for i in 0..d {
+        for j in 0..d {
+            w[i * d + j] = (0..d).map(|k| v[i * d + k] * g[k] * v[j * d + k]).sum::<f64>() as f32;
+        }
+    }
+    (w, lam)
+}
+
+fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, alpha: f64) {
+    let d = cfg.d;
+    let total = (train.len() - 1) / SEQ_LEN;
+    let starts: Vec<usize> = (0..2000.min(total)).map(|i| i * total / 2000.min(total) * SEQ_LEN).collect();
+    let mut h: Vec<f32> = vec![];
+    for chunk in starts.chunks(2 * CHUNK) {
+        h.extend(forward(dev, cfg, train, chunk, tap, true, false).hidden);
+    }
+    let n = h.len() / d;
+    let mut mu = vec![0f64; d];
+    for row in h.chunks(d) {
+        for j in 0..d {
+            mu[j] += row[j] as f64 / n as f64;
+        }
+    }
+    let mut cov = vec![0f64; d * d];
+    let mut x = vec![0f64; d];
+    for row in h.chunks(d) {
+        for j in 0..d {
+            x[j] = row[j] as f64 - mu[j];
+        }
+        for i in 0..d {
+            for j in i..d {
+                cov[i * d + j] += x[i] * x[j];
+            }
+        }
+    }
+    for i in 0..d {
+        for j in i..d {
+            cov[i * d + j] /= n as f64;
+            cov[j * d + i] = cov[i * d + j];
+        }
+    }
+    let (w, lam) = whitening_matrix(&cov, d, alpha);
+    let mut sorted = lam.clone();
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    println!(
+        "whitener: alpha {alpha}, {n} sample keys, eigenvalues {:.3e} .. {:.3e} (top 5% hold {:.0}% of the variance)",
+        sorted[d - 1],
+        sorted[0],
+        100.0 * sorted[..d / 20].iter().sum::<f64>() / sorted.iter().sum::<f64>()
+    );
+    WHITEN.set((mu.iter().map(|&m| m as f32).collect(), w)).ok();
 }
 
 fn main() {
@@ -669,7 +801,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
-            | "recent" | "dump" | "wdump" => {
+            | "recent" | "whiten" | "dump" | "wdump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -738,6 +870,9 @@ fn main() {
         let from = if causal { "both".to_string() } else { get("store_from", "train") };
         assert!(["train", "held", "both"].contains(&from.as_str()), "store_from is train, held or both");
         assert!(from == "train" || causal || stride > 1, "store_from=held needs stride > 1 so some held-out windows are left unscored");
+        if let Some(a) = opt.get("whiten").map(|a| a.parse::<f64>().unwrap_or_else(|_| panic!("whiten=<alpha>, got {a}"))).filter(|&a| a > 0.0) {
+            fit_whitener(&dev, &cfg, &train, tap, a);
+        }
         let mut gpu = KnnStore::new(cfg.d, 16384);
         let (mut n_train, mut n_held) = (0, 0);
         let build = std::time::Instant::now();
@@ -903,6 +1038,38 @@ fn main() {
     if let Some(path) = opt.get("wdump") {
         for tier in tiers.last().unwrap() {
             tier.wdump(path, true);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// alpha = 1 whitens: W cov W is c^2 times the identity up to the ridge (1%), and alpha = 0 leaves the metric alone (W = identity).
+    #[test]
+    fn whitening_matrix_whitens_at_alpha_one_and_is_identity_at_zero() {
+        let d = 4;
+        // A symmetric positive-definite covariance with correlated, unequal directions.
+        let cov: Vec<f64> = vec![4.0, 1.0, 0.5, 0.0, 1.0, 3.0, 0.2, 0.1, 0.5, 0.2, 1.0, 0.3, 0.0, 0.1, 0.3, 0.5];
+        let (w, _) = whitening_matrix(&cov, d, 1.0);
+        let mul = |a: &[f64], b: &[f64]| -> Vec<f64> { (0..d * d).map(|ij| (0..d).map(|k| a[ij / d * d + k] * b[k * d + ij % d]).sum()).collect() };
+        let w: Vec<f64> = w.iter().map(|&x| x as f64).collect();
+        let m = mul(&mul(&w, &cov), &w);
+        for i in 0..d {
+            for j in 0..d {
+                if i == j {
+                    assert!((m[i * d + i] - m[0]).abs() < 1e-2 * m[0], "diagonal {i}: {} vs {}", m[i * d + i], m[0]);
+                } else {
+                    assert!(m[i * d + j].abs() < 1e-2 * m[0], "off-diagonal ({i},{j}) = {}", m[i * d + j]);
+                }
+            }
+        }
+        let (w0, _) = whitening_matrix(&cov, d, 0.0);
+        for i in 0..d {
+            for j in 0..d {
+                assert!((w0[i * d + j] - (i == j) as u8 as f32).abs() < 1e-5);
+            }
         }
     }
 }
