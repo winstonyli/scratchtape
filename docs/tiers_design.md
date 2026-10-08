@@ -396,6 +396,17 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   ~1.3 s of the `part=5/96` slice, which had ~4.5M keys and less load. The search is still ~97% of the run: matmul ~0.5 s
   and top-k ~0.7 s per 1024-query block (see the top-k and pass-1 entries above) are the next places to look.
 
+- **The matmul is ~a quarter of the search; top-k is the target (2026-10-07; `examples/gpu/cmma_blocking_check.rs`).**
+  One 16384-key x 1024-query x 256 product (the real tile shape, f16 -> f32): `k_dots_cmma` (one plane per 16x16 tile,
+  fragments loaded from global memory, no reuse) **0.77 ms = 11 TFLOP/s**; a plane holding 2x2 accumulator tiles
+  **0.46 ms = 18.6 TFLOP/s**, output identical (quiet machine: CPU 15-20%, no other eGPU users, exclusive lease). A 5M-key
+  block has ~307 tiles, so the whole matmul is ~0.24 s of the ~0.95 s an undisturbed block takes (`knn_scale_check`, no
+  timing syncs). 2x2 would save ~0.1 s per block (~10%); even a 4x faster kernel saves under 0.2 s. The `KNN_TIMING`
+  "matmul 0.55 s" overstates it: timing mode syncs after every tile. The remaining ~0.7 s per block is top-k insertion
+  plus launch overhead; the fused matmul+filter kernel (parked above) is not worth building for the matmul alone. Not
+  done: a 4x4 or shared-memory variant, and the 2x2 kernel is not wired into `KnnStore`. If search speed matters again,
+  look at top-k insertions (a coarser threshold, fewer parts' lists, or a survivor-compaction pass) before the matmul.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
