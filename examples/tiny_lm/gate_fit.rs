@@ -176,10 +176,15 @@ fn main() {
     assert!(!rows.is_empty(), "empty dump");
     let all = mean_fixed(&rows, 0.5);
     println!("{} rows; fixed lambda 0.5: CE {all:.5}", rows.len());
+    let mut checked = false;
     for a in &args[1..] {
         let logged: f64 = a.strip_prefix("logged=").unwrap_or_else(|| panic!("unknown argument {a}")).parse().unwrap();
         assert!((all - logged).abs() < 1e-4, "gate 0: dump gives {all:.5}, the run logged {logged}");
         println!("gate 0 passed: dump reproduces the logged {logged}");
+        checked = true;
+    }
+    if !checked {
+        println!("gate 0 NOT checked (no logged=<CE>)");
     }
     let (even, odd) = split(&rows);
     let (lam, ce) = best_fixed(&even);
@@ -188,10 +193,11 @@ fn main() {
     println!("best fixed on even = {lam:.2}: even {ce:.5}, odd {:.5}", mean_fixed(&odd, lam));
     let init = lam.clamp(0.01, 0.99);
     let base_odd = mean_fixed(&odd, 0.5);
+    let base_best = mean_fixed(&odd, lam);
 
     let b = Binned::fit(&even, 4, 4);
     let binned_odd = mean_gated(&odd, |r| b.lambda(r));
-    println!("binned 4x4 (entropy x nearest distance, quantile edges from even): odd {binned_odd:.5} ({:+.5} vs fixed 0.5)", binned_odd - base_odd);
+    println!("binned 4x4 (entropy x nearest distance, quantile edges from even): odd {binned_odd:.5} (gain {:+.5} vs fixed 0.5, {:+.5} vs best fixed {lam:.2})", base_odd - binned_odd, base_best - binned_odd);
     println!("  lambda by bin (rows = entropy bins low->high, columns = nearest-distance bins low->high):");
     for i in 0..4 {
         println!("    {}", (0..4).map(|j| format!("{:.2}", b.lam[i * 4 + j])).collect::<Vec<_>>().join("  "));
@@ -200,10 +206,16 @@ fn main() {
 
     let g = fit_gate(&even, init, 500);
     let param_odd = mean_gated(&odd, |r| g.lambda(r));
-    println!("parametric gate: even {:.5}, odd {param_odd:.5} ({:+.5} vs fixed 0.5); w = {:?}", mean_gated(&even, |r| g.lambda(r)), param_odd - base_odd, g.w.map(|x| (x * 1000.0).round() / 1000.0));
+    println!("parametric gate: even {:.5}, odd {param_odd:.5} (gain {:+.5} vs fixed 0.5, {:+.5} vs best fixed {lam:.2}); w = {:?}", mean_gated(&even, |r| g.lambda(r)), base_odd - param_odd, base_best - param_odd, g.w.map(|x| (x * 1000.0).round() / 1000.0));
     println!("  features: entropy, ln(1 + d0), (dk - d0) / (1 + d0), standardised on the even half: mean {:?}, std {:?}", g.mean, g.std);
 
-    println!("verdict: binned gain {:.4} nats, parametric gain {:.4} nats (success: parametric > 0.002; kill: binned < 0.002)", base_odd - binned_odd, base_odd - param_odd);
+    println!(
+        "verdict: binned gain {:.4} vs fixed 0.5, {:.4} vs best fixed; parametric gain {:.4} vs fixed 0.5, {:.4} vs best fixed (nats). Success (parametric > 0.002) and kill (binned < 0.002) apply to the gain vs best fixed, the baseline that excludes mere retuning of a constant; the vs-0.5 numbers are for reference.",
+        base_odd - binned_odd,
+        base_best - binned_odd,
+        base_odd - param_odd,
+        base_best - param_odd
+    );
 }
 
 #[cfg(test)]
