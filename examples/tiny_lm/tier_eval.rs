@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [search=merged|split] [warm=<t0>] [dump=<path>] [wdump=<path>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [dump=<path>] [wdump=<path>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -33,7 +33,7 @@
 // none, which a tier reading longer context (the `h` flag) can exploit; `warm=32` is the control for that.
 // `memory=online` is the same idea written as it is read: the memory starts as the train keys and each chunk's scored
 // positions are appended before its search, and a window's queries see the keys of the windows before it in their own
-// book, as the causal memory does (nothing else); it needs stride 1. `search=split` (online only) searches the train keys and the in-document keys separately and keeps
+// book, as the causal memory does (nothing else); it needs stride 1. An online memory searches the train keys and the in-document keys separately and keeps
 // the k nearest of each (the in-document search scans only the tail tiles), instead of the k nearest of the two together.
 // `recent=<n>` (causal) limits a query to the n windows before its own.
 // `memory=causal` makes the memory a past-only in-document one: the train keys plus ALL held-out windows (in order), where
@@ -387,9 +387,7 @@ struct Store {
     online: Option<RefCell<Online>>,
     /// Rows at window positions below this are never scored, so they are not searched.
     warm: usize,
-    /// `search=split` (online memory): the train keys and the in-document keys are searched separately, KMAX nearest each.
-    split: bool,
-    /// (chunk searched, per row the KMAX nearest (squared distance, value), ascending; with `split`, the train list then
+    /// (chunk searched, per row the KMAX nearest (squared distance, value), ascending; online, the train list then
     /// the in-document list)
     found: RefCell<(Option<usize>, Vec<(f32, u16)>)>,
 }
@@ -416,9 +414,14 @@ struct Online {
 }
 
 impl Store {
+    /// The online memory searches its train keys and its in-document keys separately, KMAX nearest each.
+    fn split(&self) -> bool {
+        self.online.is_some()
+    }
+
     /// Entries per row in `found`.
     fn stride(&self) -> usize {
-        if self.split { 2 * KMAX } else { KMAX }
+        if self.split() { 2 * KMAX } else { KMAX }
     }
 
     fn prepare(&self, chunk: usize, hidden: &[f32], rows: usize, starts: &[usize]) {
@@ -455,7 +458,7 @@ impl Store {
         let gpu = self.gpu.borrow();
         let stride = self.stride();
         let mut found = vec![(f32::INFINITY, 0u16); rows * stride];
-        if self.split {
+        if self.split() {
             // Per-source lists: the KMAX nearest train keys, then the KMAX nearest in-document keys (the last keys, so only
             // the tail tiles are scanned).
             let (r, n_train) = rg.as_ref().unwrap();
@@ -526,7 +529,7 @@ impl Tier for Knn {
         // A causal memory can have fewer than k keys to offer (the start of a book): use those, or leave p alone.
         let finite = |l: &[(f32, u16)]| l[..self.k].iter().take_while(|n| n.0.is_finite()).count();
         let merged: Vec<(f32, u16)>;
-        let nb = if self.store.split {
+        let nb = if self.store.split() {
             // The k nearest of each source, merged by distance.
             let mut m = row[..finite(&row[..KMAX])].to_vec();
             m.extend_from_slice(&row[KMAX..KMAX + finite(&row[KMAX..])]);
@@ -666,7 +669,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
-            | "recent" | "dump" | "wdump" | "search" => {
+            | "recent" | "dump" | "wdump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -731,12 +734,6 @@ fn main() {
             "online" => (false, true),
             m => panic!("memory is flat, causal or online, got {m}"),
         };
-        let split = match get("search", "merged").as_str() {
-            "merged" => false,
-            "split" => true,
-            s => panic!("search is merged or split, got {s}"),
-        };
-        assert!(online || !split, "search=split needs memory=online");
         assert!(!online || (stride == 1 && from_is_train(&get("store_from", "train"))), "memory=online needs stride 1 and store_from=train");
         let from = if causal { "both".to_string() } else { get("store_from", "train") };
         assert!(["train", "held", "both"].contains(&from.as_str()), "store_from is train, held or both");
@@ -795,7 +792,7 @@ fn main() {
             let first_window = (0..windows).map(|w| docs[docs.partition_point(|&b| b <= w * SEQ_LEN) - 1].div_ceil(SEQ_LEN)).collect();
             Causal { n_train: n_train_keys, first_window, recent: size("recent", &usize::MAX.to_string()) }
         });
-        Some(Rc::new(Store { gpu: RefCell::new(gpu), causal, online, warm, split, found: RefCell::new((None, vec![])) }))
+        Some(Rc::new(Store { gpu: RefCell::new(gpu), causal, online, warm, found: RefCell::new((None, vec![])) }))
     } else {
         None
     };

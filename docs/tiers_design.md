@@ -581,8 +581,12 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   `scripts/tier_write_first.sh` (the A/B) are gone. Check: `part=3/6`, `knn:256:0.5:15` gives 1.1047 and 0.4 gives 1.1051,
   identical to the earlier `write=first` run. Scripts from before this change that use `memory=online` without `write=`
   (`tier_online.sh`, `tier_full4/7/8/9/10.sh`, `tier_gate_dump.sh`, `tier_time.sh`, `tier_words_gate_dump.sh`) reproduced the
-  write-after numbers in this log only at commit 854c38e or earlier; today they run write-first. `search=merged` stays as
-  the control for the split search until its cost is decided.
+  write-after numbers in this log only at commit 854c38e or earlier; today they run write-first. **`search=` removed too
+  (decision: keep the split search; +0.0044 nats for ~1.5x the search time, full run 696 s).** The online memory always
+  searches train and in-document keys separately; flat and causal memories keep the single (merged) search, which is
+  the only path they have. Online scripts before commit f50fdb5 reproduce the merged-search numbers (control 1.1182) only
+  at 854c38e or earlier. Check: `part=0/12`, `knn:256:0.4:15:25:50` = 1.1262, identical to the earlier split run.
+  `scripts/tier_search_split.sh` (the A/B) deleted.
 
 - **Richer values: the model's surprise at the stored position (2026-10-08): KILL.** Survey option 3. Idea: store, with
   each key's byte, -ln p(true byte) the model had there, and let it scale the neighbour's weight. Diagnostic (flat
@@ -599,6 +603,21 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   `tier_surprise_beta2.log`; the code (a `KnnStore::add_raw` plus a `beta` spec field) was reverted, kept as
   `runs/key_surprise_diag.patch` (git-ignored). Remaining richer-value idea: store the next several bytes (option 2 of
   the survey), not tried.
+
+- **Richer values: the next two bytes (2026-10-08): KILL.** Survey option 2 of the richer-values list. Each train key stores
+  its next byte and the byte after it; the neighbours of the previous position vote for the current byte with their
+  second byte (an induction-style continuation), mixed in with weight mu inside the kNN term. Flat memory, `part=3/6`,
+  `knn:256:0.4:15`:
+
+  | mu | **0** | 0.1 | 0.2 | 0.3 | 0.5 |
+  |---|---|---|---|---|---|
+  | CE | **1.1130** | 1.1212 | 1.1321 | 1.1443 | 1.1717 |
+
+  Monotonically worse: the previous position's neighbours were chosen for a different context, so their continuation is
+  noise next to the current position's own neighbours. Log `runs/tier_next2.log`; code reverted, kept as
+  `runs/next2_diag.patch` (git-ignored). With the surprise-weighting result this closes the richer-values options of the
+  survey (stored surprise, multi-byte continuation); what is left is outside the value: the key (tap block, a learned
+  key) or the model itself.
 
 ## Order
 
