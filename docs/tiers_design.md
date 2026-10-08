@@ -462,6 +462,20 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   confirms the slice gain nor the 826 s figure. The even/odd halves share books, hence the early/late split next to it.
   Tests: `cargo test --release --example gate_fit -j 8` (6 pass). Commits 3808d38..807957d.
 
+- **Words-weight gating: tooling built, full run in flight (2026-10-08; spec `docs/superpowers/specs/2026-10-08-words-gating-design.md`,
+  plan `docs/superpowers/plans/2026-10-08-words-gating.md`).** `tier_eval ... dump=<k> wdump=<w>` writes the kNN rows and, per
+  scored position, the words tier's inputs (applied, p_in, q, entropy_in, ln(1+count mass), bigram hit, prefix length);
+  `words_gate_fit <w> <k> logged=<CE>` joins them (Gate 0b: 0.75 p_in + 0.25 q == the kNN row's p_t), checks the logged CE (Gate
+  0), then fits a bigram x entropy-quartile gate and a 6-weight sigmoid gate (also seeing count mass, prefix length, ln(1+d0))
+  for the words weight with the kNN weight fixed at 0.4, on even/odd and early/late splits, and prints one verdict
+  (success: sigmoid > 0.002 on both splits; kill: binned < 0.002 on either; else inconclusive) with per-chunk standard errors.
+  Slice check (`part=5/96`, 5248 positions, quiet machine): both dumps 5248 rows, Gate 0b and Gate 0 passed (1.08783 vs
+  logged 1.0878); the slice gains are noise (sigmoid -0.0033/+0.0005 +-0.002).
+  **In flight: `scripts/tier_words_gate_dump.sh`, started 2026-10-08 04:54:38, `tier_eval_run` PID 81180 (Normal), expected 8-15
+  min, quiet machine at launch (CPU 13%, no leases, no other eGPU users).** Logs `runs/wg_dump.log`, load
+  `runs/wg_dump_load.log`; dumps `runs/wg_dump_k.bin`, `runs/wg_dump_w.bin`. Then:
+  `words_gate_fit runs/wg_dump_w.bin runs/wg_dump_k.bin logged=<CE>`.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
