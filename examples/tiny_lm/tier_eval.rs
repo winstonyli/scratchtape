@@ -97,7 +97,7 @@ trait Tier {
         String::new()
     }
     /// Writes this tier's per-position dump (the `dump=` option) to `path`; tiers without one do nothing.
-    fn dump(&self, _path: &str) {}
+    fn dump(&self, _path: &str, _last: bool) {}
 }
 
 fn is_letter(b: usize) -> bool {
@@ -470,11 +470,15 @@ impl Tier for Knn {
         let n = self.positions.max(1) as f64;
         format!("knn ({} keys): mean squared distance to nearest {:.1}, to k-th {:.1}", self.store.gpu.borrow().len(), self.nearest / n, self.kth / n)
     }
-    fn dump(&self, path: &str) {
+    fn dump(&self, path: &str, last: bool) {
         if let Some(d) = &self.dump {
             let bytes: Vec<u8> = d.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(path, bytes).unwrap_or_else(|e| panic!("writing {path}: {e}"));
-            println!("dump: {} rows to {path}", d.len() / 6);
+            let tmp = format!("{path}.tmp");
+            std::fs::write(&tmp, bytes).unwrap_or_else(|e| panic!("writing {tmp}: {e}"));
+            std::fs::rename(&tmp, path).unwrap_or_else(|e| panic!("renaming {tmp} to {path}: {e}"));
+            if last {
+                println!("dump: {} rows to {path}", d.len() / 6);
+            }
         }
     }
 }
@@ -692,6 +696,11 @@ fn main() {
         if ci > 0 && ci % 20 == 0 {
             eprintln!("speed: chunks {}..{} {:.2} s/chunk ({:.0} s paused)", ci - 20, ci, (t_lap.elapsed() - paused).as_secs_f64() / 20.0, paused.as_secs_f64());
             (t_lap, paused) = (std::time::Instant::now(), std::time::Duration::ZERO);
+            if let Some(path) = opt.get("dump") {
+                for tier in tiers.last().unwrap() {
+                    tier.dump(path, false);
+                }
+            }
         }
         let t0 = std::time::Instant::now();
         let f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden, true);
@@ -762,7 +771,7 @@ fn main() {
     }
     if let Some(path) = opt.get("dump") {
         for tier in tiers.last().unwrap() {
-            tier.dump(path);
+            tier.dump(path, true);
         }
     }
 }
