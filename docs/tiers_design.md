@@ -439,12 +439,25 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   the same hump, a quadratic entropy term (or more entropy bins) is the next gate to try. Also added: `dump=` is written
   atomically every 20 chunks, `gate_fit` takes several dump files (chunk ids offset by 100000 per file) and reports a second,
   harder early/late split next to even/odd.
-  **In flight (contended, by choice): full run `scripts/tier_gate_dump.sh`, started 2026-10-07 23:35:50, `tier_eval_run` PID 87148
-  (Normal priority), expected ~14-19 min.** Logs: `runs/tier_gate_dump.log` (stdout, `speed:` lines in the same file via
-  stderr), load: `runs/tier_gate_dump_load.log`; dump `runs/tier_gate_dump.bin` (rewritten every 20 chunks). At launch the
-  eGPU also had `manifold` and `WizardGraphicalClient` on the 3D engine and CPU was ~51% (`bv_ph` ~1 core), so timings are
-  contended; CE and the gate result are unaffected. Then: `gate_fit runs/tier_gate_dump.bin logged=<CE of the stack spec>`.
-  **Not run yet:** `scripts/tier_gate_dump.sh` (full stack, ~14 min GPU) waits for a quiet machine (user says "uncontended").
+  **Full run done (`scripts/tier_gate_dump.sh`, 2026-10-07 23:35-23:43, contended: `manifold`/`WizardGraphicalClient` on the eGPU,
+  CPU 36-48%): 503808 positions, CE 1.1313, 448.6 s, flat 0.8-1.2 s/chunk, no device loss. Gate 0 passed (dump 1.13127 vs
+  logged 1.1313).** Held-out gain in nats (`gate_fit runs/tier_gate_dump.bin logged=1.1313`; best fixed lambda 0.40 / 0.41):
+
+  | split | binned vs 0.5 | binned vs best fixed | sigmoid vs 0.5 | sigmoid vs best fixed |
+  |---|---|---|---|---|
+  | even/odd | +0.0022 | +0.0011 | +0.0022 | **+0.0011** |
+  | early/late | +0.0021 | +0.0008 | +0.0023 | **+0.0010** |
+
+  **Verdict: below the success bar (0.002 over best fixed) and the binned gate is under the kill line (0.002), so gating the
+  kNN lambda by entropy and neighbour distance is not worth wiring in: ~0.001 nats (0.1%) of the 0.045 the stack already
+  gains over the model.** Most of the "gain vs 0.5" is just moving the constant to 0.40. Shape: lambda is highest (0.6) at
+  mid entropy and short distance, lowest (~0.3) at the top-entropy bin and at large distances; the sigmoid fits negative
+  weights on entropy and ln(1+d0), so the hump seen on the 21k slice is weaker here. The 4x4 table is smooth and stable
+  across both splits, so the signal is real but small; a quadratic entropy term might add a few 1e-4, not 2e-3. Practical
+  takeaway: set the kNN weight to ~0.4 (the fixed-0.4 gain over 0.5 is ~0.001 on the held-out half) and look for the next
+  tier gain elsewhere (gate the CPU tiers, or a richer memory), not in lambda. Timing (448.6 s vs 825.6 s for tier_full9)
+  is not like-for-like: this run scored one spec instead of six, dropped `KNN_TIMING`, and used slice 16384, so it neither
+  confirms the slice gain nor the 826 s figure. The even/odd halves share books, hence the early/late split next to it.
   Tests: `cargo test --release --example gate_fit -j 8` (6 pass). Commits 3808d38..807957d.
 
 ## Order
