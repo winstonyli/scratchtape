@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [dump=<path>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -26,6 +26,7 @@
 //                   windows run through the frozen model, values their next bytes; the k nearest keys (squared L2)
 //                   give p_knn(b) ~ sum exp(-(d - d_nearest)/temp) over neighbours with value b (k <= 64);
 //                   p' = (1-lambda) * p + lambda * p_knn.
+// `dump=<path>` writes six f32 per scored position of the last spec's knn tier (chunk, p_target, k_target, entropy, d0, dk) for `gate_fit`.
 // `warm=<t0>` scores each byte only at window position >= t0 (windows then start every 64 - t0 bytes), so the model
 // always has at least t0 bytes of context: the plain protocol (warm 0) gives the early positions of every window almost
 // none, which a tier reading longer context (the `h` flag) can exploit; `warm=32` is the control for that.
@@ -95,6 +96,8 @@ trait Tier {
     fn report(&self) -> String {
         String::new()
     }
+    /// Writes this tier's per-position dump (the `dump=` option) to `path`; tiers without one do nothing.
+    fn dump(&self, _path: &str) {}
 }
 
 fn is_letter(b: usize) -> bool {
@@ -421,6 +424,8 @@ struct Knn {
     positions: usize,
     nearest: f64,
     kth: f64,
+    dump: Option<Vec<f32>>,
+    chunk: usize,
 }
 
 impl Tier for Knn {
@@ -428,6 +433,7 @@ impl Tier for Knn {
         true
     }
     fn prepare(&mut self, chunk: usize, hidden: &[f32], rows: usize, starts: &[usize]) {
+        self.chunk = chunk;
         self.store.prepare(chunk, hidden, rows, starts);
     }
     fn adjust(&mut self, ctx: &Ctx, probs: &mut [f64]) {
@@ -435,7 +441,12 @@ impl Tier for Knn {
         let nb = &found.1[ctx.row * KMAX..ctx.row * KMAX + self.k];
         // A causal memory can have fewer than k keys to offer (the start of a book): use those, or leave p alone.
         let nb = &nb[..nb.iter().take_while(|n| n.0.is_finite()).count()];
+        let p_t = probs[ctx.target];
+        let entropy = -probs.iter().filter(|&&p| p > 0.0).map(|&p| p * p.ln()).sum::<f64>();
         if nb.is_empty() {
+            if let Some(d) = &mut self.dump {
+                d.extend([self.chunk as f32, p_t as f32, p_t as f32, entropy as f32, 0.0, 0.0]);
+            }
             return;
         }
         let mut knn = [0f64; VOCAB];
@@ -444,6 +455,9 @@ impl Tier for Knn {
             let w = (-((dist - nb[0].0) as f64) / self.temp).exp();
             knn[v as usize] += w;
             total += w;
+        }
+        if let Some(d) = &mut self.dump {
+            d.extend([self.chunk as f32, p_t as f32, (knn[ctx.target] / total) as f32, entropy as f32, nb[0].0, nb[nb.len() - 1].0]);
         }
         for b in 0..VOCAB {
             probs[b] = (1.0 - self.lambda) * probs[b] + self.lambda * knn[b] / total;
@@ -456,10 +470,17 @@ impl Tier for Knn {
         let n = self.positions.max(1) as f64;
         format!("knn ({} keys): mean squared distance to nearest {:.1}, to k-th {:.1}", self.store.gpu.borrow().len(), self.nearest / n, self.kth / n)
     }
+    fn dump(&self, path: &str) {
+        if let Some(d) = &self.dump {
+            let bytes: Vec<u8> = d.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(path, bytes).unwrap_or_else(|e| panic!("writing {path}: {e}"));
+            println!("dump: {} rows to {path}", d.len() / 6);
+        }
+    }
 }
 
 /// One spec, e.g. `lexicon:0.05` or `lexicon:0.05+knn:16:0.2:50`, into its tiers.
-fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>) -> Vec<Box<dyn Tier>> {
+fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>, dump: bool) -> Vec<Box<dyn Tier>> {
     spec.split('+')
         .map(|part| {
             let (kind, arg) = part.split_once(':').unwrap_or((part, ""));
@@ -479,7 +500,7 @@ fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>) -> Vec<Box
                     let a: Vec<f64> = arg.split(':').map(|x| x.parse().unwrap_or_else(|_| panic!("knn:<k>:<lambda>:<temp>, got {part}"))).collect();
                     assert!(a.len() == 3 && a[0] >= 1.0 && a[0] as usize <= KMAX, "knn:<k>:<lambda>:<temp> with 1 <= k <= {KMAX}, got {part}");
                     let store = store.clone().expect("a knn tier needs the store");
-                    Box::new(Knn { store, k: a[0] as usize, lambda: a[1], temp: a[2], positions: 0, nearest: 0.0, kth: 0.0 }) as Box<dyn Tier>
+                    Box::new(Knn { store, k: a[0] as usize, lambda: a[1], temp: a[2], positions: 0, nearest: 0.0, kth: 0.0, dump: dump.then(Vec::new), chunk: 0 }) as Box<dyn Tier>
                 }
                 _ => panic!("unknown tier {kind} in {spec}"),
             }
@@ -531,7 +552,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
-            | "recent" => {
+            | "recent" | "dump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -558,6 +579,9 @@ fn main() {
     };
     let (part_i, part_n) = part("part");
     let (spart_i, spart_n) = part("store_part");
+    if opt.contains_key("dump") {
+        assert!(specs.last().is_some_and(|s| s.rsplit('+').next().is_some_and(|p| p.starts_with("knn:"))), "dump needs the last tier= spec to end in knn");
+    }
     let corpus = get("corpus", "novels6");
 
     let flat: Vec<f32> = std::fs::read_to_string(ckpt).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
@@ -649,7 +673,8 @@ fn main() {
         None
     };
 
-    let mut tiers: Vec<Vec<Box<dyn Tier>>> = specs.iter().map(|s| build_tier(s, &train, &store)).collect();
+    let dump_spec = opt.contains_key("dump").then(|| specs.len() - 1);
+    let mut tiers: Vec<Vec<Box<dyn Tier>>> = specs.iter().enumerate().map(|(i, s)| build_tier(s, &train, &store, dump_spec == Some(i))).collect();
     let need_hidden = tiers.iter().flatten().any(|t| t.needs_hidden());
     let (mut ce_model, mut ce_device) = (0.0f64, 0.0f64);
     let mut ce_tier = vec![0.0f64; tiers.len()];
@@ -733,6 +758,11 @@ fn main() {
             if !report.is_empty() {
                 println!("  {report}");
             }
+        }
+    }
+    if let Some(path) = opt.get("dump") {
+        for tier in tiers.last().unwrap() {
+            tier.dump(path);
         }
     }
 }
