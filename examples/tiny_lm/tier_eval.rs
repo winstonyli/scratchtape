@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [dump=<path>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [dump=<path>] [wdump=<path>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -27,6 +27,7 @@
 //                   give p_knn(b) ~ sum exp(-(d - d_nearest)/temp) over neighbours with value b (k <= 64);
 //                   p' = (1-lambda) * p + lambda * p_knn.
 // `dump=<path>` writes six f32 per scored position of the last spec's knn tier (chunk, p_target, k_target, entropy, d0, dk) for `gate_fit`.
+// `wdump=<path>` (with `dump=`) writes eight f32 per scored position of the last spec's words tier (chunk, applied, p_in_target, q_target, entropy_in, ln(1+count mass), bigram, prefix_len) for `words_gate_fit`.
 // `warm=<t0>` scores each byte only at window position >= t0 (windows then start every 64 - t0 bytes), so the model
 // always has at least t0 bytes of context: the plain protocol (warm 0) gives the early positions of every window almost
 // none, which a tier reading longer context (the `h` flag) can exploit; `warm=32` is the control for that.
@@ -98,6 +99,8 @@ trait Tier {
     }
     /// Writes this tier's per-position dump (the `dump=` option) to `path`; tiers without one do nothing.
     fn dump(&self, _path: &str, _last: bool) {}
+    /// Writes this tier's words dump (the `wdump=` option) to `path`; tiers without one do nothing.
+    fn wdump(&self, _path: &str, _last: bool) {}
 }
 
 fn is_letter(b: usize) -> bool {
@@ -208,6 +211,8 @@ struct Words {
     applied: usize,
     applied_bigram: usize,
     applied_first: usize,
+    dump: Option<Vec<f32>>,
+    chunk: usize,
 }
 
 fn sorted_counts(m: std::collections::HashMap<Vec<u8>, u32>) -> Vec<(Vec<u8>, u32)> {
@@ -242,6 +247,8 @@ impl Words {
             applied: 0,
             applied_bigram: 0,
             applied_first: 0,
+            dump: None,
+            chunk: 0,
         }
     }
 
@@ -261,16 +268,16 @@ impl Words {
         }
         (letters, end, total)
     }
-}
 
-impl Tier for Words {
-    fn adjust(&mut self, ctx: &Ctx, probs: &mut [f64]) {
+    /// The mixing step: `Some((q_target, count mass, bigram list used, prefix length))` when the word lists changed
+    /// `probs` inside a word, `None` otherwise.
+    fn mix(&mut self, ctx: &Ctx, probs: &mut [f64]) -> Option<(f64, f64, bool, usize)> {
         self.positions += 1;
         let seq = if self.hist { ctx.context } else { ctx.window };
-        let Some(boundary) = seq.iter().rposition(|&b| !is_letter(b)) else { return };
+        let Some(boundary) = seq.iter().rposition(|&b| !is_letter(b)) else { return None };
         let prefix: Vec<u8> = seq[boundary + 1..].iter().map(|&b| b as u8).collect();
         if prefix.is_empty() && !self.first {
-            return;
+            return None;
         }
         // The word before the current one: the last letter run ending at or before the boundary.
         let before = &seq[..=boundary];
@@ -291,28 +298,69 @@ impl Tier for Words {
                 }
             }
         }
+        let bigram_found = found.is_some();
         let (letters, end, total) = found.unwrap_or_else(|| Words::extend(&self.unigram, &prefix));
         if prefix.is_empty() {
             // Between words: the model keeps its split between letters and other bytes; the words that followed the
             // previous word redistribute the letter part over first letters.
             let letter_mass: f64 = (0..VOCAB).filter(|&b| is_letter(b)).map(|b| probs[b]).sum();
             if total <= 0.0 || letter_mass <= 0.0 {
-                return;
+                return None;
             }
             self.applied_first += 1;
             for b in (0..VOCAB).filter(|&b| is_letter(b)) {
                 probs[b] = (1.0 - self.lambda) * probs[b] + self.lambda * letter_mass * letters[b] / total;
             }
-            return;
+            return None;
         }
         let non_letter: f64 = (0..VOCAB).filter(|&b| !is_letter(b)).map(|b| probs[b]).sum();
         if total <= 0.0 || non_letter <= 0.0 {
-            return;
+            return None;
         }
         self.applied += 1;
+        let mut q_t = 0.0;
         for b in 0..VOCAB {
             let q = if is_letter(b) { letters[b] / total } else { end / total * probs[b] / non_letter };
+            if b == ctx.target {
+                q_t = q;
+            }
             probs[b] = (1.0 - self.lambda) * probs[b] + self.lambda * q;
+        }
+        Some((q_t, total, bigram_found, prefix.len()))
+    }
+}
+
+impl Tier for Words {
+    fn adjust(&mut self, ctx: &Ctx, probs: &mut [f64]) {
+        if self.dump.is_none() {
+            self.mix(ctx, probs);
+            return;
+        }
+        let p_in = probs[ctx.target];
+        let h_in = -probs.iter().filter(|&&p| p > 0.0).map(|&p| p * p.ln()).sum::<f64>();
+        let applied = self.mix(ctx, probs);
+        let row = match applied {
+            Some((q, total, bigram, prefix_len)) => {
+                [self.chunk as f32, 1.0, p_in as f32, q as f32, h_in as f32, (1.0 + total).ln() as f32, bigram as u8 as f32, prefix_len as f32]
+            }
+            None => [self.chunk as f32, 0.0, p_in as f32, p_in as f32, h_in as f32, 0.0, 0.0, 0.0],
+        };
+        self.dump.as_mut().unwrap().extend(row);
+    }
+
+    fn prepare(&mut self, chunk: usize, _hidden: &[f32], _rows: usize, _starts: &[usize]) {
+        self.chunk = chunk;
+    }
+
+    fn wdump(&self, path: &str, last: bool) {
+        if let Some(d) = &self.dump {
+            let bytes: Vec<u8> = d.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let tmp = format!("{path}.tmp");
+            std::fs::write(&tmp, bytes).unwrap_or_else(|e| panic!("writing {tmp}: {e}"));
+            std::fs::rename(&tmp, path).unwrap_or_else(|e| panic!("renaming {tmp} to {path}: {e}"));
+            if last {
+                println!("wdump: {} rows to {path}", d.len() / 8);
+            }
         }
     }
 
@@ -484,7 +532,7 @@ impl Tier for Knn {
 }
 
 /// One spec, e.g. `lexicon:0.05` or `lexicon:0.05+knn:16:0.2:50`, into its tiers.
-fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>, dump: bool) -> Vec<Box<dyn Tier>> {
+fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>, dump: bool, wdump: bool) -> Vec<Box<dyn Tier>> {
     spec.split('+')
         .map(|part| {
             let (kind, arg) = part.split_once(':').unwrap_or((part, ""));
@@ -498,7 +546,10 @@ fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>, dump: bool
                     let a: Vec<&str> = arg.split(':').collect();
                     assert!(a.len() >= 2 && a.len() <= 3, "words:<order>:<lambda>[:<flags h f>], got {part}");
                     let flags = a.get(2).copied().unwrap_or("");
-                    Box::new(Words::new(train, a[0].parse().unwrap(), a[1].parse().unwrap(), flags.contains('h'), flags.contains('f'))) as Box<dyn Tier>
+                    assert!(!(wdump && flags.contains('f')), "wdump does not support first letters");
+                    let mut w = Words::new(train, a[0].parse().unwrap(), a[1].parse().unwrap(), flags.contains('h'), flags.contains('f'));
+                    w.dump = wdump.then(Vec::new);
+                    Box::new(w) as Box<dyn Tier>
                 }
                 "knn" => {
                     let a: Vec<f64> = arg.split(':').map(|x| x.parse().unwrap_or_else(|_| panic!("knn:<k>:<lambda>:<temp>, got {part}"))).collect();
@@ -556,7 +607,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
-            | "recent" | "dump" => {
+            | "recent" | "dump" | "wdump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -585,6 +636,12 @@ fn main() {
     let (spart_i, spart_n) = part("store_part");
     if opt.contains_key("dump") {
         assert!(specs.last().is_some_and(|s| s.rsplit('+').next().is_some_and(|p| p.starts_with("knn:"))), "dump needs the last tier= spec to end in knn");
+    }
+    if opt.contains_key("wdump") {
+        assert!(opt.contains_key("dump"), "wdump needs dump= (the kNN dump it is joined with)");
+        let parts: Vec<&str> = specs.last().unwrap().split('+').collect();
+        let n = parts.len();
+        assert!(n >= 2 && parts[n - 2].starts_with("words:") && parts[n - 1].starts_with("knn:") && parts.iter().filter(|p| p.starts_with("words:")).count() == 1, "wdump needs the last tier= spec to have exactly one words: part, immediately before its final knn:");
     }
     let corpus = get("corpus", "novels6");
 
@@ -678,7 +735,8 @@ fn main() {
     };
 
     let dump_spec = opt.contains_key("dump").then(|| specs.len() - 1);
-    let mut tiers: Vec<Vec<Box<dyn Tier>>> = specs.iter().enumerate().map(|(i, s)| build_tier(s, &train, &store, dump_spec == Some(i))).collect();
+    let wdump_spec = opt.contains_key("wdump").then(|| specs.len() - 1);
+    let mut tiers: Vec<Vec<Box<dyn Tier>>> = specs.iter().enumerate().map(|(i, s)| build_tier(s, &train, &store, dump_spec == Some(i), wdump_spec == Some(i))).collect();
     let need_hidden = tiers.iter().flatten().any(|t| t.needs_hidden());
     let (mut ce_model, mut ce_device) = (0.0f64, 0.0f64);
     let mut ce_tier = vec![0.0f64; tiers.len()];
@@ -699,6 +757,11 @@ fn main() {
             if let Some(path) = opt.get("dump") {
                 for tier in tiers.last().unwrap() {
                     tier.dump(path, false);
+                }
+            }
+            if let Some(path) = opt.get("wdump") {
+                for tier in tiers.last().unwrap() {
+                    tier.wdump(path, false);
                 }
             }
         }
@@ -772,6 +835,11 @@ fn main() {
     if let Some(path) = opt.get("dump") {
         for tier in tiers.last().unwrap() {
             tier.dump(path, true);
+        }
+    }
+    if let Some(path) = opt.get("wdump") {
+        for tier in tiers.last().unwrap() {
+            tier.wdump(path, true);
         }
     }
 }
