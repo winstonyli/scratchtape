@@ -368,6 +368,13 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   (`\GPU Process Memory`) sampled alongside `load_log.ps1`, on a quiet GPU; check `tasklist | grep tier_eval_run` first.
   Note: `tier_full5.sh` / `tier_full6.sh` named above no longer exist; `tier_full7.sh` is the same stack.
 
+- **Run in flight: tier_full8 (started 2026-10-07 17:45).** `scripts/tier_full8.sh` = tier_full7 on a quiet machine (CPU 15%,
+  no other eGPU users or leases at launch; another session's `cargo bench` was idle). `runs/tier_eval_run.exe` PID 63808
+  (Normal priority, GPU-bound), log `runs/tier_full8.log` (`speed:` line every 20 chunks), load + VRAM samples every 30 s in
+  `runs/tier_full8_load.log` (load_log.ps1 PID 52620; stops when the run exits). Expected ~23-25 min if tier_full5's 1355 s
+  was representative. Reading it: flat `speed:` and VRAM under ~14 GB dedicated = tier_full7 was contention; `s/chunk`
+  growing with a growing `Shared` VRAM column = spill. To finish: compare, record here, remove this entry.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
