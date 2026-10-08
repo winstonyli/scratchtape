@@ -83,7 +83,10 @@ least 32 bytes (`warm=32`) the model alone is 1.1778, and then lexicon + word
 bigram + a past-only in-document memory reach 1.1311 (-0.0467), of which the
 memory is -0.0425 (the CPU tiers alone -0.0201). The deployable form writes the memory as the text is read
 (online, no held-out text in advance): on the whole held-out text lexicon + word bigram + online memory give 1.1313
-(-0.0451) against 1.1764 for the model alone at stride 1 (the memory alone -0.0412). The memory search is exact
+(-0.0451) against 1.1764 for the model alone at stride 1 (the memory alone -0.0412). Writing each chunk's keys before
+its search (`write=first`), weighting in-document neighbours separately from train neighbours (own temperature and a
+distance shift) and searching the two sources separately (top-256 each) bring the same stack to 1.1138 (-0.0626; the memory
+alone 1.1196); each step and its tuning is in `docs/tiers_design.md`. The memory search is exact
 and took ~5 s per 32-window chunk of 4.5M keys in f32 (2.5x faster than the first version: sampled per-query thresholds,
 multi-thread top-k, unscored rows skipped); the f16 matrix-core search is the default now, and the whole held-out run takes
 826 s (13.8 min; ~1.7 s per chunk, flat as the memory grows to 5M keys; CE identical to 4 decimals). Earlier full runs
