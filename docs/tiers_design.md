@@ -387,11 +387,14 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   `pending_keys_are_searched_without_one_tile_per_add`, exact against brute force, plain and masked). `knn_scale_check`
   with 500k keys added 32 at a time: **1.04 s per block (was 4.43 s)**, flat at 5.0M -> 5.5M keys (CPU 76% average from
   another session's job). `flush_time[1]` is now always zero (conversion and upload are timed together in `[0]`).
-- **Run in flight: tier_full9 (started 2026-10-07 18:49).** `scripts/tier_full9.sh` = tier_full7's stack after the fix
-  (CPU 27% at launch; another session's `bv_sbo` was present). `runs/tier_eval_run.exe` PID 71172, log `runs/tier_full9.log`
-  (`speed:` every 20 chunks), load + VRAM in `runs/tier_full9_load.log` (load_log.ps1 PID 49292). Expected 10-15 min
-  (~1-1.5 s/chunk). To finish: record the wall time and `speed:` range here, update the README line on search speed, remove
-  this entry.
+- **tier_full9: the fix, full held-out stack (2026-10-07 18:50 -> 19:04; `scripts/tier_full9.sh`, `runs/tier_full9.log`,
+  `runs/tier_full9_load.log`).** **825.6 s for the scoring loop (13.8 min), down from 1355 s (tier_full5, f16) and 2502 s
+  (f32); 1.44-2.21 s per chunk, flat from chunk 0 to 492** (tier_full7: 2 s growing to 73 s). CE identical to the
+  earlier runs (full stack 1.1313, -0.0451; memory alone 1.1352). Phases: forward 6 s, tier prepare (search) 799 s (97%),
+  row scoring 19 s, online writes 1 s. Machine: CPU 36% average (another session's `bv_sbo` and `WizardGraphicalClient`
+  present, so not fully quiet), Defender off, dedicated VRAM 3.3 GB, no shared-VRAM spill. Per chunk ~1.7 s against the
+  ~1.3 s of the `part=5/96` slice, which had ~4.5M keys and less load. The search is still ~97% of the run: matmul ~0.5 s
+  and top-k ~0.7 s per 1024-query block (see the top-k and pass-1 entries above) are the next places to look.
 
 ## Order
 
