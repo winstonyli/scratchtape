@@ -58,6 +58,13 @@ fn split(rows: &[Row]) -> (Vec<Row>, Vec<Row>) {
     rows.iter().partition(|r| r.chunk % 2 == 0)
 }
 
+/// (earlier rows, later rows) in appearance order, cut at the first chunk-id change at or after the midpoint so no chunk is split.
+fn split_halves(rows: &[Row]) -> (Vec<Row>, Vec<Row>) {
+    let cut = (rows.len() / 2).max(1);
+    let cut = (cut..rows.len()).find(|&i| rows[i].chunk != rows[i - 1].chunk).unwrap_or(rows.len());
+    (rows[..cut].to_vec(), rows[cut..].to_vec())
+}
+
 fn mean_gated(rows: &[Row], lam: impl Fn(&Row) -> f64) -> f64 {
     rows.iter().map(|r| loss(r, lam(r))).sum::<f64>() / rows.len() as f64
 }
@@ -204,34 +211,45 @@ fn main() {
         println!("gate 0 NOT checked (no logged=<CE>)");
     }
     let (even, odd) = split(&rows);
-    let (lam, ce) = best_fixed(&even);
-    println!("even {} rows / odd {} rows", even.len(), odd.len());
-    println!("fixed 0.5: even {:.5}, odd {:.5}", mean_fixed(&even, 0.5), mean_fixed(&odd, 0.5));
-    println!("best fixed on even = {lam:.2}: even {ce:.5}, odd {:.5}", mean_fixed(&odd, lam));
-    let init = lam.clamp(0.01, 0.99);
-    let base_odd = mean_fixed(&odd, 0.5);
-    let base_best = mean_fixed(&odd, lam);
+    report("even/odd", &even, &odd);
+    let (early, late) = split_halves(&rows);
+    report("early/late", &early, &late);
+}
 
-    let b = Binned::fit(&even, 4, 4);
-    let binned_odd = mean_gated(&odd, |r| b.lambda(r));
-    println!("binned 4x4 (entropy x nearest distance, quantile edges from even): odd {binned_odd:.5} (gain {:+.5} vs fixed 0.5, {:+.5} vs best fixed {lam:.2})", base_odd - binned_odd, base_best - binned_odd);
-    println!("  lambda by bin (rows = entropy bins low->high, columns = nearest-distance bins low->high):");
-    for i in 0..4 {
-        println!("    {}", (0..4).map(|j| format!("{:.2}", b.lam[i * 4 + j])).collect::<Vec<_>>().join("  "));
+/// Fits the gates on `fit` and scores them on `score`; every line is prefixed with `label`.
+fn report(label: &str, fit: &[Row], score: &[Row]) {
+    if fit.is_empty() || score.is_empty() {
+        println!("[{label}] skipped: fit half has {} rows, score half {}", fit.len(), score.len());
+        return;
     }
-    println!("  entropy edges {:?}, d0 edges {:?}", b.h_edges.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>(), b.d_edges.iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>());
+    let (lam, ce) = best_fixed(fit);
+    println!("[{label}] fit {} rows / score {} rows", fit.len(), score.len());
+    println!("[{label}] fixed 0.5: fit {:.5}, score {:.5}", mean_fixed(fit, 0.5), mean_fixed(score, 0.5));
+    println!("[{label}] best fixed on fit = {lam:.2}: fit {ce:.5}, score {:.5}", mean_fixed(score, lam));
+    let init = lam.clamp(0.01, 0.99);
+    let base_score = mean_fixed(score, 0.5);
+    let base_best = mean_fixed(score, lam);
 
-    let g = fit_gate(&even, init, 500);
-    let param_odd = mean_gated(&odd, |r| g.lambda(r));
-    println!("parametric gate: even {:.5}, odd {param_odd:.5} (gain {:+.5} vs fixed 0.5, {:+.5} vs best fixed {lam:.2}); w = {:?}", mean_gated(&even, |r| g.lambda(r)), base_odd - param_odd, base_best - param_odd, g.w.map(|x| (x * 1000.0).round() / 1000.0));
-    println!("  features: entropy, ln(1 + d0), (dk - d0) / (1 + d0), standardised on the even half: mean {:?}, std {:?}", g.mean, g.std);
+    let b = Binned::fit(fit, 4, 4);
+    let binned_score = mean_gated(score, |r| b.lambda(r));
+    println!("[{label}] binned 4x4 (entropy x nearest distance, quantile edges from fit): score {binned_score:.5} (gain {:+.5} vs fixed 0.5, {:+.5} vs best fixed {lam:.2})", base_score - binned_score, base_best - binned_score);
+    println!("[{label}]   lambda by bin (rows = entropy bins low->high, columns = nearest-distance bins low->high):");
+    for i in 0..4 {
+        println!("[{label}]     {}", (0..4).map(|j| format!("{:.2}", b.lam[i * 4 + j])).collect::<Vec<_>>().join("  "));
+    }
+    println!("[{label}]   entropy edges {:?}, d0 edges {:?}", b.h_edges.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>(), b.d_edges.iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>());
+
+    let g = fit_gate(fit, init, 500);
+    let param_score = mean_gated(score, |r| g.lambda(r));
+    println!("[{label}] parametric gate: fit {:.5}, score {param_score:.5} (gain {:+.5} vs fixed 0.5, {:+.5} vs best fixed {lam:.2}); w = {:?}", mean_gated(fit, |r| g.lambda(r)), base_score - param_score, base_best - param_score, g.w.map(|x| (x * 1000.0).round() / 1000.0));
+    println!("[{label}]   features: entropy, ln(1 + d0), (dk - d0) / (1 + d0), standardised on the fit half: mean {:?}, std {:?}", g.mean, g.std);
 
     println!(
-        "verdict: binned gain {:.4} vs fixed 0.5, {:.4} vs best fixed; parametric gain {:.4} vs fixed 0.5, {:.4} vs best fixed (nats). Success (parametric > 0.002) and kill (binned < 0.002) apply to the gain vs best fixed, the baseline that excludes mere retuning of a constant; the vs-0.5 numbers are for reference.",
-        base_odd - binned_odd,
-        base_best - binned_odd,
-        base_odd - param_odd,
-        base_best - param_odd
+        "[{label}] verdict: binned gain {:.4} vs fixed 0.5, {:.4} vs best fixed; parametric gain {:.4} vs fixed 0.5, {:.4} vs best fixed (nats). Success (parametric > 0.002) and kill (binned < 0.002) apply to the gain vs best fixed, the baseline that excludes mere retuning of a constant; the vs-0.5 numbers are for reference.",
+        base_score - binned_score,
+        base_best - binned_score,
+        base_score - param_score,
+        base_best - param_score
     );
 }
 
@@ -272,6 +290,21 @@ mod tests {
         let ids: Vec<u32> = rows.iter().map(|r| r.chunk).collect();
         assert_eq!(ids, vec![0, 3, 100_000, 100_003]);
         assert!(rows.iter().zip([0u32, 3, 0, 3]).all(|(r, orig)| r.chunk % 2 == orig % 2));
+    }
+
+    #[test]
+    fn split_halves_never_splits_a_chunk_and_keeps_order() {
+        // 3 rows per chunk, 5 chunks: the midpoint (row 7) is inside chunk 2, so the cut moves to the start of chunk 3.
+        let rows: Vec<Row> = (0..15).map(|i| row(i / 3, i as f64 / 100.0, 0.5)).collect();
+        let (early, late) = split_halves(&rows);
+        assert_eq!(early.len() + late.len(), rows.len());
+        assert_eq!(early.len(), 9);
+        let joined: Vec<f64> = early.iter().chain(&late).map(|r| r.p).collect();
+        assert_eq!(joined, rows.iter().map(|r| r.p).collect::<Vec<_>>());
+        assert!(early.last().unwrap().chunk < late.first().unwrap().chunk);
+        // One chunk only: nothing to cut, the late half is empty.
+        let one: Vec<Row> = (0..4).map(|_| row(7, 0.5, 0.5)).collect();
+        assert_eq!(split_halves(&one).1.len(), 0);
     }
 
     #[test]
