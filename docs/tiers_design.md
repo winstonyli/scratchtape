@@ -382,6 +382,17 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   `doc_first_key`). Then rerun the full stack; expect ~1-1.5 s/chunk and a run of ~10-15 min, to be verified with the
   `speed:` lines and a quiet-machine log.
 
+- **Fix: pending keys are searched as a transient tile (2026-10-07).** `KnnStore::len()` counts pending keys, `search`
+  uploads the pending tail as one extra tile, and `write_chunk` no longer calls `finish()` per window (test
+  `pending_keys_are_searched_without_one_tile_per_add`, exact against brute force, plain and masked). `knn_scale_check`
+  with 500k keys added 32 at a time: **1.04 s per block (was 4.43 s)**, flat at 5.0M -> 5.5M keys (CPU 76% average from
+  another session's job). `flush_time[1]` is now always zero (conversion and upload are timed together in `[0]`).
+- **Run in flight: tier_full9 (started 2026-10-07 18:49).** `scripts/tier_full9.sh` = tier_full7's stack after the fix
+  (CPU 27% at launch; another session's `bv_sbo` was present). `runs/tier_eval_run.exe` PID 71172, log `runs/tier_full9.log`
+  (`speed:` every 20 chunks), load + VRAM in `runs/tier_full9_load.log` (load_log.ps1 PID 49292). Expected 10-15 min
+  (~1-1.5 s/chunk). To finish: record the wall time and `speed:` range here, update the README line on search speed, remove
+  this entry.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
