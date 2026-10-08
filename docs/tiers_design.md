@@ -631,6 +631,25 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   Monotone in depth, so the final block is the best key and no earlier tap is worth retuning for. Logs
   `runs/tier_tap{1,2,3}.log`. The key is still a raw hidden state; a learned key remains untried.
 
+- **Learned key, cheapest probe: a fixed whitening of the keys (2026-10-08): small gain, +0.003.** Keys and queries are
+  centred and multiplied by Sigma^(-alpha/2) (symmetric, total variance kept, ridge 1e-3 of the mean eigenvalue), Sigma from
+  128k train positions (the top 5% of the eigenvalues hold 66% of the variance); throwaway code (`runs/whiten_diag.patch`,
+  `KNN_WHITEN=<alpha>`), online split memory, memory alone, `part=3/6`, `knn:256:0.4:T:5T/3:10T/3` (distance scale shifts
+  with alpha, so the temperature is re-picked per alpha; best in **bold**):
+
+  | alpha | T=8 | 15 | 22 | 30 | 45 | 60 | 90 |
+  |---|---|---|---|---|---|---|---|
+  | 0 (today; reproduces 1.0929) | 1.1038 | **1.0929** | | 1.1036 | | | |
+  | 0.25 | 1.1173 | 1.0948 | **1.0905** | 1.0918 | 1.1010 | 1.1140 | 1.1412 |
+  | 0.5 | 1.1276 | 1.0997 | 1.0914 | **1.0899** | 1.0948 | 1.1043 | 1.1300 |
+  | 1 | 1.1370 | 1.1063 | 1.0950 | **1.0912** | 1.0954 | 1.1087 | 1.1506 |
+
+  (alpha 0 at T=8/15/30 uses shifts 27/50/100; the others tie Td and shift to T as above, T=8 and 15 columns for alpha>0
+  are the first grid with Td/shift 13/27 and 25/50.) Best gain **0.0030** (alpha 0.5, T 30: 1.0899 vs 1.0929), a smooth
+  optimum between alpha 0.25 and 1. Memory alone, one slice, shift and Td only coarsely tied to T: promising rather than
+  proven. A learned (supervised) projection could be worth more, but this probe says the raw metric is only mildly off. The
+  fit costs ~25 s once and a 256x256 matrix multiply per key (8 threads); not yet a proper option.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
