@@ -10,7 +10,9 @@ use scratchtape::nn::Rng;
 use std::time::{Duration, Instant};
 
 const D: usize = 256;
-const TILE: usize = 16384;
+fn tile() -> usize {
+    std::env::var("TILE").ok().and_then(|v| v.parse().ok()).unwrap_or(16384)
+}
 const ROWS: usize = 1024;
 const ROUNDS: usize = 5;
 
@@ -50,13 +52,21 @@ fn main() {
     let _lease = gpu_lease::hold(Kind::Exclusive, "scratchtape knn_scale_check", Duration::from_secs(15 * 60));
     let mut rng = Rng::new(1);
     let queries: Vec<f32> = (0..ROWS * D).map(|_| rng.next_gaussian()).collect();
-    let mut store = KnnStore::new(D, TILE);
+    let mut store = KnnStore::new(D, tile());
     println!("f16 {}", store.is_f16());
     let mut n = 0;
+    // QUICK=1: only the 5M point (for comparing TILE / KNN_SLICE / KNN_PARTS settings).
+    let quick = std::env::var_os("QUICK").is_some();
     for target in [500_000, 1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000] {
+        if quick && target < 5_000_000 {
+            continue;
+        }
         fill(&mut store, &mut rng, n, target);
         n = target;
         time(&store, &queries, "ladder");
+    }
+    if quick {
+        return;
     }
     std::thread::sleep(Duration::from_secs(60));
     time(&store, &queries, "same 5M store after 60 s idle");
@@ -67,7 +77,7 @@ fn main() {
         time(&store, &queries, &format!("5M + {added} added 32 at a time"));
     }
     drop(store);
-    let mut fresh = KnnStore::new(D, TILE);
+    let mut fresh = KnnStore::new(D, tile());
     fill(&mut fresh, &mut rng, 0, 500_000);
     time(&fresh, &queries, "fresh 0.5M store");
 }

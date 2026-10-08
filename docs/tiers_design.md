@@ -407,6 +407,16 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   done: a 4x4 or shared-memory variant, and the 2x2 kernel is not wired into `KnnStore`. If search speed matters again,
   look at top-k insertions (a coarser threshold, fewer parts' lists, or a survivor-compaction pass) before the matmul.
 
+- **Keys per top-k launch: 4096 -> 16384 (2026-10-07; `KNN_SLICE`, `runs/knn_topk_grid.ps1`, `runs/knn_topk_grid.log`).**
+  Block time at 5M keys (`knn_scale_check`, `QUICK=1`, best of 5, CPU 15-41%): tile 16384 / slice 4096 **884-905 ms**
+  (two runs), slice 8192 762, **slice 16384 706**; tile 65536 / slice 4096 883, 16384 697, 65536 **625** (its worst round
+  was 3.8-4.5 s, a warm-up or watchdog-adjacent stall, so not adopted). So launch count explains ~20-30% of a block; the
+  other ~0.6 s is the scan itself. 16384 is the default now (one launch per default tile; 512 keys per thread per launch
+  at 32 parts). **Full run tier_full10 (`scripts/tier_full10.sh`, 19:28-19:46): no device loss, CE identical (1.1313),
+  but 1119 s with the machine at 86% CPU (another session's `bv_sbo`), against 826 s at 36% CPU for tier_full9; mean
+  top-k per block 746 ms vs 726 ms, so the full run neither confirms nor refutes the gain.** The 826 s figure stands as
+  the best measured; a full run under similar load is needed to compare the two slices fairly.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).

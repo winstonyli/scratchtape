@@ -24,7 +24,7 @@ const QBLOCK: usize = 2048;
 const THREADS: usize = 32768;
 /// Keys per top-k launch: one launch must stay short (a long one trips the OS's GPU watchdog; with KMAX = 256 a
 /// whole 16384-key tile lost the device when one thread scanned all of it). Each thread scans SLICE / PARTS keys.
-const SLICE: usize = 4096;
+const SLICE: usize = 16384;
 
 /// Every `SAMPLE_STRIDE`-th key (by index; coprime to the 64-byte window length, so the sample covers all window positions) is also kept on the host. A query's distances to the sample give its threshold:
 /// the `THRESH_RANK`-th nearest sample key is about the `THRESH_RANK * SAMPLE_STRIDE`-th nearest key overall, so only keys
@@ -282,6 +282,8 @@ impl KnnStore {
         if timing {
             t_mm += t_pass1;
         }
+        // `KNN_SLICE` overrides the keys per top-k launch (experiments).
+        let slice: usize = std::env::var("KNN_SLICE").ok().and_then(|v| v.parse().ok()).unwrap_or(SLICE);
         let mut base = 0usize;
         for t in self.tiles.iter().chain(tail) {
             let t0 = std::time::Instant::now();
@@ -291,9 +293,9 @@ impl KnnStore {
                 t_mm += t0.elapsed();
             }
             let t0 = std::time::Instant::now();
-            for j0 in (0..t.len).step_by(SLICE) {
+            for j0 in (0..t.len).step_by(slice) {
                 super::count_launch();
-                let n = SLICE.min(t.len - j0);
+                let n = slice.min(t.len - j0);
                 #[rustfmt::skip]
                 k_topk::launch(client(), cubes(parts * q), CubeDim::new_1d(EW_DIM), buf(&dist, self.tile * qp), buf(&t.norms, t.len), buf(&t.vals, t.len), buf(&best_d, parts * q * KMAX), buf(&best_v, parts * q * KMAX), buf(&lo, q), buf(&hi, q), buf(&thr_buf, q), always, q as u32, qp as u32, parts as u32, (base + j0) as u32, j0 as u32, n as u32);
             }
