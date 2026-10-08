@@ -1,0 +1,7 @@
+#!/bin/sh
+# Full held-out run of the deployable stack with a per-position dump for gate_fit (docs/superpowers/specs/2026-10-07-uncertainty-gating-design.md).
+# Only the full-stack spec is scored (the knn search is shared, so this costs about the same as tier_full9). Needs a quiet machine: run the LONG_RUNS checks first.
+export KNN_TIMING=1
+E=runs/tier_eval_run.exe; C=runs/nov_big_k1_d0.1_8m_m0.ckpt
+$E $C warm=32 stride=1 memory=online store=100000 \
+  tier=lexicon:0.3+words:1:0.25+knn:256:0.5:15 dump=runs/tier_gate_dump.bin > runs/tier_gate_dump.log 2>&1
