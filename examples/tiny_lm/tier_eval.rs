@@ -54,7 +54,7 @@
 // Gate 0: the CE computed here from the logits must match the device's own row losses (1e-4) and, with
 // `expect=`, the number recorded for the checkpoint (to its 4 printed digits).
 use scratchtape::gpu_lease::{self, Kind};
-use scratchtape::gpu_step::knn::{KMAX, KnnStore};
+use scratchtape::gpu_step::knn::{DOC, KMAX, KnnStore};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, read};
 use std::cell::RefCell;
@@ -388,7 +388,7 @@ struct Store {
     /// Rows at window positions below this are never scored, so they are not searched.
     warm: usize,
     /// (chunk searched, per row the KMAX nearest (squared distance, value), ascending)
-    found: RefCell<(Option<usize>, Vec<(f32, u8)>)>,
+    found: RefCell<(Option<usize>, Vec<(f32, u16)>)>,
 }
 
 /// Makes the memory causal: the first `n_train` keys (train windows) are always visible, and of the held-out windows
@@ -447,8 +447,8 @@ impl Store {
         let d = hidden.len() / rows;
         let q: Vec<f32> = scored.iter().flat_map(|&r| hidden[r * d..(r + 1) * d].iter().copied()).collect();
         let rg = ranges.as_ref().map(|(r, a)| (scored.iter().map(|&i| r[i]).collect::<Vec<_>>(), *a));
-        let part = self.gpu.borrow().search_masked(&q, scored.len(), rg.as_ref().map(|(r, a)| (r.as_slice(), *a)));
-        let mut found = vec![(f32::INFINITY, 0u8); rows * KMAX];
+        let part = self.gpu.borrow().search_tagged(&q, scored.len(), rg.as_ref().map(|(r, a)| (r.as_slice(), *a)));
+        let mut found = vec![(f32::INFINITY, 0u16); rows * KMAX];
         for (j, &r) in scored.iter().enumerate() {
             found[r * KMAX..(r + 1) * KMAX].copy_from_slice(&part[j * KMAX..(j + 1) * KMAX]);
         }
@@ -467,7 +467,7 @@ impl Store {
             }
             let rows = j * SEQ_LEN + warm..(j + 1) * SEQ_LEN;
             // `len()` counts keys not yet uploaded, so no flush per window (that made one 32-key device tile per window).
-            gpu.add(&hidden[rows.start * d..rows.end * d], &targets[rows].iter().map(|&t| t as u8).collect::<Vec<_>>());
+            gpu.add_doc(&hidden[rows.start * d..rows.end * d], &targets[rows].iter().map(|&t| t as u8).collect::<Vec<_>>());
         }
     }
 }
@@ -477,9 +477,16 @@ struct Knn {
     k: usize,
     lambda: f64,
     temp: f64,
+    /// In-document neighbours (keys written from the scored text's own book) use this temperature and have `shift` taken
+    /// off their squared distance before weighting; `temp_doc == temp` and `shift == 0` is the plain tier.
+    temp_doc: f64,
+    shift: f64,
     positions: usize,
     nearest: f64,
     kth: f64,
+    /// Neighbours seen and how many of them were in-document keys.
+    seen: usize,
+    seen_doc: usize,
     dump: Option<Vec<f32>>,
     chunk: usize,
 }
@@ -507,11 +514,16 @@ impl Tier for Knn {
         }
         let mut knn = [0f64; VOCAB];
         let mut total = 0.0;
-        for &(dist, v) in nb {
-            let w = (-((dist - nb[0].0) as f64) / self.temp).exp();
-            knn[v as usize] += w;
+        let adj = |&(dist, v): &(f32, u16)| dist as f64 - if v >= DOC { self.shift } else { 0.0 };
+        let reference = nb.iter().map(adj).fold(f64::INFINITY, f64::min);
+        for n in nb {
+            let doc = n.1 >= DOC;
+            let w = (-(adj(n) - reference) / if doc { self.temp_doc } else { self.temp }).exp();
+            knn[(n.1 % DOC) as usize] += w;
             total += w;
+            self.seen_doc += doc as usize;
         }
+        self.seen += nb.len();
         if let Some(d) = &mut self.dump {
             d.extend([self.chunk as f32, p_t as f32, (knn[ctx.target] / total) as f32, entropy as f32, nb[0].0, nb[nb.len() - 1].0]);
         }
@@ -524,7 +536,13 @@ impl Tier for Knn {
     }
     fn report(&self) -> String {
         let n = self.positions.max(1) as f64;
-        format!("knn ({} keys): mean squared distance to nearest {:.1}, to k-th {:.1}", self.store.gpu.borrow().len(), self.nearest / n, self.kth / n)
+        format!(
+            "knn ({} keys): mean squared distance to nearest {:.1}, to k-th {:.1}; {:.1}% of the neighbours are in-document keys",
+            self.store.gpu.borrow().len(),
+            self.nearest / n,
+            self.kth / n,
+            100.0 * self.seen_doc as f64 / self.seen.max(1) as f64
+        )
     }
     fn dump(&self, path: &str, last: bool) {
         if let Some(d) = &self.dump {
@@ -560,10 +578,11 @@ fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>, dump: bool
                     Box::new(w) as Box<dyn Tier>
                 }
                 "knn" => {
-                    let a: Vec<f64> = arg.split(':').map(|x| x.parse().unwrap_or_else(|_| panic!("knn:<k>:<lambda>:<temp>, got {part}"))).collect();
-                    assert!(a.len() == 3 && a[0] >= 1.0 && a[0] as usize <= KMAX, "knn:<k>:<lambda>:<temp> with 1 <= k <= {KMAX}, got {part}");
+                    let a: Vec<f64> = arg.split(':').map(|x| x.parse().unwrap_or_else(|_| panic!("knn:<k>:<lambda>:<temp>[:<temp_doc>:<shift>], got {part}"))).collect();
+                    assert!((a.len() == 3 || a.len() == 5) && a[0] >= 1.0 && a[0] as usize <= KMAX, "knn:<k>:<lambda>:<temp>[:<temp_doc>:<shift>] with 1 <= k <= {KMAX}, got {part}");
                     let store = store.clone().expect("a knn tier needs the store");
-                    Box::new(Knn { store, k: a[0] as usize, lambda: a[1], temp: a[2], positions: 0, nearest: 0.0, kth: 0.0, dump: dump.then(Vec::new), chunk: 0 }) as Box<dyn Tier>
+                    let (temp_doc, shift) = if a.len() == 5 { (a[3], a[4]) } else { (a[2], 0.0) };
+                    Box::new(Knn { store, k: a[0] as usize, lambda: a[1], temp: a[2], temp_doc, shift, positions: 0, nearest: 0.0, kth: 0.0, seen: 0, seen_doc: 0, dump: dump.then(Vec::new), chunk: 0 }) as Box<dyn Tier>
                 }
                 _ => panic!("unknown tier {kind} in {spec}"),
             }
@@ -689,26 +708,27 @@ fn main() {
         let (mut n_train, mut n_held) = (0, 0);
         let build = std::time::Instant::now();
         let mut t_fwd = std::time::Duration::ZERO;
-        let mut load = |data: &[usize], starts: &[usize]| {
+        let mut load = |data: &[usize], starts: &[usize], doc: bool| {
             // Only the hidden states are needed (no logits or losses), so launches can be twice as large.
             for chunk in starts.chunks(2 * CHUNK) {
                 let t0 = std::time::Instant::now();
                 let f = forward(&dev, &cfg, data, chunk, tap, true, false);
                 t_fwd += t0.elapsed();
-                gpu.add(&f.hidden, &f.targets.iter().map(|&t| t as u8).collect::<Vec<_>>());
+                let vals: Vec<u8> = f.targets.iter().map(|&t| t as u8).collect();
+                if doc { gpu.add_doc(&f.hidden, &vals) } else { gpu.add(&f.hidden, &vals) }
             }
         };
         if from != "held" && want > 0 {
             let total = (train.len() - 1) / SEQ_LEN;
             let starts: Vec<usize> = (0..want.min(total)).map(|i| i * total / want.min(total) * SEQ_LEN).collect();
-            load(&train, &starts);
+            load(&train, &starts, false);
             n_train = starts.len();
         }
         if from != "train" {
             let windows = (held_out.len() - 1) / SEQ_LEN;
             let unscored: Vec<usize> = (0..windows).filter(|i| causal || (i % stride != offset && i * spart_n / windows == spart_i)).map(|i| i * SEQ_LEN).collect();
             let starts: Vec<usize> = if causal { unscored } else { (0..want.min(unscored.len())).map(|i| unscored[i * unscored.len() / want.min(unscored.len())]).collect() };
-            load(&held_out, &starts);
+            load(&held_out, &starts, true);
             n_held = starts.len();
         }
         gpu.finish();

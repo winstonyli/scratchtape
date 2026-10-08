@@ -12,6 +12,8 @@ use cubecl::server::Handle;
 use half::f16;
 use std::cell::RefCell;
 
+/// Added to a value to mark an in-document key (`KnnStore::add_doc`).
+pub const DOC: u16 = 256;
 /// Neighbours kept per query.
 pub const KMAX: usize = 256;
 const KM: u32 = KMAX as u32;
@@ -48,7 +50,8 @@ pub struct KnnStore {
     tile: usize,
     tiles: Vec<Tile>,
     pending_keys: Vec<f32>,
-    pending_vals: Vec<u8>,
+    /// A key's byte, plus `DOC` for a key added with `add_doc`.
+    pending_vals: Vec<u16>,
     sample_keys: Vec<f32>,
     /// Keys and queries as f16 on the matrix cores (the default; `KNN_F32=1` selects the exact f32 path): about 2x faster matmul and half the key memory, but
     /// distances carry f16 rounding (~1e-3 relative); norms are taken from the rounded vectors so a distance is exactly
@@ -87,9 +90,18 @@ impl KnnStore {
 
     /// Appends keys (row-major [n, d]) and their values; full tiles are uploaded as they fill.
     pub fn add(&mut self, keys: &[f32], vals: &[u8]) {
+        self.add_tagged(keys, vals, 0);
+    }
+
+    /// `add`, but the keys are marked as in-document: `search_tagged` returns `DOC + byte` for them.
+    pub fn add_doc(&mut self, keys: &[f32], vals: &[u8]) {
+        self.add_tagged(keys, vals, DOC);
+    }
+
+    fn add_tagged(&mut self, keys: &[f32], vals: &[u8], tag: u16) {
         assert_eq!(keys.len(), vals.len() * self.d);
         self.pending_keys.extend_from_slice(keys);
-        self.pending_vals.extend_from_slice(vals);
+        self.pending_vals.extend(vals.iter().map(|&v| v as u16 + tag));
         while self.pending_vals.len() >= self.tile {
             self.flush(self.tile);
         }
@@ -111,14 +123,14 @@ impl KnnStore {
         for i in (first.next_multiple_of(SAMPLE_STRIDE) - first..n).step_by(SAMPLE_STRIDE) {
             self.sample_keys.extend_from_slice(&keys[i * self.d..(i + 1) * self.d]);
         }
-        let vals: Vec<u8> = self.pending_vals.drain(..n).collect();
+        let vals: Vec<u16> = self.pending_vals.drain(..n).collect();
         let tile = self.tile_of(&keys, &vals);
         self.flush_time[0] += t0.elapsed();
         self.tiles.push(tile);
     }
 
     /// Device tile for `keys` (row-major [vals.len(), d]) and their values.
-    fn tile_of(&self, keys: &[f32], vals: &[u8]) -> Tile {
+    fn tile_of(&self, keys: &[f32], vals: &[u16]) -> Tile {
         let vals_f: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
         let (key_h, norms) = self.upload_keys(keys);
         Tile { keys: key_h, norms: upload_f32(&norms), vals: upload_f32(&vals_f), len: vals.len() }
@@ -160,6 +172,11 @@ impl KnnStore {
     /// lo_r <= j < hi_r, for `mask = Some((ranges, always))`, ranges[r] = (lo_r, hi_r). With fewer than `KMAX` allowed
     /// keys the list ends in (infinity, 0) entries. This is how a memory is made causal: a query sees only keys older than it.
     pub fn search_masked(&self, queries: &[f32], rows: usize, mask: Option<(&[(u32, u32)], u32)>) -> Vec<(f32, u8)> {
+        self.search_tagged(queries, rows, mask).into_iter().map(|(d, v)| (d, (v % DOC) as u8)).collect()
+    }
+
+    /// `search_masked`, but the value is `DOC + byte` for keys added with `add_doc`.
+    pub fn search_tagged(&self, queries: &[f32], rows: usize, mask: Option<(&[(u32, u32)], u32)>) -> Vec<(f32, u16)> {
         assert!(self.len() >= KMAX, "need at least {KMAX} keys");
         assert_eq!(queries.len(), rows * self.d);
         let (ranges, always) = match mask {
@@ -215,7 +232,7 @@ impl KnnStore {
 
     /// One block of `q` queries. With `thresholds`, returns None when some query's threshold left fewer than `KMAX` keys.
     #[allow(clippy::too_many_arguments)]
-    fn search_block(&self, block: &[f32], q: usize, ranges: &[(u32, u32)], always: u32, parts: usize, thresholds: bool, tail: Option<&Tile>) -> Option<Vec<(f32, u8)>> {
+    fn search_block(&self, block: &[f32], q: usize, ranges: &[(u32, u32)], always: u32, parts: usize, thresholds: bool, tail: Option<&Tile>) -> Option<Vec<(f32, u16)>> {
         // Queries as the matmul wants them: f32 [q, d], or (f16) rounded, transposed to [d, qp] and padded to a multiple of 16.
         let qp = if self.f16 { q.next_multiple_of(16) } else { q };
         let rounded: Vec<f32>;
@@ -333,7 +350,7 @@ impl KnnStore {
                 }
                 return None;
             }
-            out.extend(c.iter().map(|&(dd, v)| ((dd + qn).max(0.0), v as u8)));
+            out.extend(c.iter().map(|&(dd, v)| ((dd + qn).max(0.0), v as u16)));
         }
         Some(out)
     }
@@ -563,6 +580,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tagged_keys_come_back_tagged_and_plain_search_strips_the_tag() {
+        let (d, n, rows) = (24, 600, 8);
+        let mut rng = Rng::new(5);
+        let keys: Vec<f32> = (0..n * d).map(|_| rng.next_gaussian()).collect();
+        let vals: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let queries: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
+        let mut store = KnnStore::with_precision(d, 300, false);
+        store.add(&keys[..400 * d], &vals[..400]);
+        store.add_doc(&keys[400 * d..], &vals[400..]);
+        store.finish();
+        let (tagged, plain) = (store.search_tagged(&queries, rows, None), store.search(&queries, rows));
+        let mut doc = 0;
+        for (t, p) in tagged.iter().zip(&plain) {
+            assert_eq!(t.0, p.0);
+            assert_eq!((t.1 % DOC) as u8, p.1);
+            doc += (t.1 >= DOC) as usize;
+        }
+        // Keys 400.. are tagged (a third of the keys, so some of every query's 256 nearest are), the rest are not.
+        assert!(doc > 0 && doc < tagged.len());
     }
 
     #[test]

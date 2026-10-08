@@ -521,6 +521,34 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   another session's `bv_cd` was running, CPU 27-57%. Mixture weights and temperature are now closed; the remaining gain has
   to come from the memory's contents (option 2: separate train and in-document keys; option 3: richer values).
 
+- **Richer memory, step 2: weight in-document neighbours separately (`knn:k:λ:T:T_doc:shift`; 2026-10-08).** Keys carry a
+  source tag (`KnnStore::add_doc`, `search_tagged`: the value travels as `DOC + byte`, so no extra search cost); in-document
+  neighbours (keys written from the scored text's own book, causal as in `write=first`) use temperature `T_doc` and have
+  `shift` taken off their squared distance before the exp(-(d - d_ref)/T) weight, `d_ref` = the smallest adjusted distance.
+  `T_doc = T`, shift 0 is the plain tier (checked: identical CE). Why: only **1.0% (slice) / 2.0% (full) of the 256 nearest
+  neighbours are in-document keys**; their distances are larger (sparser memory), so train keys outvote the informative ones.
+  Slice `part=3/6`, memory alone, lambda 0.4 / T 15: plain -0.0402; (T_doc 25, shift 40) -0.0491; a plateau over T_doc 25-40
+  and shift 30-50, worse at 70-80 (the few doc keys then dominate) (`scripts/tier_doc_split.sh`, `runs/tier_doc_split*.log`).
+  Full held-out (`scripts/tier_full_doc_split.sh`, `runs/tier_full_doc_split.log`; 564 s, 1.04-1.52 s/chunk, CPU
+  contended by another session; 7 finalists picked on the slice):
+
+  | stack (lexicon 0.3 + words 1:0.25 + knn:256:lambda:T:T_doc:shift) | CE | vs model |
+  |---|---|---|
+  | plain 0.4:15 (control, reproduces tier_full_wf) | 1.1274 | -0.0489 |
+  | 0.4:15:25:30 | 1.1191 | -0.0572 |
+  | **0.4:15:25:40** | **1.1182** | **-0.0582** |
+  | 0.4:15:25:50 | 1.1189 | -0.0575 |
+  | 0.4:15:40:40 | 1.1187 | -0.0577 |
+  | 0.5:15:25:50 | 1.1210 | -0.0554 |
+  | 0.5:20:40:50 | 1.1188 | -0.0576 |
+  | 0.5:20:25:40 | 1.1192 | -0.0572 |
+
+  Memory alone at (0.4:15:25:40): 1.1238 (-0.0526; was 1.1322 plain). Gain **0.0092** over the plain stack, by far the largest
+  since the memory itself and 8x any gating result; the finalists agree within 0.0009 so the optimum is flat and the
+  selection bias is negligible. Best deployable stack: **1.1182 (-0.0582)**. Not done: a per-source top-256 (an in-document
+  key outside the merged top-256 is still invisible; only 2% of neighbours are in-document), re-tuning lambda and the words
+  weight with this, and a learned (instead of constant) shift.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
