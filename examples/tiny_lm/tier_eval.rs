@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [write=after|first] [search=merged|split] [warm=<t0>] [dump=<path>] [wdump=<path>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [search=merged|split] [warm=<t0>] [dump=<path>] [wdump=<path>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -31,11 +31,9 @@
 // `warm=<t0>` scores each byte only at window position >= t0 (windows then start every 64 - t0 bytes), so the model
 // always has at least t0 bytes of context: the plain protocol (warm 0) gives the early positions of every window almost
 // none, which a tier reading longer context (the `h` flag) can exploit; `warm=32` is the control for that.
-// `memory=online` is the same idea written as it is read: the memory starts as the train keys and each scored chunk's
-// scored positions are appended after scoring, so a query sees the past text of its own book up to the previous chunk
-// (32 windows of write latency) and nothing else; it needs stride 1. `write=first` (online only) removes that latency:
-// a chunk's keys are written before its search and a window's queries see the keys of the windows before it, as the
-// causal memory does. `search=split` (online only) searches the train keys and the in-document keys separately and keeps
+// `memory=online` is the same idea written as it is read: the memory starts as the train keys and each chunk's scored
+// positions are appended before its search, and a window's queries see the keys of the windows before it in their own
+// book, as the causal memory does (nothing else); it needs stride 1. `search=split` (online only) searches the train keys and the in-document keys separately and keeps
 // the k nearest of each (the in-document search scans only the tail tiles), instead of the k nearest of the two together.
 // `recent=<n>` (causal) limits a query to the n windows before its own.
 // `memory=causal` makes the memory a past-only in-document one: the train keys plus ALL held-out windows (in order), where
@@ -406,11 +404,9 @@ struct Causal {
     recent: usize,
 }
 
-/// A memory written as the text is read: after each scored chunk its scored positions are appended, so a query sees the
-/// train keys and, from its own book, everything written before its chunk (a write latency of one chunk).
+/// A memory written as the text is read: each chunk's scored positions are appended before its search, and a query sees
+/// the train keys and, from its own book, only the keys of earlier windows.
 struct Online {
-    /// `write=first`: each chunk's keys are written before its search and a query sees only the keys of earlier windows.
-    first: bool,
     /// Index of the first key written from the current chunk.
     base: usize,
     n_train: usize,
@@ -441,12 +437,11 @@ impl Store {
         });
         if let Some(on) = &self.online {
             let on = on.borrow();
-            let hi = self.gpu.borrow().len() as u32;
             let per_window = SEQ_LEN - self.warm;
             let r = (0..rows)
                 .map(|r| {
                     let d = on.docs.partition_point(|&b| b <= starts[r / SEQ_LEN]) - 1;
-                    let hi = if on.first { (on.base + r / SEQ_LEN * per_window) as u32 } else { hi };
+                    let hi = (on.base + r / SEQ_LEN * per_window) as u32;
                     (on.doc_first_key[d].map_or(hi, |k| k as u32), hi)
                 })
                 .collect();
@@ -671,7 +666,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
-            | "recent" | "dump" | "wdump" | "write" | "search" => {
+            | "recent" | "dump" | "wdump" | "search" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -736,7 +731,6 @@ fn main() {
             "online" => (false, true),
             m => panic!("memory is flat, causal or online, got {m}"),
         };
-        assert!(online || !opt.contains_key("write"), "write= needs memory=online");
         let split = match get("search", "merged").as_str() {
             "merged" => false,
             "split" => true,
@@ -793,12 +787,7 @@ fn main() {
         let n_train_keys = n_train * SEQ_LEN;
         let online = online.then(|| {
             let docs = held_out_docs(&corpus);
-            let first = match get("write", "after").as_str() {
-                "after" => false,
-                "first" => true,
-                w => panic!("write is after or first, got {w}"),
-            };
-            RefCell::new(Online { first, base: 0, n_train: n_train_keys, doc_first_key: vec![None; docs.len()], docs })
+            RefCell::new(Online { base: 0, n_train: n_train_keys, doc_first_key: vec![None; docs.len()], docs })
         });
         let causal = causal.then(|| {
             let docs = held_out_docs(&corpus);
@@ -846,12 +835,11 @@ fn main() {
         let f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden, true);
         let rows = f.ids.len();
         phase[0] += t0.elapsed();
-        let write_first = store.as_ref().is_some_and(|st| st.online.as_ref().is_some_and(|on| on.borrow().first));
-        if write_first {
-            let t0 = std::time::Instant::now();
-            store.as_ref().unwrap().write_chunk(&f.hidden, &f.targets, chunk, warm, cfg.d);
-            phase[3] += t0.elapsed();
+        let t0 = std::time::Instant::now();
+        if let Some(st) = &store {
+            st.write_chunk(&f.hidden, &f.targets, chunk, warm, cfg.d);
         }
+        phase[3] += t0.elapsed();
         let t0 = std::time::Instant::now();
         for tier in tiers.iter_mut().flatten() {
             tier.prepare(ci, &f.hidden, rows, chunk);
@@ -880,11 +868,6 @@ fn main() {
             }
         }
         phase[2] += t0.elapsed();
-        let t0 = std::time::Instant::now();
-        if let Some(st) = store.as_ref().filter(|_| !write_first) {
-            st.write_chunk(&f.hidden, &f.targets, chunk, warm, cfg.d);
-        }
-        phase[3] += t0.elapsed();
     }
     let total = t_all.elapsed().as_secs_f64();
     let pct = |d: std::time::Duration| format!("{:.1}s ({:.0}%)", d.as_secs_f64(), 100.0 * d.as_secs_f64() / total);

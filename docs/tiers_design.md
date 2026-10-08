@@ -576,6 +576,14 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   they stay finite and cheap); with the pass restored the slice that crashed three times finishes (CE 1.1262) and the full
   run completes, and tile skipping was not at fault.
 
+- **Cleanup (2026-10-08): `write=after` removed.** The online memory always writes a chunk's keys before its search now
+  (`write=first` was strictly better and nothing is pending against it); the `write=` option, `Online.first` and
+  `scripts/tier_write_first.sh` (the A/B) are gone. Check: `part=3/6`, `knn:256:0.5:15` gives 1.1047 and 0.4 gives 1.1051,
+  identical to the earlier `write=first` run. Scripts from before this change that use `memory=online` without `write=`
+  (`tier_online.sh`, `tier_full4/7/8/9/10.sh`, `tier_gate_dump.sh`, `tier_time.sh`, `tier_words_gate_dump.sh`) reproduced the
+  write-after numbers in this log only at commit 854c38e or earlier; today they run write-first. `search=merged` stays as
+  the control for the split search until its cost is decided.
+
 - **Richer values: the model's surprise at the stored position (2026-10-08): KILL.** Survey option 3. Idea: store, with
   each key's byte, -ln p(true byte) the model had there, and let it scale the neighbour's weight. Diagnostic (flat
   memory, `part=3/6`, 82 chunks, 6 surprise bins): neighbour hit rate falls steeply with key surprise (rank 0-7:
