@@ -354,14 +354,19 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   Unexplained: contention during the run was not measured (the eGPU users and CPU load were checked only before launch),
   and the full run's memory is larger (5.04M keys at the end vs 4.5M). Do not quote the full-run speedup until it is
   reproduced under a logged quiet machine.
-- **Run in flight (started 2026-10-02 22:06, session ended while it ran).** `scripts/tier_full7.sh` (same stack as
-  tier_full6, `KNN_TIMING=1`): `runs/tier_eval_run.exe`, PID 41004, log `runs/tier_full7.log`, load samples in
-  `runs/tier_full7_load.log` (`scripts/load_log.ps1`, stops when the run exits; if it died early the log just ends).
-  Expected ~25 min. Question: is the 1464 s (2.86 s/chunk) vs ~1.3-1.7 s/chunk on slices contention? Slices at parts 5, 60,
-  90 of 96 all took 12.2-12.7 s (so not store growth or position in the held-out set); the load log at launch showed
-  `manifold` and `WizardGraphicalClient` on the eGPU and CPU 46-47%. To finish: compare slow `knn timing` blocks in the log
-  to the load-log timestamps (blocks are not timestamped; use cumulative block times from the run start), then record the result
-  here. Check `tasklist | grep tier_eval_run` before launching anything else (orphan rule).
+- **tier_full7 (2026-10-02 22:06 -> 2026-10-03 00:44; `scripts/tier_full7.sh`, `runs/tier_full7.log`, load samples in
+  `runs/tier_full7_load.log`): finished, but 2 h 38 min, not ~25 min.** CE identical again (full stack 1.1313). The
+  `KNN_TIMING` blocks sum to 9255 s and **grow through the run**: 1.97 s at block 100 (4.53M keys), 5.8 s at 250, 17.4 s at
+  400, 31-73 s over the last ~100 (5.03M keys); 329 of 492 blocks took over 10 s, 7 under 2 s. Matmul and top-k slow together
+  (equal shares each block). `WizardGraphicalClient` was on the eGPU in nearly every sample, CPU averaged 71% (Defender off).
+  Open: contention alone does not obviously explain a steady, monotone 30x growth; candidates are VRAM spill past 16 GB
+  over USB4 as the store grows (not measured: no VRAM counters were logged), a per-chunk host-side cost, or a degrading
+  eGPU link. tier_full6's 1464 s (2.86 s/chunk) was probably a milder case of the same thing. **Do not quote any full-run
+  speed until a run on a quiet machine logs its own speed** (`tier_eval` now prints `speed: chunks a..b X s/chunk` every
+  20 chunks and pauses while another job holds an exclusive GPU lease); the `part=5/96` slice speedups (block ~2.2 s ->
+  ~1.3 s) stand because they were measured within minutes on the same exe. Next: rerun the full stack with VRAM
+  (`\GPU Process Memory`) sampled alongside `load_log.ps1`, on a quiet GPU; check `tasklist | grep tier_eval_run` first.
+  Note: `tier_full5.sh` / `tier_full6.sh` named above no longer exist; `tier_full7.sh` is the same stack.
 
 ## Order
 

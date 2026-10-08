@@ -84,8 +84,10 @@ bigram + a past-only in-document memory reach 1.1311 (-0.0467), of which the
 memory is -0.0425 (the CPU tiers alone -0.0201). The deployable form writes the memory as the text is read
 (online, no held-out text in advance): on the whole held-out text lexicon + word bigram + online memory give 1.1313
 (-0.0451) against 1.1764 for the model alone at stride 1 (the memory alone -0.0412). The memory search is exact
-and takes ~5 s per 32-window chunk of 4.5M keys (2.5x faster than the first version: sampled per-query thresholds,
-multi-thread top-k, unscored rows skipped). Existing work by tier: the transformer and its GPU-resident
+and took ~5 s per 32-window chunk of 4.5M keys in f32 (2.5x faster than the first version: sampled per-query thresholds,
+multi-thread top-k, unscored rows skipped); the f16 matrix-core search is the default now (1355 s for the whole run on a
+quiet machine, CE identical to 4 decimals), but a later full rerun took 2 h 38 min on a shared GPU, so full-run speed is
+unsettled (`docs/tiers_design.md`). Existing work by tier: the transformer and its GPU-resident
 step (tier 1); the symbolic-structure and reasoning examples (tier 2);
 replay buffers, checkpoints and consolidation in `examples/memory_tiers/`
 (the long-term side, so far at toy or Aesop-quarters scale). Experiments

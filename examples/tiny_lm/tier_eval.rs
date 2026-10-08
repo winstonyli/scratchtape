@@ -564,7 +564,7 @@ fn main() {
     let flat: Vec<f32> = std::fs::read_to_string(ckpt).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
     assert_eq!(flat.len(), cfg.len(), "{ckpt} has {} parameters, this config needs {}", flat.len(), cfg.len());
     let (train, held_out) = split_corpus(&corpus);
-    let _lease = gpu_lease::hold(Kind::Shared, "scratchtape tier_eval", Duration::from_secs(3600));
+    let _lease = gpu_lease::hold(Kind::Shared, "scratchtape tier_eval", Duration::from_secs(4 * 3600));
     let dev = DeviceParams::upload(&flat);
 
     // Held-out words the train split has never shown: the ceiling on what a train-split lexicon can know.
@@ -659,7 +659,16 @@ fn main() {
     // Wall time per phase: forward launch + readback, tier prepare (kNN search + readback), per-row scoring, online writes.
     let mut phase = [std::time::Duration::ZERO; 4];
     let t_all = std::time::Instant::now();
+    let (mut t_lap, mut paused) = (std::time::Instant::now(), std::time::Duration::ZERO);
     for (ci, chunk) in starts.chunks(CHUNK).enumerate() {
+        // Yield to another job's exclusive lease, and log speed per 20 chunks (paused time excluded) so a slow stretch reads as contention.
+        let t_p = std::time::Instant::now();
+        gpu_lease::pause_while_exclusive();
+        paused += t_p.elapsed();
+        if ci > 0 && ci % 20 == 0 {
+            eprintln!("speed: chunks {}..{} {:.2} s/chunk ({:.0} s paused)", ci - 20, ci, (t_lap.elapsed() - paused).as_secs_f64() / 20.0, paused.as_secs_f64());
+            (t_lap, paused) = (std::time::Instant::now(), std::time::Duration::ZERO);
+        }
         let t0 = std::time::Instant::now();
         let f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden, true);
         let rows = f.ids.len();
