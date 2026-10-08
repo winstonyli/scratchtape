@@ -619,6 +619,18 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   survey (stored surprise, multi-byte continuation); what is left is outside the value: the key (tap block, a learned
   key) or the model itself.
 
+- **Tap block under the current memory (2026-10-08): block 3 stays.** Online split memory, `part=3/6`, spec
+  `knn:256:0.4:15:25:50` (parameters tuned at tap 3 only), model alone 1.1453:
+
+  | tap | memory alone | + lexicon + words |
+  |---|---|---|
+  | 1 | 1.1557 (+0.0105) | 1.1502 |
+  | 2 | 1.1110 (-0.0343) | 1.1063 |
+  | **3 (last)** | **1.0929 (-0.0524)** | **1.0881 (-0.0571)** |
+
+  Monotone in depth, so the final block is the best key and no earlier tap is worth retuning for. Logs
+  `runs/tier_tap{1,2,3}.log`. The key is still a raw hidden state; a learned key remains untried.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
