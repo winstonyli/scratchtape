@@ -417,6 +417,17 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   top-k per block 746 ms vs 726 ms, so the full run neither confirms nor refutes the gain.** The 826 s figure stands as
   the best measured; a full run under similar load is needed to compare the two slices fairly.
 
+- **Uncertainty gating: tooling built, run held (2026-10-07; spec `docs/superpowers/specs/2026-10-07-uncertainty-gating-design.md`,
+  plan `docs/superpowers/plans/2026-10-07-uncertainty-gating.md`).** `tier_eval ... dump=<path>` writes six f32 per scored
+  position of the last spec's knn tier (chunk, p_t, k_t, entropy, d0, dk); `gate_fit <dump> [logged=<CE>]` checks Gate 0
+  (dump CE at lambda 0.5 == logged CE to 1e-4), then fits a 4x4 binned gate and a 4-parameter sigmoid gate on even chunks
+  and scores odd chunks. Features are `ln(1+d0)` and `(dk-d0)/(1+d0)` plus entropy (the spec said `ln d0`; harmless, distances
+  are >= 0), standardised on the fit half. Success and kill are judged against the gain over the **best fixed lambda**, not
+  0.5 (a gate can reproduce any constant); both are printed. Caveats: even/odd are interleaved chunks of the same books, so
+  the held-out test is weak; Gate 0 has not yet run on real data (the ~15 s slice check, `part=5/96`, is also pending).
+  **Not run yet:** `scripts/tier_gate_dump.sh` (full stack, ~14 min GPU) waits for a quiet machine (user says "uncontended").
+  Tests: `cargo test --release --example gate_fit -j 8` (6 pass). Commits 3808d38..807957d.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
