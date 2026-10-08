@@ -1,6 +1,7 @@
 // Fits and scores per-position gates for the kNN memory's mixing weight from a `tier_eval dump=` file
 // (docs/superpowers/specs/2026-10-07-uncertainty-gating-design.md).
-//   gate_fit <dump> [logged=<CE the run logged for the dumped spec>]
+//   gate_fit <dump>... [logged=<CE the run logged for the dumped spec>]
+// Several dump files are pooled (file i's chunk ids are shifted by i * 100000); `logged=` (Gate 0) needs exactly one file.
 // Fits on even chunks, scores on odd chunks. Rows are (chunk, p_target, k_target, entropy, d0, dk); a position's loss at
 // weight l is -ln((1 - l) p + l k).
 
@@ -24,6 +25,19 @@ fn read_rows(path: &str) -> Vec<Row> {
             Row { chunk: f(0) as u32, p: f(1), k: f(2), h: f(3), d0: f(4), dk: f(5) }
         })
         .collect()
+}
+
+/// Chunk-id offset between dump files: even, so chunk parity (the even/odd split) is preserved, and larger than any run's chunk count.
+const FILE_CHUNK_OFFSET: u32 = 100_000;
+
+/// All rows of several dump files, in file order; file i's chunk ids are shifted by i * FILE_CHUNK_OFFSET so files never share a chunk.
+fn read_all(paths: &[String]) -> Vec<Row> {
+    let mut all = vec![];
+    for (i, p) in paths.iter().enumerate() {
+        let off = i as u32 * FILE_CHUNK_OFFSET;
+        all.extend(read_rows(p).into_iter().map(|r| Row { chunk: r.chunk + off, ..r }));
+    }
+    all
 }
 
 fn loss(r: &Row, lam: f64) -> f64 {
@@ -171,14 +185,17 @@ fn fit_gate(rows: &[Row], init_lambda: f64, iters: usize) -> Gate {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    assert!(!args.is_empty(), "usage: gate_fit <dump> [logged=<CE>]");
-    let rows = read_rows(&args[0]);
+    let (opts, files): (Vec<&String>, Vec<&String>) = args.iter().partition(|a| a.contains('='));
+    assert!(!files.is_empty(), "usage: gate_fit <dump>... [logged=<CE>]");
+    let files: Vec<String> = files.into_iter().cloned().collect();
+    let rows = read_all(&files);
     assert!(!rows.is_empty(), "empty dump");
     let all = mean_fixed(&rows, 0.5);
-    println!("{} rows; fixed lambda 0.5: CE {all:.5}", rows.len());
+    println!("{} rows from {} file(s); fixed lambda 0.5: CE {all:.5}", rows.len(), files.len());
     let mut checked = false;
-    for a in &args[1..] {
+    for a in opts {
         let logged: f64 = a.strip_prefix("logged=").unwrap_or_else(|| panic!("unknown argument {a}")).parse().unwrap();
+        assert!(files.len() == 1, "logged= (Gate 0) checks one run's log against one dump; got {} dump files", files.len());
         assert!((all - logged).abs() < 1e-4, "gate 0: dump gives {all:.5}, the run logged {logged}");
         println!("gate 0 passed: dump reproduces the logged {logged}");
         checked = true;
@@ -243,6 +260,18 @@ mod tests {
         for (r, w) in rows.iter().zip(want) {
             assert_eq!((r.chunk, r.p, r.k, r.h, r.d0, r.dk), w);
         }
+    }
+
+    #[test]
+    fn read_all_offsets_chunk_ids_per_file_and_keeps_parity() {
+        let a = write_dump("all_a", &[[0.0, 0.5, 0.5, 0.0, 1.0, 2.0], [3.0, 0.5, 0.5, 0.0, 1.0, 2.0]]);
+        let b = write_dump("all_b", &[[0.0, 0.5, 0.5, 0.0, 1.0, 2.0], [3.0, 0.5, 0.5, 0.0, 1.0, 2.0]]);
+        let rows = read_all(&[a.clone(), b.clone()]);
+        std::fs::remove_file(&a).unwrap();
+        std::fs::remove_file(&b).unwrap();
+        let ids: Vec<u32> = rows.iter().map(|r| r.chunk).collect();
+        assert_eq!(ids, vec![0, 3, 100_000, 100_003]);
+        assert!(rows.iter().zip([0u32, 3, 0, 3]).all(|(r, orig)| r.chunk % 2 == orig % 2));
     }
 
     #[test]
