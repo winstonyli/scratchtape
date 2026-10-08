@@ -439,6 +439,11 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   the same hump, a quadratic entropy term (or more entropy bins) is the next gate to try. Also added: `dump=` is written
   atomically every 20 chunks, `gate_fit` takes several dump files (chunk ids offset by 100000 per file) and reports a second,
   harder early/late split next to even/odd.
+  **In flight (contended, by choice): full run `scripts/tier_gate_dump.sh`, started 2026-10-07 23:35:50, `tier_eval_run` PID 87148
+  (Normal priority), expected ~14-19 min.** Logs: `runs/tier_gate_dump.log` (stdout, `speed:` lines in the same file via
+  stderr), load: `runs/tier_gate_dump_load.log`; dump `runs/tier_gate_dump.bin` (rewritten every 20 chunks). At launch the
+  eGPU also had `manifold` and `WizardGraphicalClient` on the 3D engine and CPU was ~51% (`bv_ph` ~1 core), so timings are
+  contended; CE and the gate result are unaffected. Then: `gate_fit runs/tier_gate_dump.bin logged=<CE of the stack spec>`.
   **Not run yet:** `scripts/tier_gate_dump.sh` (full stack, ~14 min GPU) waits for a quiet machine (user says "uncontended").
   Tests: `cargo test --release --example gate_fit -j 8` (6 pass). Commits 3808d38..807957d.
 
