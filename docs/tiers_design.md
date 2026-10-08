@@ -509,8 +509,17 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   | lexicon + words + knn 0.5 | 1.1313 | 1.1282 | 0.0031 |
   | lexicon + words + knn 0.4 | 1.1301 | **1.1274** | 0.0027 |
 
-  Best deployable stack is now 1.1274 (-0.0489). Not re-tuned: weight and temperature under `write=first` (the in-document
-  share of the memory grew), and the words weight 0.19.
+  Best deployable stack is now 1.1274 (-0.0489).
+
+- **Retune under `write=first` (`scripts/tier_retune_wf.sh`, `runs/tier_retune_wf.log`; 2026-10-08).** One full run, 24 specs
+  sharing the search: words weight {0.25, 0.19} x knn weight {0.4, 0.5, 0.6} x temp {10, 15, 20, 25}. Best **0.19 / 0.4 / 15:
+  1.1272** (-0.0492), against 1.1274 at the current 0.25 / 0.4 / 15: the stack is already at its optimum (gain 0.0002, less
+  than the ~1e-4 selection bias of picking the best of 24 on the scoring text). The words weight 0.19 is worth 0.0001-0.0002
+  everywhere. Ridge: (0.4, 15) 1.1274, (0.5, 20) 1.1279, (0.5, 15) 1.1282, (0.4, 20) 1.1282; temp 10 and 25 and weight 0.6
+  are clearly worse (1.1296-1.1448). Weight 0.3 was not tried (0.4 beat 0.5 at temp 15 by 0.0008, so a slightly lower
+  weight could add ~1e-4). Defaults left at `words:1:0.25` / `knn:256:0.4:15`. Run: 502 s (row scoring 27% with 24 specs);
+  another session's `bv_cd` was running, CPU 27-57%. Mixture weights and temperature are now closed; the remaining gain has
+  to come from the memory's contents (option 2: separate train and in-document keys; option 3: richer values).
 
 ## Order
 
