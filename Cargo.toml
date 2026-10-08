@@ -270,3 +270,7 @@ path = "examples/differentiable_reasoning/differentiable_backward_chaining.rs"
 [[example]]
 name = "differentiable_backward_chaining_dense"
 path = "examples/differentiable_reasoning/differentiable_backward_chaining_dense.rs"
+
+[[example]]
+name = "knn_scale_check"
+path = "examples/gpu/knn_scale_check.rs"

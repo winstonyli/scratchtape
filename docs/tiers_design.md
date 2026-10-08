@@ -359,21 +359,28 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   `KNN_TIMING` blocks sum to 9255 s and **grow through the run**: 1.97 s at block 100 (4.53M keys), 5.8 s at 250, 17.4 s at
   400, 31-73 s over the last ~100 (5.03M keys); 329 of 492 blocks took over 10 s, 7 under 2 s. Matmul and top-k slow together
   (equal shares each block). `WizardGraphicalClient` was on the eGPU in nearly every sample, CPU averaged 71% (Defender off).
-  Open: contention alone does not obviously explain a steady, monotone 30x growth; candidates are VRAM spill past 16 GB
-  over USB4 as the store grows (not measured: no VRAM counters were logged), a per-chunk host-side cost, or a degrading
-  eGPU link. tier_full6's 1464 s (2.86 s/chunk) was probably a milder case of the same thing. **Do not quote any full-run
-  speed until a run on a quiet machine logs its own speed** (`tier_eval` now prints `speed: chunks a..b X s/chunk` every
-  20 chunks and pauses while another job holds an exclusive GPU lease); the `part=5/96` slice speedups (block ~2.2 s ->
-  ~1.3 s) stand because they were measured within minutes on the same exe. Next: rerun the full stack with VRAM
-  (`\GPU Process Memory`) sampled alongside `load_log.ps1`, on a quiet GPU; check `tasklist | grep tier_eval_run` first.
+  The growth is explained in the next entry (one tiny device tile per window), not by VRAM spill or store size.
+  tier_full6's 1464 s (2.86 s/chunk) was probably a milder case of the same thing. `tier_eval` now prints
+  `speed: chunks a..b X s/chunk` every 20 chunks and pauses while another job holds an exclusive GPU lease.
   Note: `tier_full5.sh` / `tier_full6.sh` named above no longer exist; `tier_full7.sh` is the same stack.
 
-- **Run in flight: tier_full8 (started 2026-10-07 17:45).** `scripts/tier_full8.sh` = tier_full7 on a quiet machine (CPU 15%,
-  no other eGPU users or leases at launch; another session's `cargo bench` was idle). `runs/tier_eval_run.exe` PID 63808
-  (Normal priority, GPU-bound), log `runs/tier_full8.log` (`speed:` line every 20 chunks), load + VRAM samples every 30 s in
-  `runs/tier_full8_load.log` (load_log.ps1 PID 52620; stops when the run exits). Expected ~23-25 min if tier_full5's 1355 s
-  was representative. Reading it: flat `speed:` and VRAM under ~14 GB dedicated = tier_full7 was contention; `s/chunk`
-  growing with a growing `Shared` VRAM column = spill. To finish: compare, record here, remove this entry.
+- **Root cause of the growing block time: one tiny tile per window (2026-10-07; `examples/gpu/knn_scale_check.rs`,
+  `runs/knn_scale_check*.log`).** tier_full8 (rerun on a then-quiet machine, killed at chunk ~200 of 492) was slow too:
+  2.3 s/chunk for chunks 0-20, 8-9 at 40-100, 16 at 180-200, with only 3.2 GB VRAM (spill ruled out) but other sessions'
+  jobs arriving mid-run (CPU 65% average; `tier_eval_run` used ~1 core). Store-size ladder at the tier_eval shapes (d 256,
+  tile 16384, 1024 queries, f16, Gaussian keys, best of 5 on an exclusive lease, CPU 27-60% from another session's job):
+  0.5M keys 0.38-0.47 s, 2M 0.65, 5M 0.97-1.01 s, so **size alone is linear and mild**, and no drift (same 5M store after
+  60 s idle: 1.0 s; fresh 0.5M store: 0.44-0.56 s). `write_chunk` calls `finish()` after every window, so each 32 keys
+  (SEQ_LEN 64 - warm 32) become their own device tile and a chunk adds 32 tiles (~15.7k by the end of a run, against ~300
+  full tiles). Adding 125k / 250k / 500k keys that way to the 5M store: **1.79 / 2.76 / 4.43 s per block** (~0.22 ms per
+  extra tile per search, matmul + top-k launches). That is the time-driven growth seen in tier_full5-8; with the host
+  starved by other jobs each launch costs far more (tier_full7: 31-73 s blocks), which fits LONG_RUNS' "round trips ~25x
+  slower with all cores busy". The earlier slice speedups (`part=5/96`, few chunks) never hit it. Not yet fixed. Options:
+  (a) keep the partial tail in `pending` and have `search` upload it as a transient tile (no `finish()` needed; `len()`
+  must count pending keys, and `flush`'s `first` and the doc-start indices must stay consistent); (b) cheaper, `finish()`
+  once per chunk instead of per window (492 tiles of 1024 instead of 15.7k of 32; needs `len()` to count pending for
+  `doc_first_key`). Then rerun the full stack; expect ~1-1.5 s/chunk and a run of ~10-15 min, to be verified with the
+  `speed:` lines and a quiet-machine log.
 
 ## Order
 
