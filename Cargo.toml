@@ -278,3 +278,7 @@ path = "examples/gpu/knn_scale_check.rs"
 [[example]]
 name = "cmma_blocking_check"
 path = "examples/gpu/cmma_blocking_check.rs"
+
+[[example]]
+name = "gate_fit"
+path = "examples/tiny_lm/gate_fit.rs"
