@@ -226,6 +226,25 @@ mod tests {
         Row { chunk, p, k, h: 0.0, d0: 1.0, dk: 2.0 }
     }
 
+    fn write_dump(name: &str, rows: &[[f32; 6]]) -> String {
+        let path = std::env::temp_dir().join(format!("gate_fit_test_{}_{name}.bin", std::process::id()));
+        let bytes: Vec<u8> = rows.iter().flatten().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(&path, bytes).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn read_rows_round_trips_the_file_format() {
+        let path = write_dump("roundtrip", &[[0.0, 0.5, 0.25, 1.5, 8.0, 12.0], [7.0, 0.125, 0.75, 0.0, 2.5, 3.0], [100.0, 1.0, 0.0625, 4.0, 0.5, 1.0]]);
+        let rows = read_rows(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(rows.len(), 3);
+        let want = [(0u32, 0.5, 0.25, 1.5, 8.0, 12.0), (7, 0.125, 0.75, 0.0, 2.5, 3.0), (100, 1.0, 0.0625, 4.0, 0.5, 1.0)];
+        for (r, w) in rows.iter().zip(want) {
+            assert_eq!((r.chunk, r.p, r.k, r.h, r.d0, r.dk), w);
+        }
+    }
+
     #[test]
     fn loss_at_the_ends_is_the_two_distributions() {
         let r = row(0, 0.2, 0.6);
