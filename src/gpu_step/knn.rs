@@ -177,6 +177,18 @@ impl KnnStore {
 
     /// `search_masked`, but the value is `DOC + byte` for keys added with `add_doc`.
     pub fn search_tagged(&self, queries: &[f32], rows: usize, mask: Option<(&[(u32, u32)], u32)>) -> Vec<(f32, u16)> {
+        self.search_from(queries, rows, mask, 0)
+    }
+
+    /// The `KMAX` nearest among keys j with lo_r <= j < hi_r for `ranges[r] = (lo_r, hi_r)`, where every `lo_r >= from_key`:
+    /// only the tiles reaching `from_key` or beyond are scanned (the in-document keys of an online memory are its last
+    /// ones); the sample-threshold pass still runs, and is needed: without thresholds the tail top-k lost the device.
+    pub fn search_tail(&self, queries: &[f32], rows: usize, ranges: &[(u32, u32)], from_key: usize) -> Vec<(f32, u16)> {
+        assert!(ranges.iter().all(|r| r.0 as usize >= from_key));
+        self.search_from(queries, rows, Some((ranges, 0)), from_key)
+    }
+
+    fn search_from(&self, queries: &[f32], rows: usize, mask: Option<(&[(u32, u32)], u32)>, from_key: usize) -> Vec<(f32, u16)> {
         assert!(self.len() >= KMAX, "need at least {KMAX} keys");
         assert_eq!(queries.len(), rows * self.d);
         let (ranges, always) = match mask {
@@ -194,7 +206,7 @@ impl KnnStore {
             let block = &queries[q0 * self.d..(q0 + q) * self.d];
             let rg = &ranges[q0..q0 + q];
             let parts = forced.unwrap_or((THREADS / q).clamp(8, 32));
-            let found = self.search_block(block, q, rg, always, parts, true, tail.as_ref()).unwrap_or_else(|| self.search_block(block, q, rg, always, parts, false, tail.as_ref()).unwrap());
+            let found = self.search_block(block, q, rg, always, parts, true, from_key, tail.as_ref()).unwrap_or_else(|| self.search_block(block, q, rg, always, parts, false, from_key, tail.as_ref()).unwrap());
             out.extend(found);
         }
         out
@@ -232,7 +244,7 @@ impl KnnStore {
 
     /// One block of `q` queries. With `thresholds`, returns None when some query's threshold left fewer than `KMAX` keys.
     #[allow(clippy::too_many_arguments)]
-    fn search_block(&self, block: &[f32], q: usize, ranges: &[(u32, u32)], always: u32, parts: usize, thresholds: bool, tail: Option<&Tile>) -> Option<Vec<(f32, u16)>> {
+    fn search_block(&self, block: &[f32], q: usize, ranges: &[(u32, u32)], always: u32, parts: usize, thresholds: bool, from_key: usize, tail: Option<&Tile>) -> Option<Vec<(f32, u16)>> {
         // Queries as the matmul wants them: f32 [q, d], or (f16) rounded, transposed to [d, qp] and padded to a multiple of 16.
         let qp = if self.f16 { q.next_multiple_of(16) } else { q };
         let rounded: Vec<f32>;
@@ -303,6 +315,10 @@ impl KnnStore {
         let slice: usize = std::env::var("KNN_SLICE").ok().and_then(|v| v.parse().ok()).unwrap_or(SLICE);
         let mut base = 0usize;
         for t in self.tiles.iter().chain(tail) {
+            if base + t.len <= from_key {
+                base += t.len;
+                continue;
+            }
             let t0 = std::time::Instant::now();
             self.dots(&t.keys, t.len, &qh, &dist, q, qp);
             if timing {
@@ -602,6 +618,25 @@ mod tests {
         }
         // Keys 400.. are tagged (a third of the keys, so some of every query's 256 nearest are), the rest are not.
         assert!(doc > 0 && doc < tagged.len());
+    }
+
+    #[test]
+    fn tail_search_equals_the_masked_search_over_the_same_ranges() {
+        let (d, n, rows, from) = (24, 2000, 30, 1500);
+        let mut rng = Rng::new(13);
+        let keys: Vec<f32> = (0..n * d).map(|_| rng.next_gaussian()).collect();
+        let vals: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let queries: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
+        let mut store = KnnStore::with_precision(d, 300, false);
+        store.add(&keys, &vals);
+        store.finish();
+        // Some queries see fewer than KMAX keys, which end in (infinity, 0) entries.
+        let ranges: Vec<(u32, u32)> = (0..rows).map(|r| (from as u32 + (r as u32 * 7) % 100, 1700 + (r as u32 * 31) % 300)).collect();
+        let (tail, masked) = (store.search_tail(&queries, rows, &ranges, from), store.search_tagged(&queries, rows, Some((&ranges, 0))));
+        assert_eq!(tail.len(), masked.len());
+        for (i, (a, b)) in tail.iter().zip(&masked).enumerate() {
+            assert!(a.0 == b.0 || (a.0 - b.0).abs() < 1e-3 * (1.0 + b.0.abs()), "entry {i}: {a:?} vs {b:?}");
+        }
     }
 
     #[test]

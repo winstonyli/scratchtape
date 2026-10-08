@@ -549,6 +549,33 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   key outside the merged top-256 is still invisible; only 2% of neighbours are in-document), re-tuning lambda and the words
   weight with this, and a learned (instead of constant) shift.
 
+- **Retune under per-source weighting (2026-10-08, slice part=3/6): flat.** Best words 0.19/0.4/15/25/40 = 1.1179 on the
+  full run's grid vs the 0.25 default 1.1182; lambda, words weight and temperatures are at their optimum.
+
+- **Step B: per-source top-256 (`search=split`, 2026-10-08).** Train keys and in-document keys are searched separately
+  (`KnnStore::search_tail` scans only the tiles from `n_train` on), KMAX=256 each, merged by distance. On the slice
+  +0.003, 50% of the neighbours then in-document. Full held-out (`scripts/tier_full_search_split.sh`,
+  `runs/tier_full_search_split.log`; 696 s, 1.1-1.7 s/chunk, ~1.5x the merged search; CPU 31% from other jobs):
+
+  | stack (knn:k:lambda:T:T_doc:shift) | CE | vs model |
+  |---|---|---|
+  | memory alone 256:0.4:15:25:50 | 1.1196 | -0.0568 |
+  | **+lexicon+words, 256:0.4:15:25:50** | **1.1138** | **-0.0626** |
+  | 256:0.4:15:25:40 | 1.1143 | -0.0621 |
+  | 256:0.4:15:25:60 | 1.1145 | -0.0619 |
+  | 256:0.4:15:40:50 | 1.1148 | -0.0615 |
+  | 256:0.5:20:40:50 | 1.1149 | -0.0615 |
+  | 64:0.4:15:25:50 | 1.1153 | -0.0611 |
+  | 256:0.4:15:25:70 | 1.1163 | -0.0600 |
+
+  Gain **0.0044** over the merged control (1.1182); memory alone 1.1238 -> 1.1196. The optimum is again flat (top five
+  within 0.0011). Best deployable stack: **1.1138 (-0.0626)**.
+  **Engineering note (crash):** the first version of the tail search skipped the sample-threshold pass ("the sample is
+  mostly older keys") and lost the GPU device (`BufferAsyncError`, "Parent device is lost") in every full run within
+  ~140 chunks, also with 1024-key slices. The cause was the missing thresholds (the sample includes in-document keys, so
+  they stay finite and cheap); with the pass restored the slice that crashed three times finishes (CE 1.1262) and the full
+  run completes, and tile skipping was not at fault.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
