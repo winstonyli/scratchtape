@@ -1142,6 +1142,26 @@ paper sections re-fetched, the Nature paper via the DeepMind post)
   gains continue up to 262K tokens of memory, and new functions or theorems
   are usable at test time without retraining. Memory the model reads but
   does not train through.
+- He, Neubig & Berg-Kirkpatrick 2021, *Efficient Nearest Neighbor Language
+  Models* ([arXiv 2109.04212](https://arxiv.org/abs/2109.04212), EMNLP 2021):
+  makes kNN-LM cheaper three ways: skip retrieval at steps a small predictor
+  marks as not needing it, prune or merge datastore entries, and PCA the keys
+  (256-512 dims matched the full 1024 at 3-4x speed). Speed, not cross-entropy;
+  relevant because our run time is ~97% kNN search.
+- Grave, Joulin & Usunier 2017, *Improving Neural Language Models with a
+  Continuous Cache* ([arXiv 1612.04426](https://arxiv.org/abs/1612.04426),
+  ICLR 2017): a cache of
+  recent hidden states used as a pointer-style distribution. Adding it to
+  kNN-LM gave about 2% perplexity on WikiText-103 (Khandelwal et al. 2020).
+  Our online in-document memory plays this role.
+- Drozdov et al. 2022, *You can't pick your neighbors, or can you? When and
+  how to rely on retrieval in the kNN-LM*
+  ([arXiv 2210.15859](https://arxiv.org/abs/2210.15859), Findings of EMNLP
+  2022): large n-gram overlap between datastore and test text drives the
+  gain, and the interpolation weight is set from retrieval quality (the
+  3.8% WikiText-103 perplexity figure is from a review page, unchecked). Our
+  uncertainty gate (best fixed weight 0.4; a gate adds ~0.001 nats) is the
+  same idea and found little.
 
 **Continual learning / memory tiers**
 - McClelland, McNaughton & O'Reilly 1995 (complementary learning

@@ -491,6 +491,27 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   gains must come from what the tiers contain (richer memory, better word model), not how they are weighted. Logs
   `runs/wg_dump.log`, `runs/wg_dump_load.log`; dumps `runs/wg_dump_k.bin`, `runs/wg_dump_w.bin`.
 
+- **Richer memory, step 1: remove the online write latency (`write=first`; 2026-10-08).** Survey: the memory's gain is
+  document-specific, and online lost 0.0033 to the offline causal memory on `part=3/6`. With `warm=32` the windows overlap
+  (a new window every 32 bytes), so the old online path already wrote every text byte once; the gap was only the
+  32-window write latency (up to ~1 KB of the most recent text invisible, because a chunk was searched before its keys
+  were written). `write=first` writes the chunk's keys before its search and gives each window's queries only the keys of
+  earlier windows (same causal rule, nothing from the future), so it stays deployable. `part=3/6`, `knn:256:0.5:15`: write
+  after -0.0374, **write first -0.0406**, causal -0.0407 (`scripts/tier_write_first.sh`; `part=5/96` is too small a slice
+  to test this: online starts a slice with an empty in-document memory, causal does not). Full held-out
+  (`scripts/tier_full_write_first.sh`, `runs/tier_full_wf.log`; 503808 positions, 384 s at 0.79 s/chunk, steady; CPU ~27%,
+  GPU otherwise idle, Defender off):
+
+  | stack | write after | write first | gain |
+  |---|---|---|---|
+  | model alone | 1.1764 | 1.1764 | |
+  | knn:256:0.5:15 | 1.1352 | 1.1322 | 0.0030 |
+  | lexicon + words + knn 0.5 | 1.1313 | 1.1282 | 0.0031 |
+  | lexicon + words + knn 0.4 | 1.1301 | **1.1274** | 0.0027 |
+
+  Best deployable stack is now 1.1274 (-0.0489). Not re-tuned: weight and temperature under `write=first` (the in-document
+  share of the memory grew), and the words weight 0.19.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
