@@ -650,6 +650,24 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   proven. A learned (supervised) projection could be worth more, but this probe says the raw metric is only mildly off. The
   fit costs ~25 s once and a 256x256 matrix multiply per key (8 threads); not yet a proper option.
 
+- **Whitened keys, full held-out run (2026-10-08): +0.0020 on the stack, +0.0033 memory alone.** Same throwaway patch
+  (`KNN_WHITEN=0.5`, `runs/whiten_diag.patch`), `runs/tier_full_whiten.log`, 656.7 s over 492 chunks (1.1-1.2 s/chunk; the
+  machine was 96% busy with other sessions at launch, so timing is not clean), `lexicon:0.3+words:1:0.25+knn:256:0.4:T:Td:S`:
+
+  | T:Td:S | stack CE | vs model |
+  |---|---|---|
+  | **30:50:100** | **1.1118** | **-0.0646** |
+  | 30:40:100 | 1.1124 | -0.0639 |
+  | 38:63:127 | 1.1131 | -0.0633 |
+  | 30:50:70 | 1.1132 | -0.0631 |
+  | 30:50:130 | 1.1132 | -0.0632 |
+  | 22:36:73 | 1.1142 | -0.0622 |
+
+  Memory alone 1.1163 (was 1.1196). Control without whitening: 1.1138 / 1.1196, so the slice's -0.0030 shrinks to -0.0020 on
+  the stack, still consistent and smooth in the grid (flat within 0.0014 around the optimum, tuned on the same text as the
+  score, so a small optimism). Cost: a ~25 s fit once plus a 256x256 multiply per key and query (8 threads); the search itself
+  is unchanged (656.7 s vs 696 s is load, not a speedup). Not yet a proper option; the patch is the reference.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
