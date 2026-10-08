@@ -282,3 +282,7 @@ path = "examples/gpu/cmma_blocking_check.rs"
 [[example]]
 name = "gate_fit"
 path = "examples/tiny_lm/gate_fit.rs"
+
+[[example]]
+name = "words_gate_fit"
+path = "examples/tiny_lm/words_gate_fit.rs"
