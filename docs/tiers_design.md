@@ -407,7 +407,7 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   done: a 4x4 or shared-memory variant, and the 2x2 kernel is not wired into `KnnStore`. If search speed matters again,
   look at top-k insertions (a coarser threshold, fewer parts' lists, or a survivor-compaction pass) before the matmul.
 
-- **Keys per top-k launch: 4096 -> 16384 (2026-10-07; `KNN_SLICE`, `runs/knn_topk_grid.ps1`, `runs/knn_topk_grid.log`).**
+- **Keys per top-k launch: 4096 -> 16384 (2026-10-07; `KNN_SLICE`, `scripts/knn_topk_grid.ps1`, log in `runs/`).**
   Block time at 5M keys (`knn_scale_check`, `QUICK=1`, best of 5, CPU 15-41%): tile 16384 / slice 4096 **884-905 ms**
   (two runs), slice 8192 762, **slice 16384 706**; tile 65536 / slice 4096 883, 16384 697, 65536 **625** (its worst round
   was 3.8-4.5 s, a warm-up or watchdog-adjacent stall, so not adopted). So launch count explains ~20-30% of a block; the
