@@ -429,6 +429,16 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   -0.0018, sigmoid -0.0001 vs best fixed 0.42 (odd half, ~2k rows); the binned table has 0.00/1.00 bins from a few rows,
   and the sigmoid weights were negative on entropy, distance and spread (lambda falls as uncertainty rises), opposite to the
   expectation, so check the sign on the full run.
+  **Larger slice (`part=5/24`, 20992 positions, 656 windows, CPU 56%, `runs/gate_slice24.bin`): Gate 0 passed again (1.01596 vs
+  logged 1.0160).** Gain over the best fixed lambda (0.45 even/odd, 0.42 early/late), held-out half: binned +0.0002 / +0.0001,
+  sigmoid **+0.0012 / +0.0010** nats; over fixed 0.5 the sigmoid gets +0.0024 / +0.0020. Both are below the 0.002 success bar
+  against best fixed, and the binned gate is under the kill line, so on this slice the gate is at best a marginal gain; the
+  full run (about 24x the positions) decides. Shape of the binned table (stable across both splits): lambda rises from ~0.2
+  at low entropy to ~0.7 at mid-high entropy, then falls to ~0.3 in the top entropy bin (the model is lost and so are its
+  neighbours); the sigmoid cannot express that hump, which is why it gets a negative entropy weight. If the full run shows
+  the same hump, a quadratic entropy term (or more entropy bins) is the next gate to try. Also added: `dump=` is written
+  atomically every 20 chunks, `gate_fit` takes several dump files (chunk ids offset by 100000 per file) and reports a second,
+  harder early/late split next to even/odd.
   **Not run yet:** `scripts/tier_gate_dump.sh` (full stack, ~14 min GPU) waits for a quiet machine (user says "uncontended").
   Tests: `cargo test --release --example gate_fit -j 8` (6 pass). Commits 3808d38..807957d.
 
