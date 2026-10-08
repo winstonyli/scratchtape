@@ -424,7 +424,11 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   and scores odd chunks. Features are `ln(1+d0)` and `(dk-d0)/(1+d0)` plus entropy (the spec said `ln d0`; harmless, distances
   are >= 0), standardised on the fit half. Success and kill are judged against the gain over the **best fixed lambda**, not
   0.5 (a gate can reproduce any constant); both are printed. Caveats: even/odd are interleaved chunks of the same books, so
-  the held-out test is weak; Gate 0 has not yet run on real data (the ~15 s slice check, `part=5/96`, is also pending).
+  the held-out test is weak. **Slice check done (`part=5/96`, 5248 positions, 6 chunks, 48% CPU; correctness only):
+  Gate 0 passed (dump CE 1.08876 vs logged 1.0888; 5248 rows = 125952 bytes).** Gate numbers on it are noise: binned
+  -0.0018, sigmoid -0.0001 vs best fixed 0.42 (odd half, ~2k rows); the binned table has 0.00/1.00 bins from a few rows,
+  and the sigmoid weights were negative on entropy, distance and spread (lambda falls as uncertainty rises), opposite to the
+  expectation, so check the sign on the full run.
   **Not run yet:** `scripts/tier_gate_dump.sh` (full stack, ~14 min GPU) waits for a quiet machine (user says "uncontended").
   Tests: `cargo test --release --example gate_fit -j 8` (6 pass). Commits 3808d38..807957d.
 
