@@ -17,8 +17,8 @@
 - Dump row formats (little-endian f32): kNN dump x6 `chunk, p_t, k_t, H, d0, dk` (existing; `p_t` is the target probability **after** words); words dump x8 `chunk, applied (0/1), p_in_t, q_t, H_in, ln(1+total), bigram (0/1), prefix_len`.
 - Stack under test: `tier=lexicon:0.3+words:1:0.25+knn:256:0.4:15`, `warm=32 stride=1 memory=online store=100000`, checkpoint `runs/nov_big_k1_d0.1_8m_m0.ckpt`.
 - Gate 0: mean loss at lambda_w = 0.25, mu = 0.4 equals the logged CE to 1e-4. Gate 0b: at every row `0.75 p_in + 0.25 q` equals the kNN dump's `p_t` to 1e-5.
-- Success: parametric gain over the best constant lambda_w > 0.002 nats per scored position on both splits. Kill: binned gain < 0.002 on either split.
-- Commit messages end with the line `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`.
+- Verdict (one, printed by `main` after both splits): **success** if the sigmoid gain over the best constant lambda_w is > 0.002 nats per scored position on both splits; otherwise **kill** if the binned gain is < 0.002 on either split; otherwise **inconclusive** (record, no wiring). Each gain is printed with a per-chunk paired standard error.
+- Commit messages end with the line `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>` (the attribution line the session's system reminder gives, for commits made by the controller or by implementers alike).
 
 ---
 
@@ -32,7 +32,7 @@
 
 - [ ] **Step 1: Read the code to adapt the steps**
 
-Read `struct Words`, `Words::new`, `Words::adjust` (about lines 195-320), `fn build_tier` (`"words"` arm near line 497), the `Tier` trait (line 90-101), the option match (`"dump"` near line 559), the dump assert (near line 586), and the dump loops in `main` (near lines 680, 699, 772). Note how many `return;` statements `Words::adjust` has and which one is the final applied branch (the last `for b in 0..VOCAB { let q = ...; probs[b] = ... }` block, reached only when the prefix is non-empty).
+Read `struct Words`, `Words::new`, `Words::adjust` (about lines 195-320), `fn build_tier` (`"words"` arm near line 497), the `Tier` trait (line 90-101), the option match (`"dump"` near line 559), the dump assert (near line 586), and the dump loops in `main` (near lines 680, 699, 772). `Words::adjust` has five early exits: the let-else `let Some(boundary) = ... else { return };` (about line 270, no semicolon) and four `return;` statements (about lines 273, 300, 306, 310; the one at 300 is inside the first-letters branch). The applied branch is the last block (about lines 308-316), `for b in 0..VOCAB { let q = ...; probs[b] = ... }`, reached only when the prefix is non-empty.
 
 - [ ] **Step 2: Add the trait hook and the Words fields**
 
@@ -43,11 +43,17 @@ In the `Tier` trait, after `fn dump(...)`, add:
     fn wdump(&self, _path: &str, _last: bool) {}
 ```
 
-Add to `struct Words` the fields `dump: Option<Vec<f32>>` and `chunk: usize`, initialise them in `Words::new` as `dump: None, chunk: 0` (the `build_tier` arm sets `dump` below). Add `fn prepare` to `impl Tier for Words` if it has none (copy the trait's signature; body `self.chunk = chunk;`; if the trait provides a default `prepare`, override it).
+Add to `struct Words` the fields `dump: Option<Vec<f32>>` and `chunk: usize`, initialise them in `Words::new` as `dump: None, chunk: 0` (the `build_tier` arm sets `dump` below). Add to `impl Tier for Words` (if the trait's `prepare` has a different parameter list, keep its types and names, underscore-prefixing the unused ones, and only use `chunk`):
+
+```rust
+    fn prepare(&mut self, chunk: usize, _hidden: &[f32], _rows: usize, _starts: &[usize]) {
+        self.chunk = chunk;
+    }
+```
 
 - [ ] **Step 3: Split `Words::adjust` into a mixing body and a recording wrapper**
 
-Rename the existing `fn adjust` body to an inherent method `fn mix(&mut self, ctx: &Ctx, probs: &mut [f64]) -> Option<(f64, bool, usize)>` in `impl Words`, returning `Some((total, bigram_found, prefix.len()))` from the final applied branch (after the `probs` update loop, with `bigram_found = found.is_some()` captured before `found` is consumed by `unwrap_or_else`) and `None` from every other `return` (change each `return;` to `return None;`). The first-letters branch (`prefix.is_empty()`) also returns `None`. Then write the trait method:
+Rename the existing `fn adjust` body to an inherent method `fn mix(&mut self, ctx: &Ctx, probs: &mut [f64]) -> Option<(f64, f64, bool, usize)>` in `impl Words`, returning `Some((q_t, total, bigram_found, prefix.len()))` from the final applied branch and `None` from every other exit: change the let-else to `else { return None };` and each of the four `return;` to `return None;` (the first-letters branch also returns `None`). `bigram_found = found.is_some()` must be captured before `found` is consumed by `unwrap_or_else`. In the final loop capture the target's word-list probability as it is computed: declare `let mut q_t = 0.0;` before the loop and inside it, after `let q = ...;`, add `if b == ctx.target { q_t = q; }`; return `Some((q_t, total, bigram_found, prefix.len()))` after the loop. Then write the trait method:
 
 ```rust
     fn adjust(&mut self, ctx: &Ctx, probs: &mut [f64]) {
@@ -58,10 +64,8 @@ Rename the existing `fn adjust` body to an inherent method `fn mix(&mut self, ct
         let p_in = probs[ctx.target];
         let h_in = -probs.iter().filter(|&&p| p > 0.0).map(|&p| p * p.ln()).sum::<f64>();
         let applied = self.mix(ctx, probs);
-        // The mix is (1 - l) p_in + l q at every byte, so q at the target follows from the result.
         let row = match applied {
-            Some((total, bigram, prefix_len)) => {
-                let q = (probs[ctx.target] - (1.0 - self.lambda) * p_in) / self.lambda;
+            Some((q, total, bigram, prefix_len)) => {
                 [self.chunk as f32, 1.0, p_in as f32, q as f32, h_in as f32, (1.0 + total).ln() as f32, bigram as u8 as f32, prefix_len as f32]
             }
             None => [self.chunk as f32, 0.0, p_in as f32, p_in as f32, h_in as f32, 0.0, 0.0, 0.0],
@@ -95,8 +99,9 @@ If the original `Words::adjust` is `fn adjust` inside `impl Tier for Words` toge
 ```rust
     if opt.contains_key("wdump") {
         assert!(opt.contains_key("dump"), "wdump needs dump= (the kNN dump it is joined with)");
-        let last = specs.last().unwrap();
-        assert!(last.contains("words:") && last.find("words:") < last.rfind("knn:"), "wdump needs the last tier= spec to have words: before its final knn:");
+        let parts: Vec<&str> = specs.last().unwrap().split('+').collect();
+        let n = parts.len();
+        assert!(n >= 2 && parts[n - 2].starts_with("words:") && parts[n - 1].starts_with("knn:") && parts.iter().filter(|p| p.starts_with("words:")).count() == 1, "wdump needs the last tier= spec to have exactly one words: part, immediately before its final knn:");
     }
 ```
 
@@ -164,6 +169,8 @@ struct Row {
     plen: f64,
     k: f64,
     d0: f64,
+    /// d0 == 0 and dk == 0: the kNN tier found no neighbours (or every distance clamped to 0); counted, see main.
+    noneigh: bool,
 }
 
 fn read_f32(path: &str, width: usize) -> Vec<Vec<f32>> {
@@ -180,11 +187,10 @@ fn join(w: &[Vec<f32>], k: &[Vec<f32>], lw0: f64) -> Vec<Row> {
         .enumerate()
         .map(|(i, (w, k))| {
             assert_eq!(w[0], k[0], "row {i}: chunk ids differ ({} vs {})", w[0], k[0]);
-            assert!(!(k[4] == 0.0 && k[5] == 0.0), "row {i}: the kNN tier found no neighbours (not supported)");
             let (p, q) = (w[2] as f64, w[3] as f64);
             let mixed = (1.0 - lw0) * p + lw0 * q;
             assert!((mixed - k[1] as f64).abs() < 1e-5, "gate 0b, row {i}: (1-lw0) p_in + lw0 q = {mixed}, the kNN dump has {}", k[1]);
-            Row { chunk: w[0] as u32, applied: w[1] > 0.5, p, q, h: w[4] as f64, tot: w[5] as f64, bi: w[6] as f64, plen: w[7] as f64, k: k[2] as f64, d0: k[4] as f64 }
+            Row { chunk: w[0] as u32, applied: w[1] > 0.5, p, q, h: w[4] as f64, tot: w[5] as f64, bi: w[6] as f64, plen: w[7] as f64, k: k[2] as f64, d0: k[4] as f64, noneigh: k[4] == 0.0 && k[5] == 0.0 }
         })
         .collect()
 }
@@ -346,11 +352,30 @@ fn fit_gate(applied: &[Row], mu: f64, init: f64, iters: usize) -> Gate {
     g
 }
 
-fn report(label: &str, mu: f64, lw0: f64, fit: &[Row], score: &[Row]) {
+/// Mean per-row loss of `a` minus that of `b` on `rows` (positive: b is better) and its standard error over chunks
+/// (rows are grouped by chunk, so the chunk is the unit of resampling).
+fn gain_se(rows: &[Row], mu: f64, a: impl Fn(&Row) -> f64, b: impl Fn(&Row) -> f64) -> (f64, f64) {
+    let mut sums: Vec<(u32, f64)> = vec![];
+    for r in rows {
+        let d = loss(r, mu, a(r)) - loss(r, mu, b(r));
+        match sums.last_mut() {
+            Some((c, s)) if *c == r.chunk => *s += d,
+            _ => sums.push((r.chunk, d)),
+        }
+    }
+    let (n, c) = (rows.len() as f64, sums.len() as f64);
+    let total: f64 = sums.iter().map(|x| x.1).sum();
+    let mean = total / c;
+    let var = sums.iter().map(|x| (x.1 - mean).powi(2)).sum::<f64>() / (c - 1.0).max(1.0);
+    (total / n, (c * var).sqrt() / n)
+}
+
+/// Prints one split's results and returns (binned gain, sigmoid gain) over the best constant, or None if skipped.
+fn report(label: &str, mu: f64, lw0: f64, fit: &[Row], score: &[Row]) -> Option<(f64, f64)> {
     let applied: Vec<Row> = fit.iter().filter(|r| r.applied).copied().collect();
     if applied.len() < 100 || score.is_empty() {
         println!("[{label}] skipped: {} applied fit rows, {} score rows", applied.len(), score.len());
-        return;
+        return None;
     }
     let (lam, ce) = best_fixed(fit, mu);
     let at_lw0 = mean_fixed(score, mu, lw0);
@@ -359,20 +384,18 @@ fn report(label: &str, mu: f64, lw0: f64, fit: &[Row], score: &[Row]) {
     println!("[{label}] constant {lw0}: score {at_lw0:.5}; best constant on fit = {lam:.2}: fit {ce:.5}, score {best:.5}");
     let b = Binned::fit(&applied, mu);
     let binned = mean_gated(score, mu, |r| b.lambda(r));
-    println!("[{label}] binned (bigram x entropy quartile): score {binned:.5} (gain {:+.5} vs {lw0}, {:+.5} vs best constant)", at_lw0 - binned, best - binned);
+    let (gb, seb) = gain_se(score, mu, |_| lam, |r| b.lambda(r));
+    println!("[{label}] binned (bigram x entropy quartile): score {binned:.5} (gain {:+.5} vs {lw0}, {gb:+.5} +- {seb:.5} vs best constant)", at_lw0 - binned);
     for bi in 0..2 {
         println!("[{label}]   bigram={bi}: lambda by entropy quartile low->high {}", (0..4).map(|j| format!("{:.2}", b.lam[bi * 4 + j])).collect::<Vec<_>>().join("  "));
     }
     println!("[{label}]   entropy edges {:?}", b.h_edges.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>());
     let g = fit_gate(&applied, mu, lam.clamp(0.01, 0.99), 500);
     let param = mean_gated(score, mu, |r| g.lambda(r));
-    println!("[{label}] sigmoid gate: fit {:.5}, score {param:.5} (gain {:+.5} vs {lw0}, {:+.5} vs best constant)", mean_gated(fit, mu, |r| g.lambda(r)), at_lw0 - param, best - param);
+    let (gp, sep) = gain_se(score, mu, |_| lam, |r| g.lambda(r));
+    println!("[{label}] sigmoid gate: fit {:.5}, score {param:.5} (gain {:+.5} vs {lw0}, {gp:+.5} +- {sep:.5} vs best constant)", mean_gated(fit, mu, |r| g.lambda(r)), at_lw0 - param);
     println!("[{label}]   w = {:?} on [1, entropy_in, ln(1+count), bigram, prefix_len, ln(1+d0)] (standardised on the fit half)", g.w.map(|x| (x * 1000.0).round() / 1000.0));
-    println!(
-        "[{label}] verdict: binned gain {:.4}, sigmoid gain {:.4} nats per position over the best constant (success: sigmoid > 0.002 on both splits; kill: binned < 0.002 on either)",
-        best - binned,
-        best - param
-    );
+    Some((gb, gp))
 }
 
 fn main() {
@@ -400,10 +423,26 @@ fn main() {
         }
         None => println!("gate 0 NOT checked (no logged=<CE>)"),
     }
+    let nn = rows.iter().filter(|r| r.noneigh).count();
+    if nn > 0 {
+        println!("note: {nn} rows have d0 = dk = 0 (no neighbours, or every distance clamped to 0); gate 0 shows whether they matter");
+    }
     let (fit, score) = split_parity(&rows);
-    report("even/odd", mu, lw0, &fit, &score);
+    let a = report("even/odd", mu, lw0, &fit, &score);
     let (fit, score) = split_halves(&rows);
-    report("early/late", mu, lw0, &fit, &score);
+    let b = report("early/late", mu, lw0, &fit, &score);
+    let (Some((b1, p1)), Some((b2, p2))) = (a, b) else {
+        println!("verdict: inconclusive (a split was skipped)");
+        return;
+    };
+    let verdict = if p1 > 0.002 && p2 > 0.002 {
+        "SUCCESS: sigmoid gain > 0.002 on both splits"
+    } else if b1 < 0.002 || b2 < 0.002 {
+        "KILL: binned gain < 0.002 on a split"
+    } else {
+        "inconclusive: neither the success nor the kill condition holds"
+    };
+    println!("verdict: {verdict} (sigmoid {p1:.4} / {p2:.4}, binned {b1:.4} / {b2:.4} nats per position over the best constant, even/odd / early/late)");
 }
 
 #[cfg(test)]
@@ -423,7 +462,7 @@ mod tests {
                 let high = u() < 0.5;
                 let applied = u() < 0.8;
                 let (p, q) = if high { (0.05, 0.6) } else { (0.8, 0.1) };
-                Row { chunk: i / 20, applied, p, q: if applied { q } else { p }, h: if high { 3.0 + u() } else { 0.5 * u() }, tot: 1.0 + 3.0 * u(), bi: (u() < 0.5) as u8 as f64, plen: 1.0 + 5.0 * u(), k: 0.2, d0: 5.0 + 20.0 * u() }
+                Row { chunk: i / 20, applied, p, q: if applied { q } else { p }, h: if high { 3.0 + u() } else { 0.5 * u() }, tot: 1.0 + 3.0 * u(), bi: (u() < 0.5) as u8 as f64, plen: 1.0 + 5.0 * u(), k: 0.2, d0: 5.0 + 20.0 * u(), noneigh: false }
             })
             .collect()
     }

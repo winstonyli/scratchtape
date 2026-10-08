@@ -28,8 +28,8 @@ Everything else is untouched, so for a position `i` the loss at weight `l` is
 
 Valid offline because words only sees `p_in` (earlier tiers) and the kNN search does not depend on words or on mu
 (it uses hidden states and the online memory, which holds bytes). If a position has no kNN neighbours the kNN tier leaves p alone
-(`k_t` would equal `p_w,t`); with the train keys always visible this does not occur in the online run, so `gate_fit_words`
-asserts there are none (rows with `d0 == 0 && dk == 0`) instead of handling them.
+(`k_t` would equal `p_w,t`); with the train keys always visible this should not occur in the online run, and distances are
+clamped at 0, so `words_gate_fit` counts rows with `d0 == 0 && dk == 0`, prints the count, and lets Gate 0 show whether they matter.
 
 ## Dumps
 
@@ -39,8 +39,8 @@ Two files, one row per scored position of the last spec, in scoring order (so ro
 - a new words dump (`wdump=`; f32 x 8): `chunk, applied (0/1), p_in_t, q_t, H_in, ln(1+total), bigram (0/1), prefix_len`.
   `H_in` is the natural-log entropy of `p_in`. For unapplied rows `q_t = p_in_t` and the last three features are 0.
 
-`wdump=` is valid only when the last spec has a `words:` part before a final `knn:` part, like `dump=`; both options are
-required together. Same atomic write every 20 chunks.
+`wdump=` is valid only when the last spec has exactly one `words:` part, immediately before the final `knn:` part, and `first`
+letters are off; `dump=` is required with it. Same atomic write every 20 chunks.
 
 ## Offline tool
 
@@ -61,11 +61,14 @@ New example `words_gate_fit` (`examples/tiny_lm/words_gate_fit.rs`) reads both d
 
 ## Success and kill
 
-- **Success:** parametric gain over the best constant is greater than 0.002 nats on both splits. Then follow up by wiring the
-  gate into the stack (it needs the kNN search before words; the search is independent of words, so reordering is safe) and
+One verdict, printed after both splits, in this order:
+- **Success:** sigmoid gain over the best constant is greater than 0.002 nats per position on both splits. Then follow up by wiring
+  the gate into the stack (it needs the kNN search before words; the search is independent of words, so reordering is safe) and
   checking the whole-stack CE.
-- **Kill:** binned gain under 0.002 on either split. Record it and stop gating the tiers; the gain is in the memory's content.
-- In between: record, no wiring.
+- **Kill** (otherwise): binned gain under 0.002 on either split. Record it and stop gating the tiers; the gain is in the memory's content.
+- **Inconclusive** (otherwise): record, no wiring.
+Each gain is printed with a per-chunk paired standard error so a near-threshold result can be judged.
+The two gates differ in features (binned: bigram flag and entropy; sigmoid also sees count mass, prefix length and d0).
 
 ## Cost and risks
 
