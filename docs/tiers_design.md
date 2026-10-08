@@ -576,6 +576,22 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   they stay finite and cheap); with the pass restored the slice that crashed three times finishes (CE 1.1262) and the full
   run completes, and tile skipping was not at fault.
 
+- **Richer values: the model's surprise at the stored position (2026-10-08): KILL.** Survey option 3. Idea: store, with
+  each key's byte, -ln p(true byte) the model had there, and let it scale the neighbour's weight. Diagnostic (flat
+  memory, `part=3/6`, 82 chunks, 6 surprise bins): neighbour hit rate falls steeply with key surprise (rank 0-7:
+  95.1% / 73.5% / 41.0% / 15.2% / 5.1% / 1.6% for <0.1 / <0.5 / <1.5 / <3 / <5 / >=5 nats; surprise matters more than
+  distance rank), but this is confounded with the byte being hard anywhere. Direct test, weight x exp(-beta * surprise):
+
+  | beta | -0.5 | -0.3 | -0.2 | -0.1 | -0.05 | **0** | 0.1 | 0.2 | 0.3 | 0.5 | 0.8 |
+  |---|---|---|---|---|---|---|---|---|---|---|---|
+  | CE | 1.1440 | 1.1219 | 1.1162 | 1.1135 | 1.1130 | **1.1130** | 1.1141 | 1.1163 | 1.1192 | 1.1259 | 1.1360 |
+
+  The optimum is beta = 0 (-0.05 ties it): the mixture and distance weighting already capture what the surprise says, so a
+  stored surprise adds nothing in either direction. Logs `runs/tier_surprise.log`, `tier_surprise_beta.log`,
+  `tier_surprise_beta2.log`; the code (a `KnnStore::add_raw` plus a `beta` spec field) was reverted, kept as
+  `runs/key_surprise_diag.patch` (git-ignored). Remaining richer-value idea: store the next several bytes (option 2 of
+  the survey), not tried.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
