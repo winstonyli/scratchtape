@@ -407,9 +407,8 @@ impl Store {
                 on.doc_first_key[doc] = Some(gpu.len());
             }
             let rows = j * SEQ_LEN + warm..(j + 1) * SEQ_LEN;
+            // `len()` counts keys not yet uploaded, so no flush per window (that made one 32-key device tile per window).
             gpu.add(&hidden[rows.start * d..rows.end * d], &targets[rows].iter().map(|&t| t as u8).collect::<Vec<_>>());
-            // Flush per window so `len()` is the number of keys written so far.
-            gpu.finish();
         }
     }
 }

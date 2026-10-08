@@ -54,7 +54,7 @@ pub struct KnnStore {
     /// distances carry f16 rounding (~1e-3 relative); norms are taken from the rounded vectors so a distance is exactly
     /// the squared distance between the rounded vectors.
     f16: bool,
-    /// Wall time spent in `flush` so far: host copy + norms, then upload (diagnostic).
+    /// Wall time spent in `flush` so far: [host copy + norms + upload, unused] (diagnostic).
     pub flush_time: [std::time::Duration; 2],
     /// Device copy of `sample_keys` as (keys, norms, len) chunks, with the sample count it was built from.
     sample_dev: RefCell<(usize, Vec<(Handle, Handle, usize)>)>,
@@ -95,7 +95,8 @@ impl KnnStore {
         }
     }
 
-    /// Uploads whatever is pending as a final, smaller tile. Call once after the last `add`.
+    /// Uploads whatever is pending as a final, smaller tile. Optional before a search (which handles pending keys), but
+    /// call it once after the last `add` of a store that is built once and searched many times.
     pub fn finish(&mut self) {
         let n = self.pending_vals.len();
         if n > 0 {
@@ -106,17 +107,21 @@ impl KnnStore {
     fn flush(&mut self, n: usize) {
         let t0 = std::time::Instant::now();
         let keys: Vec<f32> = self.pending_keys.drain(..n * self.d).collect();
-        let first = self.len();
+        let first = self.uploaded();
         for i in (first.next_multiple_of(SAMPLE_STRIDE) - first..n).step_by(SAMPLE_STRIDE) {
             self.sample_keys.extend_from_slice(&keys[i * self.d..(i + 1) * self.d]);
         }
         let vals: Vec<u8> = self.pending_vals.drain(..n).collect();
-        let vals_f: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
-        let (key_h, norms) = self.upload_keys(&keys);
+        let tile = self.tile_of(&keys, &vals);
         self.flush_time[0] += t0.elapsed();
-        let t0 = std::time::Instant::now();
-        self.tiles.push(Tile { keys: key_h, norms: upload_f32(&norms), vals: upload_f32(&vals_f), len: n });
-        self.flush_time[1] += t0.elapsed();
+        self.tiles.push(tile);
+    }
+
+    /// Device tile for `keys` (row-major [vals.len(), d]) and their values.
+    fn tile_of(&self, keys: &[f32], vals: &[u8]) -> Tile {
+        let vals_f: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
+        let (key_h, norms) = self.upload_keys(keys);
+        Tile { keys: key_h, norms: upload_f32(&norms), vals: upload_f32(&vals_f), len: vals.len() }
     }
 
     /// Device copy of `keys` (row-major [n, d]) in the store's precision, and the norms of what was stored. The f16 copy
@@ -137,7 +142,12 @@ impl KnnStore {
         self.f16
     }
 
+    /// Keys added so far, uploaded or still pending.
     pub fn len(&self) -> usize {
+        self.uploaded() + self.pending_vals.len()
+    }
+
+    fn uploaded(&self) -> usize {
         self.tiles.iter().map(|t| t.len).sum()
     }
 
@@ -150,7 +160,6 @@ impl KnnStore {
     /// lo_r <= j < hi_r, for `mask = Some((ranges, always))`, ranges[r] = (lo_r, hi_r). With fewer than `KMAX` allowed
     /// keys the list ends in (infinity, 0) entries. This is how a memory is made causal: a query sees only keys older than it.
     pub fn search_masked(&self, queries: &[f32], rows: usize, mask: Option<(&[(u32, u32)], u32)>) -> Vec<(f32, u8)> {
-        assert!(self.pending_vals.is_empty(), "call finish() before search");
         assert!(self.len() >= KMAX, "need at least {KMAX} keys");
         assert_eq!(queries.len(), rows * self.d);
         let (ranges, always) = match mask {
@@ -158,6 +167,9 @@ impl KnnStore {
             None => (vec![(0, u32::MAX); rows], 0),
         };
         assert_eq!(ranges.len(), rows);
+        // Keys not yet in a full tile are searched as a transient last tile (an online memory adds a few keys at a time;
+        // uploading each addition as its own tile made every search launch for thousands of tiny tiles).
+        let tail = (!self.pending_vals.is_empty()).then(|| self.tile_of(&self.pending_keys, &self.pending_vals));
         let forced: Option<usize> = std::env::var("KNN_PARTS").ok().and_then(|v| v.parse().ok());
         let mut out = Vec::with_capacity(rows * KMAX);
         for q0 in (0..rows).step_by(QBLOCK) {
@@ -165,7 +177,7 @@ impl KnnStore {
             let block = &queries[q0 * self.d..(q0 + q) * self.d];
             let rg = &ranges[q0..q0 + q];
             let parts = forced.unwrap_or((THREADS / q).clamp(8, 32));
-            let found = self.search_block(block, q, rg, always, parts, true).unwrap_or_else(|| self.search_block(block, q, rg, always, parts, false).unwrap());
+            let found = self.search_block(block, q, rg, always, parts, true, tail.as_ref()).unwrap_or_else(|| self.search_block(block, q, rg, always, parts, false, tail.as_ref()).unwrap());
             out.extend(found);
         }
         out
@@ -203,7 +215,7 @@ impl KnnStore {
 
     /// One block of `q` queries. With `thresholds`, returns None when some query's threshold left fewer than `KMAX` keys.
     #[allow(clippy::too_many_arguments)]
-    fn search_block(&self, block: &[f32], q: usize, ranges: &[(u32, u32)], always: u32, parts: usize, thresholds: bool) -> Option<Vec<(f32, u8)>> {
+    fn search_block(&self, block: &[f32], q: usize, ranges: &[(u32, u32)], always: u32, parts: usize, thresholds: bool, tail: Option<&Tile>) -> Option<Vec<(f32, u8)>> {
         // Queries as the matmul wants them: f32 [q, d], or (f16) rounded, transposed to [d, qp] and padded to a multiple of 16.
         let qp = if self.f16 { q.next_multiple_of(16) } else { q };
         let rounded: Vec<f32>;
@@ -271,7 +283,7 @@ impl KnnStore {
             t_mm += t_pass1;
         }
         let mut base = 0usize;
-        for t in &self.tiles {
+        for t in self.tiles.iter().chain(tail) {
             let t0 = std::time::Instant::now();
             self.dots(&t.keys, t.len, &qh, &dist, q, qp);
             if timing {
@@ -582,6 +594,42 @@ mod tests {
     }
 
     /// Enough keys for the threshold pass to engage (sample of n / 64 keys), with masks, against a CPU brute force.
+    #[test]
+    fn pending_keys_are_searched_without_one_tile_per_add() {
+        // An online memory adds 32 keys at a time and searches after each: no finish(), so adds must not become tiles,
+        // `len()` counts pending keys, and the pending tail is found (also under a mask that points into it).
+        let (d, rows, step) = (16, 12, 32);
+        let mut rng = Rng::new(5);
+        let keys: Vec<f32> = (0..3200 * d).map(|_| rng.next_gaussian()).collect();
+        let vals: Vec<u8> = (0..3200).map(|i| (i % 251) as u8).collect();
+        let queries: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
+        let mut store = KnnStore::with_precision(d, 1024, false);
+        for n in (step..=3200).step_by(step) {
+            store.add(&keys[(n - step) * d..n * d], &vals[n - step..n]);
+            assert_eq!(store.len(), n);
+            if n < KMAX || n % 320 != 0 {
+                continue;
+            }
+            let lo = (n - 100) as u32; // allowed: the newest 100 keys, which sit in the tail unless a tile just filled
+            let ranges = vec![(lo, n as u32); rows];
+            for (mask, label) in [(None, "plain"), (Some((&ranges[..], 0u32)), "masked")] {
+                let got = store.search_masked(&queries, rows, mask);
+                for r in 0..rows {
+                    let q = &queries[r * d..(r + 1) * d];
+                    let mut all: Vec<f32> = (if mask.is_some() { lo as usize } else { 0 }..n)
+                        .map(|i| keys[i * d..(i + 1) * d].iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum())
+                        .collect();
+                    all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    for j in 0..KMAX.min(all.len()) {
+                        let g = got[r * KMAX + j].0;
+                        assert!((g - all[j]).abs() < 1e-3 * (1.0 + all[j]), "{label} n {n} query {r} rank {j}: gpu {g} vs cpu {}", all[j]);
+                    }
+                }
+            }
+        }
+        assert_eq!(store.tiles.len(), 3, "3200 keys in tiles of 1024 are 3 full tiles, the rest pending");
+    }
+
     #[test]
     fn search_stays_exact_while_the_store_grows() {
         // Tiles of 64 make sample chunks of 64 sample keys (3904 keys): growth crosses chunk boundaries between searches.

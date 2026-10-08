@@ -24,12 +24,12 @@ fn fill(store: &mut KnnStore, rng: &mut Rng, from: usize, to: usize) {
     store.finish();
 }
 
-/// The online memory's write pattern: `window` keys then `finish()`, so every window becomes its own small tile.
+/// The online memory's write pattern: `window` keys at a time, no `finish()`. (With a `finish()` after each window, as
+/// tier_eval used to do, every window became its own tile: 5M + 500k keys took 4.4 s per block instead of ~1 s.)
 fn fill_small(store: &mut KnnStore, rng: &mut Rng, n: usize, window: usize) {
     for lo in (0..n).step_by(window) {
         let keys: Vec<f32> = (0..window * D).map(|_| rng.next_gaussian()).collect();
         store.add(&keys, &vec![(lo % 251) as u8; window]);
-        store.finish();
     }
 }
 
@@ -60,11 +60,11 @@ fn main() {
     }
     std::thread::sleep(Duration::from_secs(60));
     time(&store, &queries, "same 5M store after 60 s idle");
-    // tier_eval's online writes: 32 keys (SEQ_LEN 64 - warm 32) per window, finish() after each; 500k keys = 15625 tiles.
+    // tier_eval's online writes: 32 keys (SEQ_LEN 64 - warm 32) per window; 500k keys.
     for added in [125_000, 250_000, 500_000] {
         let have = store.len() - 5_000_000;
         fill_small(&mut store, &mut rng, added - have, 32);
-        time(&store, &queries, &format!("5M + {added} in 32-key tiles"));
+        time(&store, &queries, &format!("5M + {added} added 32 at a time"));
     }
     drop(store);
     let mut fresh = KnnStore::new(D, TILE);
