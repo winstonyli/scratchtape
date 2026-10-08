@@ -471,10 +471,25 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   (success: sigmoid > 0.002 on both splits; kill: binned < 0.002 on either; else inconclusive) with per-chunk standard errors.
   Slice check (`part=5/96`, 5248 positions, quiet machine): both dumps 5248 rows, Gate 0b and Gate 0 passed (1.08783 vs
   logged 1.0878); the slice gains are noise (sigmoid -0.0033/+0.0005 +-0.002).
-  **In flight: `scripts/tier_words_gate_dump.sh`, started 2026-10-08 04:54:38, `tier_eval_run` PID 81180 (Normal), expected 8-15
-  min, quiet machine at launch (CPU 13%, no leases, no other eGPU users).** Logs `runs/wg_dump.log`, load
-  `runs/wg_dump_load.log`; dumps `runs/wg_dump_k.bin`, `runs/wg_dump_w.bin`. Then:
-  `words_gate_fit runs/wg_dump_w.bin runs/wg_dump_k.bin logged=<CE>`.
+  **Full run done (`scripts/tier_words_gate_dump.sh`, 2026-10-08 04:54-05:02, quiet at launch: CPU 13%, no leases; during the run
+  mean CPU 49% (the run itself) and `WizardGraphicalClient` on the eGPU for ~5 of 14 samples): 503808 positions (379168 with words
+  applied), 417.2 s (flat 0.72-1.02 s/chunk), CE 1.1301 (-0.0462 vs the model), which confirms the predicted CE at kNN weight 0.4
+  (1.1313 at 0.5). Gate 0b and Gate 0 passed.** Words weight gains over the best constant (0.19) on the held-out half, nats per
+  position, mean +- per-chunk standard error:
+
+  | split | binned | sigmoid |
+  |---|---|---|
+  | even/odd | +0.00021 +- 0.00004 | +0.00039 +- 0.00008 |
+  | early/late | +0.00012 +- 0.00005 | +0.00042 +- 0.00008 |
+
+  **Verdict: KILL (binned < 0.002); the sigmoid gate is also ~5x short of the bar.** The effects are real in the statistical
+  sense (several standard errors) but four hundredths of a percent of the CE: a per-position words weight is not where the
+  remaining gain is. Shape: the best weight rises with the model's entropy (0.06 at the lowest quartile to 0.2-0.26 at the
+  highest) and slightly with a bigram hit; moving the constant from 0.25 to 0.19 alone gains ~0.0002-0.0003, so retuning
+  `words:1:0.19` is the cheap leftover (about +0.0003 nats; confirm with one run). With the kNN gate (also killed, +0.001)
+  this closes mixture-weight gating for the current tiers: the weights are within ~0.001 nats of optimal either way, so
+  gains must come from what the tiers contain (richer memory, better word model), not how they are weighted. Logs
+  `runs/wg_dump.log`, `runs/wg_dump_load.log`; dumps `runs/wg_dump_k.bin`, `runs/wg_dump_w.bin`.
 
 ## Order
 
