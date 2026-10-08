@@ -454,7 +454,9 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   mid entropy and short distance, lowest (~0.3) at the top-entropy bin and at large distances; the sigmoid fits negative
   weights on entropy and ln(1+d0), so the hump seen on the 21k slice is weaker here. The 4x4 table is smooth and stable
   across both splits, so the signal is real but small; a quadratic entropy term might add a few 1e-4, not 2e-3. Practical
-  takeaway: set the kNN weight to ~0.4 (the fixed-0.4 gain over 0.5 is ~0.001 on the held-out half) and look for the next
+  takeaway: use a kNN weight of 0.4 in future `tier=...knn:256:0.4:15` specs (no code default to change; lambda is only a spec
+  argument in `scripts/`; the online memory does not depend on lambda, so the dump already gives the exact CE at 0.4, about
+  1.1301 against 1.1313 from the odd/even halves, and a confirming run adds nothing) and look for the next
   tier gain elsewhere (gate the CPU tiers, or a richer memory), not in lambda. Timing (448.6 s vs 825.6 s for tier_full9)
   is not like-for-like: this run scored one spec instead of six, dropped `KNN_TIMING`, and used slice 16384, so it neither
   confirms the slice gain nor the 826 s figure. The even/odd halves share books, hence the early/late split next to it.
