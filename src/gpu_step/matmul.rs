@@ -551,7 +551,7 @@ fn matmul_cmma(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
     let (bg, bi, ldb) = b.layout(if b.trans { k } else { n });
     let (og, oi, ldo) = out.layout(n);
     // cmma::store straight to global memory needs aligned offsets; otherwise (or with an epilogue) go through shared memory.
-    let direct = epi_free && !accumulate && out.off % 4 == 0 && out.stride % 4 == 0 && oi % 4 == 0 && ldo % 4 == 0;
+    let direct = epi_free && out.off % 4 == 0 && out.stride % 4 == 0 && oi % 4 == 0 && ldo % 4 == 0;
     super::count_launch_as(|| {
         let t = |x: bool| if x { "T" } else { "N" };
         let ops = [(epi.bias.is_some(), " +bias"), (epi.relu, " relu"), (epi.mask.is_some(), " mask"), (epi.residual.is_some(), " +res"), (epi.accumulate, " +="), (epi.col_sum.is_some(), " +colsum")];
@@ -707,6 +707,24 @@ fn k_matmul_cmma(
     #[unroll]
     for _i in 0..fm_n * fn_n {
         acc.push(cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0));
+    }
+    if accumulate {
+        if direct {
+            // `+=` straight on the fragments: out's current values are the accumulators' start (all fragments' loads
+            // issued together, instead of a dependent read-modify-write per element behind barriers).
+            #[unroll]
+            for i in 0..fm_n {
+                #[unroll]
+                for j in 0..fn_n {
+                    let gm0 = CUBE_POS_Y * bm + (UNIT_POS_Y / pn) * fm * 16 + i as u32 * 16;
+                    let gn0 = CUBE_POS_X * bn + (UNIT_POS_Y % pn) * fnn * 16 + j as u32 * 16;
+                    let z = CUBE_POS_Z;
+                    let o0 = (z / o_group) * o_stride + (z % o_group) * o_inner;
+                    let len = out.len();
+                    cmma::load_with_layout(acc.index_mut(i * fn_n + j), &out[(o_off + o0 + gm0 * ldo + gn0) as usize..len], ldo, cmma::MatrixLayout::RowMajor);
+                }
+            }
+        }
     }
 
     // Column sum of the f32 B values this unit stages (not transposed: its column is tid % bn, as threads is a multiple
@@ -950,6 +968,8 @@ mod tests {
             (1, 256, 128, 256, false, true, false, false, false, false, false), // more stages, 4 tiles
             (1, 256, 128, 128, false, false, true, true, false, false, false),
             (2, 128, 64, 96, false, false, true, true, false, true, false), // n = 96: the 64x32 tile, everything but the mask
+            (3, 64, 64, 64, true, false, false, false, false, false, true), // accumulated on the fragments (no split)
+            (2, 128, 64, 96, false, true, false, false, false, false, true), // same, 64x32 tile
             (1, 128, 1024, 128, true, false, false, false, false, false, false), // split 8, no epilogue
             (1, 128, 1024, 128, true, false, false, false, false, false, true), // split, accumulated
             (3, 64, 1024, 64, true, false, false, false, false, false, true), // batched split
