@@ -14,7 +14,7 @@
 //!   models' rows, model m's the m-th slice. Linear runs as a K-batch
 //!   matmul over the models' weights; ops without parameters don't care.
 use super::matmul::{Epilogue, MatRef, matmul};
-use super::rows::{LnOut, col_sum, layer_norm, layer_norm_backward, softmax, softmax_backward};
+use super::rows::{LnOut, layer_norm, layer_norm_backward, softmax, softmax_backward};
 use super::tokens::{CeOut, cross_entropy, cross_entropy_backward, embed, embed_backward, upload_ids};
 use super::{DeviceParams, EW_DIM, buf, client, cubes, k_fill};
 use cubecl::prelude::*;
@@ -315,7 +315,7 @@ impl<'p> DeviceTape<'p> {
                     let out = cols;
                     let xv = self.nodes[x].value.clone();
                     // Per model (the matmuls' batch): dW += xᵀ dz, db +=
-                    // colsum(dz), dx (+)= dz Wᵀ
+                    // colsum(dz) (inside the dW matmul), dx (+)= dz Wᵀ
                     let rpm = rows / m.k;
                     let (xs, dzs) = (MatRef { stride: rpm * inp, ..MatRef::new(&xv) }, MatRef { stride: rpm * out, ..MatRef::new(&dz) });
                     matmul(
@@ -326,9 +326,8 @@ impl<'p> DeviceTape<'p> {
                         inp,
                         rpm,
                         out,
-                        Epilogue { accumulate: true, ..Default::default() },
+                        Epilogue { accumulate: true, col_sum: Some((w_off + inp * out, m.stride)), ..Default::default() },
                     );
-                    col_sum(&dz, rows, out, &grads, w_off + inp * out, m);
                     let (dx, acc) = self.grad_slot(x, true);
                     matmul(
                         dzs,

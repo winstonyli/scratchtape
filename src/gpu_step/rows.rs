@@ -1,6 +1,7 @@
 //! Row-wise kernels (milestone 2): LayerNorm forward and backward, Softmax
 //! (plain or softmax1, with the causal mask and score scale folded in) and
-//! its backward, and the column sum that gives bias gradients.
+//! its backward. (Bias gradients are column sums folded into the weight-gradient
+//! matmul, see `matmul::Epilogue::col_sum`.)
 //!
 //! A row reduction runs one cube of `ROW_DIM` units per row; a column
 //! reduction runs cubes of `COL_W` columns × `COL_LANES` row lanes. Each
@@ -119,14 +120,6 @@ pub fn softmax_backward(dy: &Handle, y: &Handle, rows: usize, n: usize, scale: f
     super::count_launch();
     k_softmax_bwd::launch(client(), count, dim, whole(dy), whole(y), whole(&dx), n as u32, scale);
     dx
-}
-
-/// out[off + j] += sum over rows of x[r, j], for x [rows, n]: a bias
-/// gradient. Per model under `m`: model k's rows into k·stride + off.
-pub fn col_sum(x: &Handle, rows: usize, n: usize, out: &Handle, off: usize, m: Models) {
-    let (count, dim) = per_cols(n, m.k);
-    super::count_launch();
-    k_col_sum::launch(client(), count, dim, whole(x), whole(out), (rows / m.k) as u32, n as u32, off as u32, m.stride as u32);
 }
 
 /// The sum over the cube's units of `v` (or the max, with `max`),
@@ -342,26 +335,6 @@ fn k_softmax_bwd(dy: &[f32], y: &[f32], dx: &mut [f32], n: u32, scale: f32) {
     }
 }
 
-#[cube(launch)]
-fn k_col_sum(x: &[f32], out: &mut [f32], rows: u32, n: u32, off0: u32, stride: u32) {
-    let tx = UNIT_POS_X;
-    let lane = UNIT_POS_Y;
-    let j = CUBE_POS_X * COL_W + tx;
-    let r0 = CUBE_POS_Y * rows;
-    let off = off0 + CUBE_POS_Y * stride;
-    let mut p = 0.0f32;
-    if j < n {
-        let mut r = lane;
-        while r < rows {
-            p += x[((r0 + r) * n + j) as usize];
-            r += COL_LANES;
-        }
-    }
-    let total = lane_reduce(p, tx, lane);
-    if lane == 0 && j < n {
-        out[(off + j) as usize] += total;
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -507,21 +480,5 @@ mod tests {
                 finite_diff(&x, &r, &dx, |xs| read(&softmax(&upload(xs), rows, t, t, scale, true, one)), &what);
             }
         }
-    }
-
-    /// Needs the discrete GPU. Bias gradient = column sum, accumulated at an
-    /// offset.
-    #[test]
-    #[ignore = "needs the discrete GPU"]
-    fn col_sum_accumulates_bias_gradient() {
-        let (rows, n, off) = (70, 33, 4);
-        let mut rng = Rng::new(2);
-        let x = gauss(&mut rng, rows * n);
-        let out = upload(&vec![1.0f32; off + n + 2]);
-        col_sum(&upload(&x), rows, n, &out, off, Models::ONE);
-        let got = read(&out);
-        let want: Vec<f32> = (0..n).map(|j| 1.0 + (0..rows).map(|r| x[r * n + j]).sum::<f32>()).collect();
-        assert!(rel_err(&got[off..off + n], &want) < 1e-5);
-        assert!(got[..off].iter().chain(&got[off + n..]).all(|&v| v == 1.0));
     }
 }

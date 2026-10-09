@@ -71,6 +71,11 @@ pub struct Epilogue<'a> {
     pub mask: Option<(&'a Handle, usize)>,
     pub residual: Option<(&'a Handle, usize)>,
     pub accumulate: bool,
+    /// Also add the column sums of b[z] over k (a bias gradient, when b is dY) into out's buffer at element
+    /// `.0 + z·.1 + j` (an absolute offset, always `+=`, whatever `accumulate` says), summed in a fixed order.
+    /// b is read by the cubes of the first row of output tiles, in the kernels' own pass over k; the f16 path sums
+    /// the f32 values before they are rounded. Needs `b` not transposed on the f16 path (it uses f32 otherwise).
+    pub col_sum: Option<(usize, usize)>,
 }
 
 /// out[z] (+)= epilogue(a[z] @ b[z]) for z in 0..batch, with a[z] logically
@@ -93,7 +98,7 @@ fn f16_enabled() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn matmul_with(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usize, n: usize, epi: Epilogue, use_f16: bool) {
     assert!(!out.trans, "out is stored row-major");
-    if use_f16 {
+    if use_f16 && !(epi.col_sum.is_some() && b.trans) {
         if let Some(cfg) = pick_cmma(m, k, n) {
             return matmul_cmma(a, b, out, batch, m, k, n, epi, cfg);
         }
@@ -112,7 +117,7 @@ fn matmul_with(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
     let u = |x: usize| x as u32;
     // Split: each (matrix, slice) writes its own [m, n] partial, at
     // z = matrix * splits + slice, no epilogue.
-    let scratch = (splits > 1).then(|| client().empty(splits * m * n * 4));
+    let (scratch, cs) = split_scratch(&epi, batch, splits, m, n);
     let out = match &scratch {
         Some(h) => MatRef { stride: m * n, ..MatRef::new(h) },
         None => out,
@@ -123,7 +128,7 @@ fn matmul_with(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
     let (og, oi, ldo) = out.layout(n);
     super::count_launch_as(|| {
         let t = |x: bool| if x { "T" } else { "N" };
-        let ops = [(epi.bias.is_some(), " +bias"), (epi.relu, " relu"), (epi.mask.is_some(), " mask"), (epi.residual.is_some(), " +res"), (epi.accumulate, " +=")];
+        let ops = [(epi.bias.is_some(), " +bias"), (epi.relu, " relu"), (epi.mask.is_some(), " mask"), (epi.residual.is_some(), " +res"), (epi.accumulate, " +="), (epi.col_sum.is_some(), " +colsum")];
         let epi: String = ops.iter().filter(|o| o.0).map(|o| o.1).collect();
         format!("{batch}x[{m}x{k}]{}·[{k}x{n}]{}{epi} split {splits}", t(a.trans), t(b.trans))
     });
@@ -161,6 +166,9 @@ fn matmul_with(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
         u(epi.bias_stride),
         u(mask_off),
         u(res_off),
+        u(cs.off),
+        u(cs.stride),
+        u(n),
         a.trans,
         b.trans,
         epi.bias.is_some(),
@@ -168,24 +176,64 @@ fn matmul_with(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
         epi.mask.is_some(),
         epi.residual.is_some(),
         accumulate,
+        cs.has,
+        cs.direct,
     );
     if let Some(partial) = &scratch {
-        let len = m * n;
-        super::count_launch_as(|| format!("split-k sum {batch}x{splits}x[{m}x{n}]"));
-        k_split_sum::launch(
-            client(),
-            CubeCount::Static(((batch * len) as u32).div_ceil(256), 1, 1),
-            CubeDim::new_1d(256),
-            whole(partial),
-            whole(dest.h),
-            u(len),
-            u(splits),
-            u(dest.off),
-            u(dest.stride),
-            u(batch),
-            epi.accumulate,
-        );
+        split_sum(partial, dest, &epi, cs, batch, splits, m, n);
     }
+}
+
+/// How a matmul's column sums (`Epilogue::col_sum`) reach their place, for the kernel's `out`: at element `off` + z·`stride`
+/// (+ slice·n) it writes the sum for matrix z (and k-slice), `direct`ly `+=` the final value when there is no split, else a
+/// partial that `split_sum` adds in slice order.
+#[derive(Clone, Copy)]
+struct ColSum {
+    has: bool,
+    off: usize,
+    stride: usize,
+    direct: bool,
+}
+
+/// The scratch buffer a split matmul writes its partials to (None with one slice): `batch`·`splits` [m, n] matrices, then
+/// `batch`·`splits` column-sum rows of n when asked for.
+fn split_scratch(epi: &Epilogue, batch: usize, splits: usize, m: usize, n: usize) -> (Option<Handle>, ColSum) {
+    let has = epi.col_sum.is_some();
+    if splits > 1 {
+        let base = batch * splits * m * n;
+        let extra = if has { batch * splits * n } else { 0 };
+        (Some(client().empty((base + extra) * 4)), ColSum { has, off: base, stride: splits * n, direct: false })
+    } else {
+        let (off, stride) = epi.col_sum.unwrap_or((0, 0));
+        (None, ColSum { has, off, stride, direct: true })
+    }
+}
+
+/// The launch that adds the slices of a split matmul (and its column sums) into `dest`.
+#[allow(clippy::too_many_arguments)]
+fn split_sum(partial: &Handle, dest: MatRef, epi: &Epilogue, cs: ColSum, batch: usize, splits: usize, m: usize, n: usize) {
+    let len = m * n;
+    let (cs_dst, cs_dst_stride) = epi.col_sum.unwrap_or((0, 0));
+    let u = |x: usize| x as u32;
+    super::count_launch_as(|| format!("split-k sum {batch}x{splits}x[{m}x{n}]{}", if cs.has { " +colsum" } else { "" }));
+    k_split_sum::launch(
+        client(),
+        CubeCount::Static(((batch * (len + if cs.has { n } else { 0 })) as u32).div_ceil(256), 1, 1),
+        CubeDim::new_1d(256),
+        whole(partial),
+        whole(dest.h),
+        u(len),
+        u(splits),
+        u(dest.off),
+        u(dest.stride),
+        u(batch),
+        u(n),
+        u(cs.off),
+        u(cs_dst),
+        u(cs_dst_stride),
+        epi.accumulate,
+        cs.has,
+    );
 }
 
 /// How many slices to split k into: enough that the output tiles times
@@ -198,10 +246,25 @@ fn split_count(tiles: usize, k_blocks: usize) -> usize {
 const SPLIT_TARGET: usize = 64;
 
 /// Matrix b's out[i] (+)= sum over s of partial[(b * splits + s) * len + i],
-/// s ascending.
+/// s ascending. With `has_cs`, threads past those also add the column-sum partials: out[cs_dst + b·cs_stride + j] +=
+/// sum over s of partial[cs_src + (b·splits + s)·n + j].
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
-fn k_split_sum(partial: &[f32], out: &mut [f32], len: u32, splits: u32, o_off: u32, o_stride: u32, batch: u32, #[comptime] accumulate: bool) {
+fn k_split_sum(
+    partial: &[f32],
+    out: &mut [f32],
+    len: u32,
+    splits: u32,
+    o_off: u32,
+    o_stride: u32,
+    batch: u32,
+    n: u32,
+    cs_src: u32,
+    cs_dst: u32,
+    cs_stride: u32,
+    #[comptime] accumulate: bool,
+    #[comptime] has_cs: bool,
+) {
     let e = ABSOLUTE_POS as u32;
     if e < batch * len {
         let (b, i) = (e / len, e % len);
@@ -214,6 +277,17 @@ fn k_split_sum(partial: &[f32], out: &mut [f32], len: u32, splits: u32, o_off: u
             v += out[o];
         }
         out[o] = v;
+    } else if has_cs {
+        let c = e - batch * len;
+        if c < batch * n {
+            let (b, j) = (c / n, c % n);
+            let mut v = 0.0f32;
+            for s in 0..splits {
+                v += partial[(cs_src + (b * splits + s) * n + j) as usize];
+            }
+            let o = (cs_dst + b * cs_stride + j) as usize;
+            out[o] += v;
+        }
     }
 }
 
@@ -268,6 +342,9 @@ fn k_matmul(
     bias_stride: u32,
     mask_off: u32,
     res_off: u32,
+    cs_off: u32,
+    cs_stride: u32,
+    cs_slice: u32,
     #[comptime] trans_a: bool,
     #[comptime] trans_b: bool,
     #[comptime] has_bias: bool,
@@ -275,6 +352,8 @@ fn k_matmul(
     #[comptime] has_mask: bool,
     #[comptime] has_res: bool,
     #[comptime] accumulate: bool,
+    #[comptime] has_cs: bool,
+    #[comptime] cs_direct: bool,
 ) {
     let tx = UNIT_POS_X;
     let ty = UNIT_POS_Y;
@@ -294,6 +373,8 @@ fn k_matmul(
     let mut b_s = Shared::<[f32]>::new_slice(1024usize);
     let mut acc = Array::<f32>::new(16usize);
     let mut bv = Array::<f32>::new(4usize);
+    // Column sum of the staged B slabs (padding is zero), units 0..64 each own a column.
+    let mut cs = 0.0f32;
     #[unroll]
     for i in 0..16u32 {
         acc[i as usize] = 0.0;
@@ -340,6 +421,13 @@ fn k_matmul(
             b_s[(br * 64 + bc) as usize] = w;
         }
         sync_cube();
+        if has_cs {
+            if tid < 64 {
+                for r in 0..16u32 {
+                    cs += b_s[(r * 64 + tid) as usize];
+                }
+            }
+        }
         #[unroll]
         for p in 0..16u32 {
             #[unroll]
@@ -356,6 +444,22 @@ fn k_matmul(
             }
         }
         sync_cube();
+    }
+    if has_cs {
+        // The first row of output tiles writes the column sums (once per column and k-slice).
+        if CUBE_POS_Y == 0 {
+            if tid < 64 {
+                let gn = col0 + tid;
+                if gn < n {
+                    let o = (cs_off + zb * cs_stride + (z % splits) * cs_slice + gn) as usize;
+                    if cs_direct {
+                        out[o] += cs;
+                    } else {
+                        out[o] = cs;
+                    }
+                }
+            }
+        }
     }
     #[unroll]
     for i in 0..4u32 {
@@ -418,7 +522,7 @@ fn pick_cmma(m: usize, k: usize, n: usize) -> Option<CmmaCfg> {
     }
     CMMA_CFGS.iter().copied().find(|c| {
         let threads = plane * c.pm * c.pn;
-        m % c.bm == 0 && n % c.bn == 0 && threads <= 1024 && (c.bm * CMMA_BK) % threads == 0 && (c.bn * CMMA_BK) % threads == 0
+        m % c.bm == 0 && n % c.bn == 0 && threads <= 1024 && threads % c.bn == 0 && (c.bm * CMMA_BK) % threads == 0 && (c.bn * CMMA_BK) % threads == 0
     })
 }
 
@@ -437,7 +541,7 @@ fn matmul_cmma(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
     let splits = if epi_free && out.ld == 0 && out.group == 1 { SPLIT_TARGET.div_ceil(batch * tiles).min(stages / 2).max(1) } else { 1 };
     let slice_stages = stages.div_ceil(splits);
     let splits = stages.div_ceil(slice_stages);
-    let scratch = (splits > 1).then(|| client().empty(batch * splits * m * n * 4));
+    let (scratch, cs) = split_scratch(&epi, batch, splits, m, n);
     let out = match &scratch {
         Some(h) => MatRef { stride: m * n, ..MatRef::new(h) },
         None => out,
@@ -450,7 +554,7 @@ fn matmul_cmma(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
     let direct = epi_free && !accumulate && out.off % 4 == 0 && out.stride % 4 == 0 && oi % 4 == 0 && ldo % 4 == 0;
     super::count_launch_as(|| {
         let t = |x: bool| if x { "T" } else { "N" };
-        let ops = [(epi.bias.is_some(), " +bias"), (epi.relu, " relu"), (epi.mask.is_some(), " mask"), (epi.residual.is_some(), " +res"), (epi.accumulate, " +=")];
+        let ops = [(epi.bias.is_some(), " +bias"), (epi.relu, " relu"), (epi.mask.is_some(), " mask"), (epi.residual.is_some(), " +res"), (epi.accumulate, " +="), (epi.col_sum.is_some(), " +colsum")];
         let epi: String = ops.iter().filter(|o| o.0).map(|o| o.1).collect();
         format!("{batch}x[{m}x{k}]{}·[{k}x{n}]{}{epi} f16 {}x{} split {splits}", t(a.trans), t(b.trans), cfg.bm, cfg.bn)
     });
@@ -487,6 +591,9 @@ fn matmul_cmma(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
         u(epi.bias_stride),
         u(mask_off),
         u(res_off),
+        u(cs.off),
+        u(cs.stride),
+        u(n),
         a.trans,
         b.trans,
         u(cfg.bm),
@@ -500,23 +607,11 @@ fn matmul_cmma(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
         epi.mask.is_some(),
         epi.residual.is_some(),
         accumulate,
+        cs.has,
+        cs.direct,
     );
     if let Some(partial) = &scratch {
-        let len = m * n;
-        super::count_launch_as(|| format!("split-k sum {batch}x{splits}x[{m}x{n}]"));
-        k_split_sum::launch(
-            client(),
-            CubeCount::Static(((batch * len) as u32).div_ceil(256), 1, 1),
-            CubeDim::new_1d(256),
-            whole(partial),
-            whole(dest.h),
-            u(len),
-            u(splits),
-            u(dest.off),
-            u(dest.stride),
-            u(batch),
-            epi.accumulate,
-        );
+        split_sum(partial, dest, &epi, cs, batch, splits, m, n);
     }
 }
 
@@ -556,6 +651,9 @@ fn k_matmul_cmma(
     bias_stride: u32,
     mask_off: u32,
     res_off: u32,
+    cs_off: u32,
+    cs_stride: u32,
+    cs_slice: u32,
     #[comptime] ta: bool,
     #[comptime] tb: bool,
     #[comptime] bm: u32,
@@ -569,6 +667,8 @@ fn k_matmul_cmma(
     #[comptime] has_mask: bool,
     #[comptime] has_res: bool,
     #[comptime] accumulate: bool,
+    #[comptime] has_cs: bool,
+    #[comptime] cs_direct: bool,
 ) {
     let pad = 8u32;
     let fm = comptime![bm / (pm * 16)];
@@ -609,6 +709,12 @@ fn k_matmul_cmma(
         acc.push(cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0));
     }
 
+    // Column sum of the f32 B values this unit stages (not transposed: its column is tid % bn, as threads is a multiple
+    // of bn), reduced over the units sharing a column after the loop.
+    let mut cs = 0.0f32;
+    let planes = comptime![(pm * pn) as usize];
+    let mut tile = Shared::<[f32]>::new_slice(comptime![planes * 256]);
+
     // Double buffered: iteration st stages k-stage st into buffer st % 2 and multiplies stage st - 1 out of the other
     // buffer, then one barrier. The stage written was last read two iterations ago (before the previous barrier).
     for st in s0..s1 + 1 {
@@ -639,7 +745,11 @@ fn k_matmul_cmma(
                 } else {
                     let r = e / bn;
                     let c = e % bn;
-                    b_s[(bb + r * b_ld + c) as usize] = f16::cast_from(b[(b0 + (k0 + r) * ldb + col0 + c) as usize]);
+                    let w = b[(b0 + (k0 + r) * ldb + col0 + c) as usize];
+                    b_s[(bb + r * b_ld + c) as usize] = f16::cast_from(w);
+                    if has_cs {
+                        cs += w;
+                    }
                 }
             }
         }
@@ -676,9 +786,28 @@ fn k_matmul_cmma(
         sync_cube();
     }
 
+    if has_cs {
+        // The first row of output tiles reduces and writes the column sums (once per column and k-slice), in a fixed order.
+        if CUBE_POS_Y == 0 {
+            tile[tid as usize] = cs;
+            sync_cube();
+            if tid < bn {
+                let mut total = 0.0f32;
+                for g in 0..threads / bn {
+                    total += tile[(g * bn + tid) as usize];
+                }
+                let o = (cs_off + zb * cs_stride + (z % splits) * cs_slice + col0 + tid) as usize;
+                if cs_direct {
+                    out[o] += total;
+                } else {
+                    out[o] = total;
+                }
+            }
+            sync_cube();
+        }
+    }
+
     let len = out.len();
-    let planes = comptime![(pm * pn) as usize];
-    let mut tile = Shared::<[f32]>::new_slice(comptime![planes * 256]);
     #[unroll]
     for i in 0..fm_n {
         #[unroll]
@@ -866,8 +995,15 @@ mod tests {
             let bias = gauss(bias_off + batch * (n + 1));
             let res = gauss(r_off + batch * so);
             let mask = gauss(m_off + batch * so); // about half positive
-            let out0 = gauss(o_off + batch * so);
+            // Every case also asks for B's column sums, into a region after the output (summed into what is there).
+            let (cs_off, cs_stride) = (o_off + batch * so + 5, n + 3);
+            let out0 = gauss(cs_off + batch * cs_stride + 2);
             let mut want = out0.clone();
+            for z in 0..batch {
+                for j in 0..n {
+                    want[cs_off + z * cs_stride + j] += (0..k).map(|p| b[b_off + z * sb + if tb { j * k + p } else { p * n + j }]).sum::<f32>();
+                }
+            }
             reference(
                 &a,
                 (a_off, sa, ta),
@@ -894,6 +1030,7 @@ mod tests {
                 mask: has_mask.then_some((&mask_h, m_off)),
                 residual: has_res.then_some((&res_h, r_off)),
                 accumulate: acc,
+                col_sum: Some((cs_off, cs_stride)),
             };
             matmul_with(
                 MatRef { off: a_off, stride: sa, trans: ta, ..MatRef::new(&ah) },
@@ -907,13 +1044,20 @@ mod tests {
                 use_f16,
             );
             let got = read(&oh);
+            // The output (and its padding) and the column sums are judged apart: 1e-4 (f32) / 1e-3 (f16) for the sums.
+            let (got_cs, want_cs) = (&got[cs_off..], &want[cs_off..]);
+            let (got, want) = (&got[..cs_off], &want[..cs_off]);
             let scale = want.iter().fold(0.0f32, |s, v| s.max(v.abs()));
-            let err = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+            let err = got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+            let cs_scale = want_cs.iter().fold(0.0f32, |s, v| s.max(v.abs()));
+            let cs_err = got_cs.iter().zip(want_cs).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+            let cs_tol = if use_f16 { 1e-3 } else { 1e-4 };
             let case = format!("batch {batch} m {m} k {k} n {n} ta {ta} tb {tb} bias {has_bias} relu {relu} mask {has_mask} res {has_res} acc {acc}");
             assert_eq!(got.len(), want.len(), "{case}");
             // Also covers the padding between batches and before the offset.
             let case = format!("{case} f16 {use_f16} cfg {:?}", if use_f16 { pick_cmma(m, k, n) } else { None });
             assert!(err <= tol * scale, "{case}: max err {err} (scale {scale})");
+            assert!(cs_err <= cs_tol * cs_scale, "{case}: column sums max err {cs_err} (scale {cs_scale})");
         }
     }
 
