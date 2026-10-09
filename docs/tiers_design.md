@@ -788,6 +788,32 @@ elementwise launches can save at most ~2 ms of 10 (the non-matmul share), and th
 (true at d = 128, batch 8: 1.97 ms) does not hold at this size: matmul throughput is the lever (these kernels are plain
 f32; the kNN search already uses f16 matrix-core tiles).
 
+### f16 matrix-core training matmul (2026-10-09)
+
+Spike (`examples/gpu/matmul_cmma_spike.rs`, f16 x f16 -> f32 cmma, f32 operands converted on the way into shared memory,
+multi-plane 64x64 to 128x128 tiles, shared eGPU, CPU 97-100% busy): 1.7-2.9x over the f32 `matmul` on the 10 dominant
+shapes (2.38 ms -> 1.06 ms summed), max relative error 2.4e-4 to 3.2e-4; the spike's kernels reach 3-8 TFLOP/s on the training
+shapes against ~15 on a 4096^3 probe (no vectorised loads, no double buffering, small grids, split-k sum launch).
+
+Integration (commit 003ff86): `k_matmul_cmma` behind `TRAIN_F16=1` (default off; the f32 kernel is unchanged beside it). Used
+when the device reports the cmma f16 config, there are no head views, k is a multiple of 32 and m, n divide a tile
+(64, 64x128 or 128x128); all epilogues (bias, relu, mask, residual, accumulate) and the deterministic split-k for the weight
+gradients. Routed: every Linear, QKV, FFN and projection forward and dX matmul and all weight gradients. Still f32: the
+attention matmuls (head views, ~0.9 ms/step) and ragged shapes. Test `matmul_f16_matches_reference` (18 cases at 1e-2; not
+vacuous: it fails at 1e-5 with max error ~3e-4 of scale) passes, as do the existing f32 tests. `device_step_matches_cpu_tape`
+fails with the flag (block 0 off by 7e-4 against its 1e-4 bound; its 1e-5 ReLU-tie check cannot hold under f16 rounding), so
+that test needs a looser f16 variant.
+
+Real recipe (512000 windows, 16000 steps, d = 256, d_ff = 512, dropout 0.1; contended, CPU 50-58%, Defender off, back to
+back): held-out CE within 0.0058 nats at all 65 rows (largest gap at step 1750, 1.8158 vs 1.8100), final 1.4056 (f32) vs
+1.4022 (f16): the f32 curve is bumpy and f16 crosses it in both directions, so noise, not divergence. Training ms/step
+**~10.7 -> ~7.0** (wall 258 s -> 183 s); GPU time per step (`profile=gpu`) 10.62 -> 6.43 ms (1.65x). Biggest sites f32 -> f16: the
+FFN dX matmuls 0.55-0.84 -> 0.10-0.23 ms, the weight gradients 0.85 -> 0.50. What is left: `rows.rs` (0.43 ms), the f32
+attention matmuls (0.37, 0.22, 0.18, 0.14) and `tokens.rs:51` (0.31).
+
+Open: a longer f16 run (the 16M recipe) before making it the default; the f16 variant of the device-vs-CPU test; attention
+matmuls and ragged shapes on cmma; the kernel's own headroom (vectorised loads, double buffering).
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
