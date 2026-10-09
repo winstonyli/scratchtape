@@ -256,6 +256,27 @@ fn k_ln_bwd_params(dy: &[f32], x: &[f32], mean: &[f32], rstd: &[f32], g: &mut [f
     let mut pb = 0.0f32;
     if j < d {
         let mut r = lane;
+        // Four rows' loads are issued before their sums (same add order
+        // as the plain loop): the loop is load-latency bound, with only 16
+        // cubes per model.
+        while r + 3 * COL_LANES < rows {
+            let (r1, r2, r3) = (r0 + r + COL_LANES, r0 + r + 2 * COL_LANES, r0 + r + 3 * COL_LANES);
+            let r0r = r0 + r;
+            let (i0, i1, i2, i3) = ((r0r * d + j) as usize, (r1 * d + j) as usize, (r2 * d + j) as usize, (r3 * d + j) as usize);
+            let (d0, d1, d2, d3) = (dy[i0], dy[i1], dy[i2], dy[i3]);
+            let (x0, x1, x2, x3) = (x[i0], x[i1], x[i2], x[i3]);
+            let (m0, m1, m2, m3) = (mean[r0r as usize], mean[r1 as usize], mean[r2 as usize], mean[r3 as usize]);
+            let (s0, s1, s2, s3) = (rstd[r0r as usize], rstd[r1 as usize], rstd[r2 as usize], rstd[r3 as usize]);
+            pg += d0 * (x0 - m0) * s0;
+            pb += d0;
+            pg += d1 * (x1 - m1) * s1;
+            pb += d1;
+            pg += d2 * (x2 - m2) * s2;
+            pb += d2;
+            pg += d3 * (x3 - m3) * s3;
+            pb += d3;
+            r += 4 * COL_LANES;
+        }
         while r < rows {
             let i = ((r0 + r) * d + j) as usize;
             pg += dy[i] * (x[i] - mean[(r0 + r) as usize]) * rstd[(r0 + r) as usize];
@@ -384,7 +405,8 @@ mod tests {
     fn layer_norm_matches_cpu_tape() {
         // eps 1e-5, as LayerNorm::new; d = 200 spans several passes of a
         // row cube, rows = 37 isn't a multiple of the column lanes
-        for (rows, d, off) in [(37, 24, 5), (37, 200, 3)] {
+        // rows = 203 runs the params kernel's 4-row unrolled loop and its tail
+        for (rows, d, off) in [(37, 24, 5), (37, 200, 3), (203, 24, 5)] {
             layer_norm_case(rows, d, off);
         }
     }
