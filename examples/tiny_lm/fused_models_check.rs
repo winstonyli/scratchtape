@@ -31,7 +31,8 @@
 // `outer_lr` > 0 replaces the plain mean with DiLoCo's outer step
 // (Nesterov momentum `outer_mu` on the pseudo-gradient, DeviceParams::outer_step).
 //
-//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups] [checkpoint_secs]
+//   fused_models_check <name> <k> <batch> <lr> [windows] [seed] [weight_decay] [dropout] [warmup_windows] [momentum] [alpha] [alpha_ramp_windows] [sync_every_steps] [shared_init] [outer_lr] [outer_mu] [corpus] [lr_decay_frac] [d_model] [heads] [d_ff] [blocks] [groups] [checkpoint_secs] [profile]
+//   profile=gpu|host charges 50 steps (after 20 of warm-up) to launch sites and prints the top 40 (GPU time, or host queueing time), then exits.
 //   (any of them also as key=value, e.g. `... 4 32 0.05 windows=4096000 dropout=0.1 d_model=384`)
 //
 // Every 8000 windows (with averaging, only at sync points) it prints each
@@ -45,7 +46,7 @@
 // go to runs/<name>_m<m>.ckpt (flatten_all order).
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
-use scratchtape::gpu_step::{DeviceParams, pack, read, upload_f32};
+use scratchtape::gpu_step::{DeviceParams, host_profile_cut, host_profile_start, host_profile_take, pack, profile_start, profile_take, read, upload_f32};
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -102,7 +103,10 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
 }
 
 /// The command-line parameters, in positional order, with defaults ("" = required).
-const PARAMS: [(&str, &str); 24] = [
+const PROFILE_WARM: usize = 20;
+const PROFILE_STEPS: usize = 50;
+
+const PARAMS: [(&str, &str); 25] = [
     ("name", ""),
     ("k", ""),
     ("batch", ""),
@@ -127,6 +131,7 @@ const PARAMS: [(&str, &str); 24] = [
     ("blocks", "4"),
     ("groups", "1"),
     ("checkpoint_secs", "600"),
+    ("profile", "0"),
 ];
 
 /// Arguments after the program name: bare values fill PARAMS in order, `key=value` sets one by name
@@ -245,6 +250,7 @@ fn main() {
     // the parameters, then the velocity (momentum), then the outer anchor
     // and velocity (outer step), one line each.
     let checkpoint_secs: u64 = p.get("checkpoint_secs");
+    let profile: String = p.get("profile");
     let resume_path = format!("runs/{name}.resume");
     let (mut flat, mut first) = (flat, 0);
     let mut saved: std::vec::IntoIter<Vec<f32>> = vec![].into_iter();
@@ -279,6 +285,24 @@ fn main() {
     let mut last = (vec![], 0.0);
     let mut last_save = Instant::now();
     for step in first..=steps {
+        // `profile=gpu|host`: after PROFILE_WARM steps (compilation), charge PROFILE_STEPS steps to launch sites, print, stop.
+        if step == first + PROFILE_WARM + PROFILE_STEPS && profile != "0" {
+            let (sites, what) = if profile == "gpu" { (profile_take(), "GPU") } else { (host_profile_take(), "host") };
+            let total: f64 = sites.iter().map(|s| s.2).sum();
+            for (site, n, secs) in sites.iter().take(40) {
+                println!("{:>7.3} ms/step {:>5.1}%  {:>3} launches/step  {site}", secs * 1e3 / PROFILE_STEPS as f64, 100.0 * secs / total, n / PROFILE_STEPS);
+            }
+            println!("{what} time, all launches: {:.2} ms/step over {} sites", total * 1e3 / PROFILE_STEPS as f64, sites.len());
+            return;
+        }
+        if step == first + PROFILE_WARM {
+            dev.read(&dev.params); // drain the queue so compilation is not charged
+            match profile.as_str() {
+                "gpu" => profile_start(),
+                "host" => host_profile_start(),
+                _ => {}
+            }
+        }
         // Save before this step's work; `step` is the next one to run.
         if step > first && step < steps && last_save.elapsed().as_secs() >= checkpoint_secs {
             let line = |v: Vec<f32>| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
@@ -348,6 +372,9 @@ fn main() {
                 Some((anchor, v)) => dev.outer_step(anchor, v, outer_lr, outer_mu),
                 None => dev.average_groups(k / groups),
             }
+        }
+        if profile == "host" {
+            host_profile_cut();
         }
     }
     let _ = std::fs::remove_file(&resume_path);
