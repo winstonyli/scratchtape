@@ -814,6 +814,26 @@ attention matmuls (0.37, 0.22, 0.18, 0.14) and `tokens.rs:51` (0.31).
 Open: a longer f16 run (the 16M recipe) before making it the default; the f16 variant of the device-vs-CPU test; attention
 matmuls and ragged shapes on cmma; the kernel's own headroom (vectorised loads, double buffering).
 
+### f16 matmul, round 2: attention, double buffering (2026-10-09)
+
+Commits 4ca2751, 7a0e1c7, 72834b1, 3f6944d. `k_matmul_cmma` now takes head views (group/inner addressing), so all four attention
+matmuls run on cmma; a 64x32 tile serves n = 32 shapes (used only when no 64-wide tile fits: picking it for the weight
+gradients first made them 3x slower, caught in the profile). Shared-memory stages are double-buffered (one barrier per k
+stage), which dropped the 128-wide tiles (doubled stages exceed the 32 KiB shared-memory limit: the 128x128 launch failed
+at 37,888 bytes); the 64x64 tile now uses 8 planes (4x2). Weight-gradient matmuls ~2x faster from double buffering
+(`[256x2048]T.[2048x768]` 0.49 -> 0.22-0.27 ms); 4x2 planes ~5%; 4x4 planes fail to launch; doubling the split-k target
+gave nothing. Matmuls now run at ~13-15 TFLOP/s, about the 4096^3 probe's ceiling (~15), so vectorised loads were not tried.
+
+Tests: 4 of 4 matmul tests pass (re-run by the lead), including the new `matmul_f16_head_views_match_reference` (B = 2, H = 4,
+t = 64, w = 32, 1e-2). Loss (512000 windows, real recipe, f32 then f16 back to back): max gap 0.0068 (step 14500), final gap
+0.0014 (f32 1.4056, f16 1.4070), signed mean f16 - f32 +0.0023; the f16 curve is identical across the double-buffering and
+plane-count changes, so those did not change the numerics. Speed (contended: CPU 24-75%, another session's GPU test;
+Defender off): GPU time per step f32 10.5-10.7 -> f16 4.59 ms at light load (6.22 vs 14.72 at heavy load), ratio 0.42-0.44;
+training ms/step 10.75 -> 6.36 (light), 11.02 -> 7.72 (heavy). Left in the f16 profile (ms/step): `rows.rs:128` 0.43,
+`tokens.rs:51` 0.31, `rows.rs:96` 0.25, attention `256x[64x64]T.[64x32]N +=` 0.25 (~1 TFLOP/s, latency-bound; several
+matrices per cube might save 0.2-0.3 ms), QKV forward 0.24, then mostly non-matmul rows.rs / tokens.rs / tape.rs work.
+Still open: a longer f16 run before making `TRAIN_F16` the default, and a loosened f16 `device_step_matches_cpu_tape`.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
