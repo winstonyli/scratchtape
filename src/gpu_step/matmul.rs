@@ -404,7 +404,7 @@ struct CmmaCfg {
 
 /// The first that divides m and n. Two double-buffered stages of A and B (f16) plus the epilogue tiles must fit the 32 KiB of
 /// shared memory, which rules out 128-wide tiles; the 64x32 one is for the attention head width (n a multiple of 32 only).
-const CMMA_CFGS: [CmmaCfg; 2] = [CmmaCfg { bm: 64, bn: 64, pm: 2, pn: 2 }, CmmaCfg { bm: 64, bn: 32, pm: 2, pn: 1 }];
+const CMMA_CFGS: [CmmaCfg; 2] = [CmmaCfg { bm: 64, bn: 64, pm: 4, pn: 2 }, CmmaCfg { bm: 64, bn: 32, pm: 2, pn: 1 }];
 
 /// k is staged 32 at a time.
 const CMMA_BK: usize = 32;
