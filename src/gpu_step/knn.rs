@@ -378,7 +378,7 @@ fn widen(t: f32) -> f32 {
     t + 1e-4 * (t.abs() + 1.0)
 }
 
-fn f16_config() -> cubecl::features::MmaConfig {
+pub(super) fn f16_config() -> cubecl::features::MmaConfig {
     cubecl::features::MmaConfig {
         a_type: cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16),
         b_type: cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16),
