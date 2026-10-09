@@ -867,6 +867,21 @@ accumulator fragments and stored directly (float-order change only): `+=` attent
 (160) and per-launch latency (~18-36 us for the small matmuls); the next real gain is fusing (attention QK^T-softmax-PV, layer
 norm with the neighbouring matmul or residual).
 
+### f16 training at 8M windows: slower convergence (2026-10-09)
+
+`scripts/train_8m_f16.sh` (`TRAIN_F16=1`, the 8M recipe, log `runs/nov_big_k1_d0.1_8m_f16.log`; machine contended, CPU ~37% at
+start, another session's shared lease). Held-out CE at the 1M-window marks, f32 (`nov_big_k1_d0.1_8m`) vs f16: 1.3349 / 1.3361,
+1.2870 / 1.2869, 1.2684 / 1.2729, 1.2578 / 1.2665, 1.2518 / 1.2609, 1.2475 / 1.2558, 1.2430 / 1.2512, **1.2408 / 1.2475**. The f16
+curve is behind by up to 0.0087 (4M) and ends **+0.0067** worse; the train probe is 1.1430 against 1.1172, so f16 also fits the
+training text worse (+0.026): this is slower optimisation, not overfitting or noise. The 512000-window validations (gap
+<= 0.0085, final 0.0014) were too short to show it. Cost: training clock 4.33 ms/step against 11.4 (f32, contended; both runs
+shared the machine), total 1109 s of training against 2928 s. Reading: f16 at 8M windows is about as good as f32 at ~6M, so
+matching f32's 8M result costs roughly 11M windows, still ~2x less training time. **Do not make f16 the default yet.**
+Candidates for the loss: f16 rounding of the activations and gradients that feed the weight gradients (dW is Xt.dY with both
+operands rounded), the f16 forward, or the attention matmuls (the first validation ran before attention joined; the
+512000-window gap stayed small throughout). An ablation by matmul class (forward only, dX only, dW only, attention only in f32)
+on a 2M-window run would say which one matters.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
