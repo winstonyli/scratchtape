@@ -402,12 +402,7 @@ struct CmmaCfg {
     pn: usize,
 }
 
-const CMMA_CFGS: [CmmaCfg; 4] = [
-    CmmaCfg { bm: 128, bn: 128, pm: 2, pn: 2 },
-    CmmaCfg { bm: 128, bn: 64, pm: 4, pn: 2 },
-    CmmaCfg { bm: 64, bn: 64, pm: 2, pn: 2 },
-    CmmaCfg { bm: 64, bn: 32, pm: 2, pn: 1 }, // the attention head width
-];
+const CMMA_CFGS: [CmmaCfg; 3] = [CmmaCfg { bm: 128, bn: 128, pm: 2, pn: 2 }, CmmaCfg { bm: 128, bn: 64, pm: 4, pn: 2 }, CmmaCfg { bm: 64, bn: 64, pm: 2, pn: 2 }];
 
 /// k is staged 32 at a time.
 const CMMA_BK: usize = 32;
@@ -426,8 +421,12 @@ fn pick_cmma(batch: usize, m: usize, k: usize, n: usize) -> Option<CmmaCfg> {
     };
     let cubes = |c: &CmmaCfg| batch * (m / c.bm) * (n / c.bn);
     let fitting: Vec<&CmmaCfg> = CMMA_CFGS.iter().filter(fits).collect();
-    fitting.iter().find(|c| cubes(c) >= SPLIT_TARGET).or(fitting.last()).map(|c| **c)
+    fitting.iter().find(|c| cubes(c) >= SPLIT_TARGET).or(fitting.last()).map(|c| **c).or(Some(CMMA_NARROW).filter(|c| fits(&c)))
 }
+
+/// Only for n that is a multiple of 32 but not 64 (the attention head width): where a 64-wide tile fits it is the better
+/// one even with fewer cubes (split-k fills the GPU instead).
+const CMMA_NARROW: CmmaCfg = CmmaCfg { bm: 64, bn: 32, pm: 2, pn: 1 };
 
 /// The f16 matrix-core version of the launch(es) in `matmul_with`, same semantics; m, n, k tile `cfg`.
 #[allow(clippy::too_many_arguments)]
