@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [dump=<path>] [wdump=<path>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [classes=1] [dump=<path>] [wdump=<path>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -39,6 +39,7 @@
 // `memory=causal` makes the memory a past-only in-document one: the train keys plus ALL held-out windows (in order), where
 // a query in window w sees the train keys and only those held-out windows before w in the same book (`store` counts
 // train windows; 0 for no train keys). `stride`/`offset`/`part` still choose what is scored.
+// `classes=1` prints the loss by position class (letter or not before, kind of byte predicted): where the model's CE sits and which tier gains where.
 // `whiten=<alpha>` (default off) centres the memory's keys and queries and multiplies them by Sigma^(-alpha/2) (Sigma: the covariance of
 // 128k train positions, total variance kept); alpha 0.5 gave the best stack (docs/tiers_design.md).
 // `store_from` chooses the memory's contents: `train` (default; `store` evenly spaced train windows), `held` (every
@@ -108,6 +109,23 @@ trait Tier {
 
 fn is_letter(b: usize) -> bool {
     (b as u8).is_ascii_alphabetic() || b == b'\'' as usize
+}
+
+/// Position classes for the `classes=1` loss breakdown: whether the byte being read is a letter, and what kind of byte is predicted.
+const CLASS_NAMES: [&str; 10] = [
+    "after non-letter -> lower", "after non-letter -> UPPER", "after non-letter -> space", "after non-letter -> newline", "after non-letter -> other",
+    "after letter -> lower", "after letter -> UPPER", "after letter -> space", "after letter -> newline", "after letter -> other",
+];
+
+fn class_of(input: usize, target: usize) -> usize {
+    let kind = match target as u8 {
+        b'a'..=b'z' => 0,
+        b'A'..=b'Z' => 1,
+        b' ' => 2,
+        b'\n' => 3,
+        _ => 4,
+    };
+    kind + 5 * is_letter(input) as usize
 }
 
 /// Every maximal run of letters/apostrophes, in order.
@@ -801,7 +819,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
-            | "recent" | "whiten" | "dump" | "wdump" => {
+            | "recent" | "whiten" | "classes" | "dump" | "wdump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -938,6 +956,10 @@ fn main() {
     let need_hidden = tiers.iter().flatten().any(|t| t.needs_hidden());
     let (mut ce_model, mut ce_device) = (0.0f64, 0.0f64);
     let mut ce_tier = vec![0.0f64; tiers.len()];
+    // `classes=1`: per position class, the count and the summed CE of the model and of each spec.
+    let mut cls_n = [0usize; 10];
+    let mut cls_model = [0.0f64; 10];
+    let mut cls_tier = vec![[0.0f64; 10]; tiers.len()];
     let n_win = (held_out.len() - 1) / SEQ_LEN;
     let starts: Vec<usize> = (offset * unit..held_out.len() - SEQ_LEN).step_by(unit * stride).filter(|s| s / SEQ_LEN * part_n / n_win == part_i).collect();
     // Wall time per phase: forward launch + readback, tier prepare (kNN search + readback), per-row scoring, online writes.
@@ -988,6 +1010,9 @@ fn main() {
             let context = &held_out[(abs + 1).saturating_sub(CONTEXT)..=abs];
             let probs = softmax(&f.logits[r * VOCAB..(r + 1) * VOCAB]);
             ce_model -= probs[f.targets[r]].ln();
+            let cls = class_of(*window.last().unwrap(), f.targets[r]);
+            cls_n[cls] += 1;
+            cls_model[cls] -= probs[f.targets[r]].ln();
             ce_device += f.row_loss[r] as f64;
             let hid = if need_hidden { &f.hidden[r * cfg.d..(r + 1) * cfg.d] } else { &[][..] };
             let ctx = Ctx { row: r, window, context, target: f.targets[r], hidden: hid };
@@ -997,6 +1022,7 @@ fn main() {
                     tier.adjust(&ctx, &mut p);
                 }
                 ce_tier[i] -= p[f.targets[r]].max(1e-300).ln();
+                cls_tier[i][cls] -= p[f.targets[r]].max(1e-300).ln();
             }
         }
         phase[2] += t0.elapsed();
@@ -1028,6 +1054,24 @@ fn main() {
             if !report.is_empty() {
                 println!("  {report}");
             }
+        }
+    }
+    if opt.contains_key("classes") {
+        // Per class: its share of the positions, the model's mean CE there and its share of the total CE, then for each
+        // spec the CE gain in that class as thousandths of a nat of the overall CE (the columns sum to the overall gain).
+        println!("loss by position class (gain columns: 1e-3 nats of overall CE, summing to the overall gain):");
+        print!("{:30} {:>6} {:>7} {:>7}", "class", "share%", "modelCE", "of CE%");
+        for i in 0..specs.len() {
+            print!(" {:>7}", format!("spec{i}"));
+        }
+        println!();
+        for c in 0..10 {
+            let nc = cls_n[c].max(1) as f64;
+            print!("{:30} {:6.1} {:7.3} {:7.1}", CLASS_NAMES[c], 100.0 * cls_n[c] as f64 / n, cls_model[c] / nc, 100.0 * cls_model[c] / (ce_model * n));
+            for i in 0..specs.len() {
+                print!(" {:7.2}", 1e3 * (cls_model[c] - cls_tier[i][c]) / n);
+            }
+            println!();
         }
     }
     if let Some(path) = opt.get("dump") {

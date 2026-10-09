@@ -676,6 +676,33 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   0.25 and 0.5 (0.0003 apart) and the full-set gain from whitening is ~0.002 either way. Use `whiten=0.5` with
   `knn:256:0.4:30:50:100`. Best deployable stack: **1.1118 (-0.0646)**.
 
+- **Loss by position class (`classes=1`; `scripts/tier_classes.sh`, `runs/tier_classes.log`, 2026-10-08).** Full held-out,
+  `warm=32`, online split memory with `whiten=0.5`, 503808 positions, 637 s. Class = was the byte read a letter (letters and
+  apostrophes), and what kind of byte is predicted. Gain columns are 1e-3 nats of the overall CE and sum to the overall
+  gain (spec0 = lexicon + words, spec1 = memory alone, spec2 = whole stack, overall -0.0646):
+
+  | class | share of positions | model CE there | share of model CE | lexicon+words | memory | stack |
+  |---|---|---|---|---|---|---|
+  | non-letter -> lower (word start) | 16.4% | 2.524 | 35.2% | 0.00 | 6.64 | 6.64 |
+  | non-letter -> UPPER | 1.9% | 3.314 | 5.4% | 0.00 | 2.84 | 2.84 |
+  | non-letter -> space | 2.6% | 0.200 | 0.4% | 0.00 | -0.10 | -0.10 |
+  | non-letter -> newline | 0.8% | 0.725 | 0.5% | 0.00 | 0.12 | 0.12 |
+  | non-letter -> other | 2.3% | 0.689 | 1.3% | 0.00 | 1.51 | 1.51 |
+  | letter -> lower (mid-word) | 57.5% | 0.896 | 43.8% | 17.45 | 44.97 | 48.71 |
+  | letter -> UPPER | 0.1% | 1.923 | 0.2% | 0.18 | 0.27 | 0.31 |
+  | letter -> space (word end) | 14.0% | 0.371 | 4.4% | 1.38 | 2.85 | 3.26 |
+  | letter -> newline | 1.1% | 1.839 | 1.7% | 0.04 | **-1.84** | -1.82 |
+  | letter -> other (punctuation) | 3.3% | 2.530 | 7.0% | 0.70 | 2.77 | 3.11 |
+
+  Findings: (1) the symbolic tiers only ever act mid-word (17.5 of their 19.7); at word starts they do nothing (the `f`
+  flag did not help) and the memory recovers only 6.6 of the 414 (35%) of the CE sitting there, so word starts are the
+  biggest untouched mass but predicting the next word is a language-model job, not a lookup. (2) Mid-word the stack
+  adds 3.7 over the memory alone. (3) **Line breaks: the memory makes the newline-after-letter class worse (-1.84)**
+  and the bytes at line ends carry 1.7% + 0.5% of the CE (~26e-3 nats) plus part of the word-end-space class. The books
+  are hard-wrapped (median line 68-69 bytes, p90 71-73, max 71-77 over the six; 77-87% of the non-empty lines fall in
+  60-75), longer than the model's 64-byte window, so the model often cannot see the last newline and has no column. A
+  rule tier that tracks the column from CONTEXT bytes is the one symbolic tier with a measurable target.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
