@@ -1,4 +1,6 @@
 #!/bin/sh
+# NOTE: written for the write-after, merged-search online memory. Today memory=online writes first and searches train and
+# in-document keys separately, so this reproduces its logged numbers only at commit 92266bc (before 1cce0ef).
 # Phase timing of tier_eval on a small slice (part 5/24, warm=32, stride 1): online vs flat memory. docs/tiers_design.md.
 E=runs/tier_eval_time.exe; C=runs/nov_big_k1_d0.1_8m_m0.ckpt
 S="tier=knn:256:0.5:15"

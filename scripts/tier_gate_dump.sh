@@ -1,4 +1,6 @@
 #!/bin/sh
+# NOTE: written for the write-after, merged-search online memory. Today memory=online writes first and searches train and
+# in-document keys separately, so this reproduces its logged numbers only at commit 92266bc (before 1cce0ef).
 # Full held-out run of the deployable stack with a per-position dump for gate_fit (docs/superpowers/specs/2026-10-07-uncertainty-gating-design.md).
 # Only the full-stack spec is scored (the knn search is shared, so this costs about the same as tier_full9). Needs a quiet machine: run the LONG_RUNS checks first.
 # No KNN_TIMING: it syncs after every tile and slows the run; the "speed:" lines give s/chunk.

@@ -1,4 +1,6 @@
 #!/bin/sh
+# NOTE: written for the write-after, merged-search online memory. Today memory=online writes first and searches train and
+# in-document keys separately, so this reproduces its logged numbers only at commit 92266bc (before 1cce0ef).
 # Full held-out run of the deployable stack (kNN weight 0.4) with the kNN and words per-position dumps for words_gate_fit
 # (docs/superpowers/specs/2026-10-08-words-gating-design.md). One spec; no KNN_TIMING (it syncs after every tile).
 E=runs/tier_eval_run.exe; C=runs/nov_big_k1_d0.1_8m_m0.ckpt

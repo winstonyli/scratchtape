@@ -1,4 +1,6 @@
 #!/bin/sh
+# NOTE: written for the write-after, merged-search online memory. Today memory=online writes first and searches train and
+# in-document keys separately, so this reproduces its logged numbers only at commit 92266bc (before 1cce0ef).
 # KNN_TIMING=1 (per-block stage times in the log; tier_eval also logs s/chunk every 20 chunks). Rerun of tier_full7 on a quiet machine, with VRAM sampled by load_log.ps1. Full held-out run of the deployable stack (online memory + lexicon + word bigram), f16 search (default), top-k live-count shift, incremental sample upload. Fair-context protocol (warm=32), stride 1 (online needs it). Settings from the tier_full3 tuning.
 export KNN_TIMING=1
 E=runs/tier_eval_run.exe; C=runs/nov_big_k1_d0.1_8m_m0.ckpt
