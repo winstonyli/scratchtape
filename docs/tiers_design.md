@@ -849,6 +849,24 @@ ms/step, host 9.37 -> 5.86 ms/step (the largest host site, 0.86 ms, is gone); tr
 4.84 -> 4.61 (~4%). Left: `tokens.rs:51` 0.31, layer-norm backward `rows.rs:97` 0.26 and `:94` 0.18, the attention
 `256x[64x64]T.[64x32]N` 0.25, then the matmuls (0.16-0.25 each).
 
+### Small step costs: embedding backward, layer-norm params, `+=` attention (2026-10-09)
+
+Commits 6bb0e1b, d59ce9d, 7889d66 (each extends a unit test; 19 of 19 `gpu_step` ignored tests pass, re-run by the lead;
+with `TRAIN_F16=1` only the known `device_step_matches_cpu_tape` fails). (1) `tokens.rs:51` is the token-table backward, not a
+scatter: each unit scanned all 2048 ids with dependent global loads. Cubes now stage the ids in shared memory in 512-id chunks,
+same add order (bit-identical): 0.43 -> 0.16 ms/step. `tape.rs:525` is `k_dropout`, 16 elementwise launches of ~9 us, i.e.
+launch floor; left. (2) `k_ln_bwd_params` has only 16 cubes and is load-latency bound: four rows' loads in flight per lane,
+same add order: 0.25-0.34 -> 0.148 ms. Fusing the two reductions in `k_ln_bwd_dx` into one barrier tree gave nothing (0.212 vs
+0.210) and was reverted; the forward (0.09-0.11 ms) was not touched. (3) Packing several attention matrices per cube would not
+help: the 256 matrices already run in one wave, so the cost is per-launch latency (~18 us). The `+=` attention launches cost
+~36 us (a dependent read-modify-write per element behind barriers); with no other epilogue, `out` is now loaded into the
+accumulator fragments and stored directly (float-order change only): `+=` attention site 0.235 -> 0.215 ms, the N.N one
+0.150 -> ~0.107 ms. Loss (512000 windows, builds back to back): curves identical row by row for f32 and f16 (max gap 0); finals
+1.4028 / 1.4057 as before. Profile (`TRAIN_F16=1`, contended, CPU 56-100%, Defender off): GPU 4.18 / 4.13 -> 3.86 / 3.82 ms/step;
+160 launches unchanged; host and training ms/step within noise (f16 5.60 -> 5.36, f32 11.57 -> 11.15). Floor now: launch count
+(160) and per-launch latency (~18-36 us for the small matmuls); the next real gain is fusing (attention QK^T-softmax-PV, layer
+norm with the neighbouring matmul or residual).
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
