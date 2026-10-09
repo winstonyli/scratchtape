@@ -736,6 +736,20 @@ width, `wrap:<lambda>:w`) is worse than the plain column, 1.1630 vs 1.1608 (-0.0
 2-3 lines, and the longest of them is a noisy width (paragraph ends, verse, indentation), so it blurs a column table that
 already pools well. The plain column stays; the code was removed.
 
+### Memory re-tune with wrap, and the punctuation class (2026-10-08)
+
+Re-tune (`scripts/tier_full_wrap_retune.sh`, full held-out, stack + wrap:0.95 after knn, one coordinate at a time from
+knn:256:0.4:30:50:100 = 1.0956): lambda 0.3 / 0.5 -> 1.0991 / **1.0950**; T 25 / 40 -> 1.0961 / 1.0983; T_doc 35 / 70 ->
+1.0968 / 1.0965; shift 50 / 150 -> 1.0994 / 1.0991. The optimum did not move (only lambda 0.5, -0.0006, which is within
+the noise of a tuning step); the specs keep 0.4.
+
+Punctuation (read-only diagnostic, patch in `runs/punct_diag.patch`, not committed): the "after letter -> other" class
+(7.0% of the CE) is commas 2.4%, periods 1.8%, the lead byte of UTF-8 punctuation (curly quotes, dashes) 1.35%,
+semicolons 0.9%, `!` 0.5%, `-` 0.5%, `?` 0.3%. The model's CE there is 1.8-4.0 nats per target and the stack recovers
+0.02-0.19 of it. The books use curly quotes only (no ASCII `"`), and the byte that decides open vs close (`\x9c` vs `\x9d`
+after `\xe2\x80`) already costs 0.03-0.17 nats, so quote matching has nothing to win. What is left is where a clause or
+sentence ends, which is language modelling. KILL: no rule tier for punctuation.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
