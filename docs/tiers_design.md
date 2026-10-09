@@ -775,6 +775,19 @@ little, as expected when the model learns some of what they supplied. Doubling t
 guessed -0.005; width at matched steps gave 0.002 (d = 384), so the next model-side lever is the window (option 3) rather
 than more of the same.
 
+### Training step profile: matmul-bound, not launch-bound (2026-10-09)
+
+`fused_models_check ... profile=host|gpu` (new option: 50 steps after 20 of warm-up charged to launch sites; top 40 printed)
+on the real config (K = 1, batch 32, d = 256, d_ff = 512, 4 blocks, dropout 0.1; CPU 55% and the eGPU shared with
+other sessions, so absolute times are inflated; logs `runs/prof_host.log`, `runs/prof_gpu.log`). **177 launches per
+step, of which 92 are matmuls.** GPU time per step under the profiler 10.55 ms, of which **matmuls 8.45 ms (80%)** and
+everything else 2.10 ms (85 launches: softmax, layer norm, elementwise, split-k sums, cross entropy). The training run's own
+clock was 6.75 ms/step. The largest sites: the FFN weight gradients and input gradients (`[256x2048]T·[2048x512]N`,
+`[2048x768]N·[768x256]T` and the like, 0.5-0.85 ms each), then attention `[64x64]` batched matmuls. So fusing
+elementwise launches can save at most ~2 ms of 10 (the non-matmul share), and the doc's earlier "dispatch-bound" label
+(true at d = 128, batch 8: 1.97 ms) does not hold at this size: matmul throughput is the lever (these kernels are plain
+f32; the kNN search already uses f16 matrix-core tiles).
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
