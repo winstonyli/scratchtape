@@ -750,6 +750,15 @@ semicolons 0.9%, `!` 0.5%, `-` 0.5%, `?` 0.3%. The model's CE there is 1.8-4.0 n
 after `\xe2\x80`) already costs 0.03-0.17 nats, so quote matching has nothing to win. What is left is where a clause or
 sentence ends, which is language modelling. KILL: no rule tier for punctuation.
 
+### Longer training, 16M windows (started 2026-10-08 19:16)
+
+Question: is the model undertrained? Held-out CE of the 8M run at 1M-window marks: 1.3349 1.2870 1.2684 1.2578 1.2518 1.2475
+1.2430 1.2408 (steps of 0.006, 0.004, 0.0045, 0.002 near the end, with the schedule decaying to the end); the train
+probe is 1.1172 against 1.2408 held out, so the gap is large and more steps may mostly overfit (dropout 0.1 helped at
+4M and 8M). `scripts/train_16m.sh` = the same recipe at `windows=16384000`, `nov_big_k1_d0.1_16m`. Command: `bash
+scripts/train_16m.sh`; log `runs/nov_big_k1_d0.1_16m.log`; PID 20136 (fused_models_check.exe); ~10 ms/step, expected
+~2.4 h; resumable (`runs/nov_big_k1_d0.1_16m.resume`). Result and the stack re-run (`warm=32`, best stack, wrap) go here.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
