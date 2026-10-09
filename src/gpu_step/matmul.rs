@@ -89,12 +89,11 @@ fn f16_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("TRAIN_F16").is_ok_and(|v| v == "1") && client().features().matmul.cmma.contains(&super::knn::f16_config()))
 }
 
-/// `matmul` with the f16 matrix-core path chosen by the caller (tests); it still falls back to f32 for shapes it can't tile
-/// and for head views.
+/// `matmul` with the f16 matrix-core path chosen by the caller (tests); it still falls back to f32 for shapes it can't tile.
 #[allow(clippy::too_many_arguments)]
 fn matmul_with(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usize, n: usize, epi: Epilogue, use_f16: bool) {
     assert!(!out.trans, "out is stored row-major");
-    if use_f16 && a.group == 1 && b.group == 1 && out.group == 1 {
+    if use_f16 {
         if let Some(cfg) = pick_cmma(batch, m, k, n) {
             return matmul_cmma(a, b, out, batch, m, k, n, epi, cfg);
         }
@@ -403,7 +402,12 @@ struct CmmaCfg {
     pn: usize,
 }
 
-const CMMA_CFGS: [CmmaCfg; 3] = [CmmaCfg { bm: 128, bn: 128, pm: 2, pn: 2 }, CmmaCfg { bm: 128, bn: 64, pm: 4, pn: 2 }, CmmaCfg { bm: 64, bn: 64, pm: 2, pn: 2 }];
+const CMMA_CFGS: [CmmaCfg; 4] = [
+    CmmaCfg { bm: 128, bn: 128, pm: 2, pn: 2 },
+    CmmaCfg { bm: 128, bn: 64, pm: 4, pn: 2 },
+    CmmaCfg { bm: 64, bn: 64, pm: 2, pn: 2 },
+    CmmaCfg { bm: 64, bn: 32, pm: 2, pn: 1 }, // the attention head width
+];
 
 /// k is staged 32 at a time.
 const CMMA_BK: usize = 32;
@@ -437,7 +441,7 @@ fn matmul_cmma(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
     let tiles = (m / cfg.bm) * (n / cfg.bn);
     let stages = k / CMMA_BK;
     let epi_free = epi.bias.is_none() && !epi.relu && epi.mask.is_none() && epi.residual.is_none();
-    let splits = if epi_free && out.ld == 0 { SPLIT_TARGET.div_ceil(batch * tiles).min(stages / 2).max(1) } else { 1 };
+    let splits = if epi_free && out.ld == 0 && out.group == 1 { SPLIT_TARGET.div_ceil(batch * tiles).min(stages / 2).max(1) } else { 1 };
     let slice_stages = stages.div_ceil(splits);
     let splits = stages.div_ceil(slice_stages);
     let scratch = (splits > 1).then(|| client().empty(batch * splits * m * n * 4));
@@ -446,11 +450,11 @@ fn matmul_cmma(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
         None => out,
     };
     let accumulate = epi.accumulate && scratch.is_none();
-    let (_, _, lda) = a.layout(if a.trans { m } else { k });
-    let (_, _, ldb) = b.layout(if b.trans { k } else { n });
-    let (_, _, ldo) = out.layout(n);
+    let (ag, ai, lda) = a.layout(if a.trans { m } else { k });
+    let (bg, bi, ldb) = b.layout(if b.trans { k } else { n });
+    let (og, oi, ldo) = out.layout(n);
     // cmma::store straight to global memory needs aligned offsets; otherwise (or with an epilogue) go through shared memory.
-    let direct = epi_free && !accumulate && out.off % 4 == 0 && out.stride % 4 == 0 && ldo % 4 == 0;
+    let direct = epi_free && !accumulate && out.off % 4 == 0 && out.stride % 4 == 0 && oi % 4 == 0 && ldo % 4 == 0;
     super::count_launch_as(|| {
         let t = |x: bool| if x { "T" } else { "N" };
         let ops = [(epi.bias.is_some(), " +bias"), (epi.relu, " relu"), (epi.mask.is_some(), " mask"), (epi.residual.is_some(), " +res"), (epi.accumulate, " +=")];
@@ -473,12 +477,18 @@ fn matmul_cmma(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usi
         u(splits),
         u(a.off),
         u(a.stride),
+        ag,
+        ai,
         lda,
         u(b.off),
         u(b.stride),
+        bg,
+        bi,
         ldb,
         u(out.off),
         u(out.stride),
+        og,
+        oi,
         ldo,
         u(bias_off),
         u(epi.bias_stride),
@@ -536,12 +546,18 @@ fn k_matmul_cmma(
     splits: u32,
     a_off: u32,
     a_stride: u32,
+    a_group: u32,
+    a_inner: u32,
     lda: u32,
     b_off: u32,
     b_stride: u32,
+    b_group: u32,
+    b_inner: u32,
     ldb: u32,
     o_off: u32,
     o_stride: u32,
+    o_group: u32,
+    o_inner: u32,
     ldo: u32,
     bias_off: u32,
     bias_stride: u32,
@@ -584,9 +600,9 @@ fn k_matmul_cmma(
     let zb = z / splits;
     let s0 = (z % splits) * slice_stages;
     let s1 = u32::min(s0 + slice_stages, stages);
-    let a0 = a_off + zb * a_stride;
-    let b0 = b_off + zb * b_stride;
-    let o0 = z * o_stride;
+    let a0 = a_off + (zb / a_group) * a_stride + (zb % a_group) * a_inner;
+    let b0 = b_off + (zb / b_group) * b_stride + (zb % b_group) * b_inner;
+    let o0 = (z / o_group) * o_stride + (z % o_group) * o_inner;
 
     let fm_n = comptime![(bm / (pm * 16)) as usize];
     let fn_n = comptime![(bn / (pn * 16)) as usize];
@@ -902,7 +918,21 @@ mod tests {
     #[test]
     #[ignore = "needs the discrete GPU"]
     fn matmul_head_views_match_reference() {
-        let (bsz, heads, t, w) = (2, 3, 5, 4);
+        check_head_views(2, 3, 5, 4, false, 1e-5);
+    }
+
+    /// The same at the attention shapes (head width 32, t 64), where the f16 path must take every one of the three.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn matmul_f16_head_views_match_reference() {
+        if !client().features().matmul.cmma.contains(&crate::gpu_step::knn::f16_config()) {
+            return;
+        }
+        check_head_views(2, 4, 64, 32, true, 1e-2);
+        assert!(pick_cmma(8, 64, 32, 64).is_some() && pick_cmma(8, 64, 64, 32).is_some());
+    }
+
+    fn check_head_views(bsz: usize, heads: usize, t: usize, w: usize, use_f16: bool, tol: f32) {
         let (hw, fused) = (heads * w, 3 * heads * w);
         let batch = bsz * heads;
         let mut rng = Rng::new(9);
@@ -925,7 +955,7 @@ mod tests {
             }
         }
         let sh = client().empty(want.len() * 4);
-        matmul(
+        matmul_with(
             MatRef::heads(&qh, 0, fused, t, heads, w),
             MatRef { trans: true, ..MatRef::heads(&qh, hw, fused, t, heads, w) },
             MatRef { stride: t * t, ..MatRef::new(&sh) },
@@ -934,9 +964,10 @@ mod tests {
             w,
             t,
             Epilogue::default(),
+            use_f16,
         );
         let e = err(&read(&sh), &want);
-        assert!(e < 1e-5, "scores: {e}");
+        assert!(e < tol, "scores: {e}");
 
         let mut want = ctx0.clone();
         for z in 0..batch {
@@ -947,7 +978,7 @@ mod tests {
             }
         }
         let ch = upload(&ctx0);
-        matmul(
+        matmul_with(
             MatRef { stride: t * t, ..MatRef::new(&ph) },
             MatRef::heads(&qh, 2 * hw, fused, t, heads, w),
             MatRef::heads(&ch, 0, hw, t, heads, w),
@@ -956,9 +987,10 @@ mod tests {
             t,
             w,
             Epilogue { accumulate: true, ..Default::default() },
+            use_f16,
         );
         let e = err(&read(&ch), &want);
-        assert!(e < 1e-5, "ctx: {e}");
+        assert!(e < tol, "ctx: {e}");
 
         let mut want = qkv.clone();
         for z in 0..batch {
@@ -969,7 +1001,7 @@ mod tests {
             }
         }
         let gh = upload(&qkv);
-        matmul(
+        matmul_with(
             MatRef { stride: t * t, trans: true, ..MatRef::new(&ph) },
             MatRef::heads(&dh, 0, hw, t, heads, w),
             MatRef::heads(&gh, 2 * hw, fused, t, heads, w),
@@ -978,8 +1010,9 @@ mod tests {
             t,
             w,
             Epilogue { accumulate: true, ..Default::default() },
+            use_f16,
         );
         let e = err(&read(&gh), &want);
-        assert!(e < 1e-5, "dV: {e}");
+        assert!(e < tol, "dV: {e}");
     }
 }
