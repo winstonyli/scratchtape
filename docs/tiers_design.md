@@ -668,6 +668,14 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   score, so a small optimism). Cost: a ~25 s fit once plus a 256x256 multiply per key and query (8 threads); the search itself
   is unchanged (656.7 s vs 696 s is load, not a speedup). Not yet a proper option; the patch is the reference.
 
+- **`whiten=<alpha>` is now an option; alpha 0.25 on the full run (2026-10-08): alpha 0.5 stays.** The patch became a
+  proper option (default off; `jacobi_eigen` / `whitening_matrix` unit test; slice check `whiten=0.5`,
+  `knn:256:0.4:30:50:100` = 1.0899, as the patch). Full run at alpha 0.25 (`scripts/tier_full_whiten.sh 0.25`,
+  `runs/tier_full_whiten_0.25.log`, 648.6 s), stack CE: 22:36:73 **1.1121**, 30:40:100 1.1125, 30:50:100 1.1127, 38:63:127
+  1.1165, 15:25:50 1.1173 (memory alone 1.1185). Alpha 0.5 best 1.1118, no whitening 1.1138, so the optimum is flat between
+  0.25 and 0.5 (0.0003 apart) and the full-set gain from whitening is ~0.002 either way. Use `whiten=0.5` with
+  `knn:256:0.4:30:50:100`. Best deployable stack: **1.1118 (-0.0646)**.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
