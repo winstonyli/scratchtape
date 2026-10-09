@@ -94,7 +94,7 @@ fn f16_enabled() -> bool {
 fn matmul_with(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usize, n: usize, epi: Epilogue, use_f16: bool) {
     assert!(!out.trans, "out is stored row-major");
     if use_f16 {
-        if let Some(cfg) = pick_cmma(batch, m, k, n) {
+        if let Some(cfg) = pick_cmma(m, k, n) {
             return matmul_cmma(a, b, out, batch, m, k, n, epi, cfg);
         }
     }
@@ -402,31 +402,25 @@ struct CmmaCfg {
     pn: usize,
 }
 
-const CMMA_CFGS: [CmmaCfg; 3] = [CmmaCfg { bm: 128, bn: 128, pm: 2, pn: 2 }, CmmaCfg { bm: 128, bn: 64, pm: 4, pn: 2 }, CmmaCfg { bm: 64, bn: 64, pm: 2, pn: 2 }];
+/// The first that divides m and n. Two double-buffered stages of A and B (f16) plus the epilogue tiles must fit the 32 KiB of
+/// shared memory, which rules out 128-wide tiles; the 64x32 one is for the attention head width (n a multiple of 32 only).
+const CMMA_CFGS: [CmmaCfg; 2] = [CmmaCfg { bm: 64, bn: 64, pm: 2, pn: 2 }, CmmaCfg { bm: 64, bn: 32, pm: 2, pn: 1 }];
 
 /// k is staged 32 at a time.
 const CMMA_BK: usize = 32;
 
-/// The largest tile that divides m and n and still gives `SPLIT_TARGET` cubes (else the smallest that divides); None
-/// when k, m or n don't tile: those matmuls stay on the f32 kernel.
-fn pick_cmma(batch: usize, m: usize, k: usize, n: usize) -> Option<CmmaCfg> {
+/// None when k, m or n don't tile: those matmuls stay on the f32 kernel.
+fn pick_cmma(m: usize, k: usize, n: usize) -> Option<CmmaCfg> {
     static PLANE: OnceLock<usize> = OnceLock::new();
     let plane = *PLANE.get_or_init(|| client().properties().hardware.plane_size_max as usize);
     if k == 0 || k % CMMA_BK != 0 {
         return None;
     }
-    let fits = |c: &&CmmaCfg| {
+    CMMA_CFGS.iter().copied().find(|c| {
         let threads = plane * c.pm * c.pn;
         m % c.bm == 0 && n % c.bn == 0 && threads <= 1024 && (c.bm * CMMA_BK) % threads == 0 && (c.bn * CMMA_BK) % threads == 0
-    };
-    let cubes = |c: &CmmaCfg| batch * (m / c.bm) * (n / c.bn);
-    let fitting: Vec<&CmmaCfg> = CMMA_CFGS.iter().filter(fits).collect();
-    fitting.iter().find(|c| cubes(c) >= SPLIT_TARGET).or(fitting.last()).map(|c| **c).or(Some(CMMA_NARROW).filter(|c| fits(&c)))
+    })
 }
-
-/// Only for n that is a multiple of 32 but not 64 (the attention head width): where a 64-wide tile fits it is the better
-/// one even with fewer cubes (split-k fills the GPU instead).
-const CMMA_NARROW: CmmaCfg = CmmaCfg { bm: 64, bn: 32, pm: 2, pn: 1 };
 
 /// The f16 matrix-core version of the launch(es) in `matmul_with`, same semantics; m, n, k tile `cfg`.
 #[allow(clippy::too_many_arguments)]
@@ -585,8 +579,10 @@ fn k_matmul_cmma(
     let b_len = comptime![(if tb { bn * (32 + pad) } else { 32 * (bn + pad) }) as usize];
     let a_iters = comptime![bm * 32 / threads];
     let b_iters = comptime![bn * 32 / threads];
-    let mut a_s = Shared::<[f16]>::new_slice(a_len);
-    let mut b_s = Shared::<[f16]>::new_slice(b_len);
+    let a_len_u = comptime![a_len as u32];
+    let b_len_u = comptime![b_len as u32];
+    let mut a_s = Shared::<[f16]>::new_slice(comptime![2 * a_len]);
+    let mut b_s = Shared::<[f16]>::new_slice(comptime![2 * b_len]);
 
     let lane = UNIT_POS_X;
     let pid = UNIT_POS_Y;
@@ -613,56 +609,67 @@ fn k_matmul_cmma(
         acc.push(cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0));
     }
 
-    for s in s0..s1 {
-        let k0 = s * 32;
-        #[unroll]
-        for i in 0..a_iters {
-            let e = tid + threads * i;
-            if ta {
-                let c = e / bm;
-                let r = e % bm;
-                a_s[(c * a_ld + r) as usize] = f16::cast_from(a[(a0 + (k0 + c) * lda + row0 + r) as usize]);
-            } else {
-                let r = e / 32;
-                let c = e % 32;
-                a_s[(r * a_ld + c) as usize] = f16::cast_from(a[(a0 + (row0 + r) * lda + k0 + c) as usize]);
-            }
-        }
-        #[unroll]
-        for i in 0..b_iters {
-            let e = tid + threads * i;
-            if tb {
-                let c = e / 32;
-                let r = e % 32;
-                b_s[(c * b_ld + r) as usize] = f16::cast_from(b[(b0 + (col0 + c) * ldb + k0 + r) as usize]);
-            } else {
-                let r = e / bn;
-                let c = e % bn;
-                b_s[(r * b_ld + c) as usize] = f16::cast_from(b[(b0 + (k0 + r) * ldb + col0 + c) as usize]);
-            }
-        }
-        sync_cube();
-        #[unroll]
-        for kf in 0..2u32 {
-            let mut bf = Sequence::<cmma::Matrix<f16>>::new();
+    // Double buffered: iteration st stages k-stage st into buffer st % 2 and multiplies stage st - 1 out of the other
+    // buffer, then one barrier. The stage written was last read two iterations ago (before the previous barrier).
+    for st in s0..s1 + 1 {
+        if st < s1 {
+            let k0 = st * 32;
+            let ab = (st % 2) * a_len_u;
+            let bb = (st % 2) * b_len_u;
             #[unroll]
-            for j in 0..fn_n {
-                let mut off = (kf * 16 * b_ld + wn0 + j as u32 * 16) as usize;
-                if tb {
-                    off = ((wn0 + j as u32 * 16) * b_ld + kf * 16) as usize;
-                }
-                bf.push(cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, lb, &b_s[off..b_len], b_ld));
-            }
-            #[unroll]
-            for i in 0..fm_n {
-                let mut off = ((wm0 + i as u32 * 16) * a_ld + kf * 16) as usize;
+            for i in 0..a_iters {
+                let e = tid + threads * i;
                 if ta {
-                    off = (kf * 16 * a_ld + wm0 + i as u32 * 16) as usize;
+                    let c = e / bm;
+                    let r = e % bm;
+                    a_s[(ab + c * a_ld + r) as usize] = f16::cast_from(a[(a0 + (k0 + c) * lda + row0 + r) as usize]);
+                } else {
+                    let r = e / 32;
+                    let c = e % 32;
+                    a_s[(ab + r * a_ld + c) as usize] = f16::cast_from(a[(a0 + (row0 + r) * lda + k0 + c) as usize]);
                 }
-                let af = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, la, &a_s[off..a_len], a_ld);
+            }
+            #[unroll]
+            for i in 0..b_iters {
+                let e = tid + threads * i;
+                if tb {
+                    let c = e / 32;
+                    let r = e % 32;
+                    b_s[(bb + c * b_ld + r) as usize] = f16::cast_from(b[(b0 + (col0 + c) * ldb + k0 + r) as usize]);
+                } else {
+                    let r = e / bn;
+                    let c = e % bn;
+                    b_s[(bb + r * b_ld + c) as usize] = f16::cast_from(b[(b0 + (k0 + r) * ldb + col0 + c) as usize]);
+                }
+            }
+        }
+        if st > s0 {
+            let ab = ((st - 1) % 2) * a_len_u;
+            let bb = ((st - 1) % 2) * b_len_u;
+            #[unroll]
+            for kf in 0..2u32 {
+                let mut bf = Sequence::<cmma::Matrix<f16>>::new();
                 #[unroll]
                 for j in 0..fn_n {
-                    cmma::execute(&af, bf.index(j), acc.index(i * fn_n + j), acc.index(i * fn_n + j));
+                    let mut off = (kf * 16 * b_ld + wn0 + j as u32 * 16) as usize;
+                    if tb {
+                        off = ((wn0 + j as u32 * 16) * b_ld + kf * 16) as usize;
+                    }
+                    let o = off + bb as usize;
+                    bf.push(cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, lb, &b_s[o..o + b_len], b_ld));
+                }
+                #[unroll]
+                for i in 0..fm_n {
+                    let mut off = ((wm0 + i as u32 * 16) * a_ld + kf * 16) as usize;
+                    if ta {
+                        off = (kf * 16 * a_ld + wm0 + i as u32 * 16) as usize;
+                    }
+                    let o = off + ab as usize;
+                    let af = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, la, &a_s[o..o + a_len], a_ld);
+                    #[unroll]
+                    for j in 0..fn_n {
+                        cmma::execute(&af, bf.index(j), acc.index(i * fn_n + j), acc.index(i * fn_n + j));
+                    }
                 }
             }
         }
@@ -811,8 +818,9 @@ mod tests {
             (3, 64, 64, 64, true, false, false, false, false, true, true),
             (2, 128, 32, 128, false, false, true, false, true, true, true), // everything, bias per matrix
             (1, 128, 64, 64, false, false, false, false, true, false, false),
-            (1, 256, 128, 256, false, true, false, false, false, false, false), // 128x128 tile
-            (1, 256, 128, 128, false, false, true, true, false, false, false), // 128x64 tile
+            (1, 256, 128, 256, false, true, false, false, false, false, false), // more stages, 4 tiles
+            (1, 256, 128, 128, false, false, true, true, false, false, false),
+            (2, 128, 64, 96, false, false, true, true, false, true, false), // n = 96: the 64x32 tile, everything but the mask
             (1, 128, 1024, 128, true, false, false, false, false, false, false), // split 8, no epilogue
             (1, 128, 1024, 128, true, false, false, false, false, false, true), // split, accumulated
             (3, 64, 1024, 64, true, false, false, false, false, false, true), // batched split
@@ -904,7 +912,7 @@ mod tests {
             let case = format!("batch {batch} m {m} k {k} n {n} ta {ta} tb {tb} bias {has_bias} relu {relu} mask {has_mask} res {has_res} acc {acc}");
             assert_eq!(got.len(), want.len(), "{case}");
             // Also covers the padding between batches and before the offset.
-            let case = format!("{case} f16 {use_f16} cfg {:?}", if use_f16 { pick_cmma(batch, m, k, n) } else { None });
+            let case = format!("{case} f16 {use_f16} cfg {:?}", if use_f16 { pick_cmma(m, k, n) } else { None });
             assert!(err <= tol * scale, "{case}: max err {err} (scale {scale})");
         }
     }
@@ -928,7 +936,7 @@ mod tests {
             return;
         }
         check_head_views(2, 4, 64, 32, true, 1e-2);
-        assert!(pick_cmma(8, 64, 32, 64).is_some() && pick_cmma(8, 64, 64, 32).is_some());
+        assert!(pick_cmma(64, 32, 64).is_some() && pick_cmma(64, 64, 32).is_some());
     }
 
     fn check_head_views(bsz: usize, heads: usize, t: usize, w: usize, use_f16: bool, tol: f32) {
