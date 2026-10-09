@@ -21,6 +21,8 @@
 //                   so a word cut by the window's start is seen whole (a CPU-side working memory the model lacks); `f` also
 //                   predicts the FIRST letter of the next word (between words) from the words that followed the previous
 //                   word. `lexicon:<eps>:h` takes the `h` flag too.
+//   wrap:<lambda>   the line-wrap tier: where the 64-byte window shows no newline but the 256-byte context does, the model's mass on newline
+//                   and space is re-split by the train text's newline rate at that column (after a letter / after another byte).
 //   knn:<k>:<lambda>:<temp>
 //                   the memory tier (kNN-LM style): keys are `tap` hidden states of `store` evenly spaced TRAIN
 //                   windows run through the frozen model, values their next bytes; the k nearest keys (squared L2)
@@ -112,6 +114,8 @@ fn is_letter(b: usize) -> bool {
 }
 
 /// Position classes for the `classes=1` loss breakdown: whether the byte being read is a letter, and what kind of byte is predicted.
+/// Column buckets for the line-end table: bytes since the last newline (the last bucket also holds "none in 256 bytes").
+const COLUMN_EDGES: [usize; 7] = [20, 40, 56, 64, 68, 71, 74];
 const CLASS_NAMES: [&str; 10] = [
     "after non-letter -> lower", "after non-letter -> UPPER", "after non-letter -> space", "after non-letter -> newline", "after non-letter -> other",
     "after letter -> lower", "after letter -> UPPER", "after letter -> space", "after letter -> newline", "after letter -> other",
@@ -399,6 +403,72 @@ impl Tier for Words {
     }
 }
 
+/// Bytes since the last newline in `seq` (0: the last byte is a newline), None if it holds none.
+fn column(seq: &[usize]) -> Option<usize> {
+    seq.iter().rposition(|&b| b == b'\n' as usize).map(|i| seq.len() - 1 - i)
+}
+
+/// The line-wrap tier (KR&R): the books are hard-wrapped at ~72 bytes, longer than the model's 64-byte window, so where
+/// the window shows no newline the model does not know the column. From the train text, the rate of a newline (rather than a
+/// space) at each column, separately after a letter and after another byte; where the window has no newline but the
+/// 256-byte context has one, the newline/space split of the model's mass on those two bytes is mixed with that rate.
+struct Wrap {
+    lambda: f64,
+    /// [after a letter][column]: (newlines, spaces) that followed.
+    counts: [Vec<(u32, u32)>; 2],
+    positions: usize,
+    applied: usize,
+}
+
+const WRAP_COLUMNS: usize = 128;
+
+impl Wrap {
+    fn new(train: &[usize], lambda: f64) -> Wrap {
+        let mut counts = [vec![(0u32, 0u32); WRAP_COLUMNS], vec![(0u32, 0u32); WRAP_COLUMNS]];
+        let mut last_nl: Option<usize> = None;
+        for j in 0..train.len() - 1 {
+            if train[j] == b'\n' as usize {
+                last_nl = Some(j);
+            }
+            let Some(c) = last_nl.map(|i| j - i) else { continue };
+            let cell = &mut counts[is_letter(train[j]) as usize][c.min(WRAP_COLUMNS - 1)];
+            match train[j + 1] as u8 {
+                b'\n' => cell.0 += 1,
+                b' ' => cell.1 += 1,
+                _ => {}
+            }
+        }
+        Wrap { lambda, counts, positions: 0, applied: 0 }
+    }
+
+    /// P(newline | newline or space follows) at this column, smoothed towards one half.
+    fn newline_rate(&self, after_letter: bool, column: usize) -> f64 {
+        let (nl, sp) = self.counts[after_letter as usize][column.min(WRAP_COLUMNS - 1)];
+        (nl as f64 + 0.5) / (nl as f64 + sp as f64 + 1.0)
+    }
+}
+
+impl Tier for Wrap {
+    fn adjust(&mut self, ctx: &Ctx, probs: &mut [f64]) {
+        self.positions += 1;
+        if ctx.window.contains(&(b'\n' as usize)) {
+            return;
+        }
+        let Some(c) = column(ctx.context) else { return };
+        let mass = probs[b'\n' as usize] + probs[b' ' as usize];
+        if mass <= 0.0 {
+            return;
+        }
+        self.applied += 1;
+        let q = self.newline_rate(is_letter(*ctx.window.last().unwrap()), c);
+        probs[b'\n' as usize] = (1.0 - self.lambda) * probs[b'\n' as usize] + self.lambda * mass * q;
+        probs[b' ' as usize] = (1.0 - self.lambda) * probs[b' ' as usize] + self.lambda * mass * (1.0 - q);
+    }
+    fn report(&self) -> String {
+        format!("wrap: applied (window shows no newline, context does) at {} of {} positions", self.applied, self.positions)
+    }
+}
+
 /// The datastore (`gpu_step::knn`): `tap` hidden states of train positions and the bytes that followed them.
 /// Shared by all knn specs, which reuse one neighbour search per chunk.
 struct Store {
@@ -618,6 +688,7 @@ fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>, dump: bool
         .map(|part| {
             let (kind, arg) = part.split_once(':').unwrap_or((part, ""));
             match kind {
+                "wrap" => Box::new(Wrap::new(train, arg.parse().unwrap_or_else(|_| panic!("wrap:<lambda>, got {part}")))) as Box<dyn Tier>,
                 "lexicon" => {
                     let (eps, flags) = arg.split_once(':').unwrap_or((arg, ""));
                     let eps = eps.parse().unwrap_or_else(|_| panic!("lexicon:<eps>[:h], got {part}"));
@@ -960,6 +1031,8 @@ fn main() {
     let mut cls_n = [0usize; 10];
     let mut cls_model = [0.0f64; 10];
     let mut cls_tier = vec![[0.0f64; 10]; tiers.len()];
+    // `classes=1`, line ends: [target is a newline or a space][a newline in the 64-byte window][column bucket] -> (count, model CE sum).
+    let mut col = [[[(0usize, 0.0f64); COLUMN_EDGES.len() + 1]; 2]; 2];
     let n_win = (held_out.len() - 1) / SEQ_LEN;
     let starts: Vec<usize> = (offset * unit..held_out.len() - SEQ_LEN).step_by(unit * stride).filter(|s| s / SEQ_LEN * part_n / n_win == part_i).collect();
     // Wall time per phase: forward launch + readback, tier prepare (kNN search + readback), per-row scoring, online writes.
@@ -1013,6 +1086,12 @@ fn main() {
             let cls = class_of(*window.last().unwrap(), f.targets[r]);
             cls_n[cls] += 1;
             cls_model[cls] -= probs[f.targets[r]].ln();
+            if let Some(kind) = [b'\n', b' '].iter().position(|&b| b as usize == f.targets[r]) {
+                let column = context.iter().rposition(|&b| b == b'\n' as usize).map_or(usize::MAX, |i| context.len() - 1 - i);
+                let cell = &mut col[kind][window.contains(&(b'\n' as usize)) as usize][COLUMN_EDGES.iter().filter(|&&e| column >= e).count()];
+                cell.0 += 1;
+                cell.1 -= probs[f.targets[r]].ln();
+            }
             ce_device += f.row_loss[r] as f64;
             let hid = if need_hidden { &f.hidden[r * cfg.d..(r + 1) * cfg.d] } else { &[][..] };
             let ctx = Ctx { row: r, window, context, target: f.targets[r], hidden: hid };
@@ -1059,6 +1138,14 @@ fn main() {
     if opt.contains_key("classes") {
         // Per class: its share of the positions, the model's mean CE there and its share of the total CE, then for each
         // spec the CE gain in that class as thousandths of a nat of the overall CE (the columns sum to the overall gain).
+        println!("model CE at newline and space targets by column (bytes since the last newline) and whether the 64-byte window shows a newline:");
+        for (k, kind) in ["newline", "space"].iter().enumerate() {
+            for (v, vis) in ["window has no newline", "window has a newline"].iter().enumerate() {
+                let cells: Vec<String> = col[k][v].iter().map(|&(c, s)| if c == 0 { "      -".to_string() } else { format!("{:5.2}({:>5})", s / c as f64, c) }).collect();
+                println!("  {kind:8} {vis:22} {}", cells.join(" "));
+            }
+        }
+        println!("  columns: <20 <40 <56 <64 <68 <71 <74 >=74 (CE nats(count))");
         println!("loss by position class (gain columns: 1e-3 nats of overall CE, summing to the overall gain):");
         print!("{:30} {:>6} {:>7} {:>7}", "class", "share%", "modelCE", "of CE%");
         for i in 0..specs.len() {
@@ -1089,6 +1176,33 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lines of nine letters: a newline always follows a letter at column 9, a letter never does at column 5. The tier
+    /// moves the model's newline/space split towards the train rate only where the window shows no newline.
+    #[test]
+    fn wrap_resplits_newline_and_space_by_column_only_when_the_window_is_blind() {
+        let train: Vec<usize> = "aaaaaaaaa\n".repeat(50).bytes().map(|b| b as usize).collect();
+        let mut wrap = Wrap::new(&train, 1.0);
+        assert!(wrap.newline_rate(true, 9) > 0.95);
+        let line = "\naaaaaaaaa".bytes().map(|b| b as usize).collect::<Vec<_>>();
+        let mut probs = vec![0.0; VOCAB];
+        probs[b'\n' as usize] = 0.1;
+        probs[b' ' as usize] = 0.4;
+        probs[b'a' as usize] = 0.5;
+        // Blind window (64 bytes of 'a'), the context reaches the newline 9 bytes back.
+        let window = vec![b'a' as usize; 64];
+        let ctx = Ctx { row: 0, window: &window, context: &line, target: b'\n' as usize, hidden: &[] };
+        wrap.adjust(&ctx, &mut probs);
+        assert!(probs[b'\n' as usize] > 0.45 && probs[b' ' as usize] < 0.05 && (probs[b'a' as usize] - 0.5).abs() < 1e-12, "{probs:?}");
+        // A window that shows a newline leaves the distribution alone.
+        let mut probs2 = vec![0.0; VOCAB];
+        probs2[b'\n' as usize] = 0.1;
+        probs2[b' ' as usize] = 0.4;
+        probs2[b'a' as usize] = 0.5;
+        let seen = Ctx { window: &line, ..ctx };
+        wrap.adjust(&seen, &mut probs2);
+        assert_eq!((probs2[b'\n' as usize], probs2[b' ' as usize]), (0.1, 0.4));
+    }
 
     /// alpha = 1 whitens: W cov W is c^2 times the identity up to the ridge (1%), and alpha = 0 leaves the metric alone (W = identity).
     #[test]

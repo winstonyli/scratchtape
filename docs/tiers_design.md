@@ -703,6 +703,33 @@ tier_eval runs/nov_big_k1_d0.1_8m_m0.ckpt expect=1.2408 tier=lexicon:<eps> ...
   60-75), longer than the model's 64-byte window, so the model often cannot see the last newline and has no column. A
   rule tier that tracks the column from CONTEXT bytes is the one symbolic tier with a measurable target.
 
+### Line-wrap tier: the column rule (2026-10-08)
+
+Column check (`classes=1` log, model alone): at newline targets with no newline in the 64-byte window the model's CE is
+1.25-1.79 nats at columns 40-74 (4.1k of 6.2k such targets sit at >=56), against 0.39 where the window shows the
+newline; at space targets the same split is 0.44-0.62 vs 0.28-0.31. The model cannot see the column, so it cannot
+tell a line end from a word end.
+
+`wrap:<lambda>` (`Wrap`, KR&R rule tier): where the window has no newline but the 256-byte context does, the model's
+mass on newline+space is re-split by the train newline rate at that column (counts by [byte read is letter][column],
+`(nl+0.5)/(nl+sp+1)`), mixed with lambda. Nothing else moves. Test
+`wrap_resplits_newline_and_space_by_column_only_when_the_window_is_blind`; script `scripts/tier_full_wrap.sh`.
+
+| specs | CE | vs model 1.1764 |
+|---|---|---|
+| model + wrap:0.2 / 0.4 / 0.6 / 0.8 / 0.95 | 1.1704 / 1.1665 / 1.1637 / 1.1617 / 1.1608 | -0.0060 ... -0.0155 |
+| stack (lexicon+words+knn+whiten) control | 1.1118 | -0.0646 |
+| stack, wrap:0.8 before knn / after knn | 1.1000 / 1.0964 | -0.0763 / -0.0799 |
+| stack, wrap:0.95 before knn / after knn | 1.0988 / **1.0956** | -0.0776 / **-0.0807** |
+
+After knn is better (knn mixes (1-lambda)p + lambda*knn, so wrap placed last corrects the final newline/space split).
+Per class (1e-3 nats of overall CE): after-letter->newline goes from -1.82 (the memory made it worse) to +11.36, and
+after-letter->space from 3.26 to 5.26; nothing else changes. Applying wrap to every position (not only window-blind
+ones, `WRAP_ALL`) was worse and was removed. The wrap tier adds -0.0162 on top of the 1.1118 stack, the largest single
+gain since the memory itself. Not tried: lambda 1.0, richer conditioning than the column (previous byte class,
+indentation, blank lines), the same rule for the other classes with a visible target.
+
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).

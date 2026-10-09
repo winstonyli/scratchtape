@@ -86,7 +86,7 @@ memory is -0.0425 (the CPU tiers alone -0.0201). The deployable form writes the 
 (-0.0451) against 1.1764 for the model alone at stride 1 (the memory alone -0.0412). Writing each chunk's keys before
 its search (`write=first`), weighting in-document neighbours separately from train neighbours (own temperature and a
 distance shift) and searching the two sources separately (top-256 each) bring the same stack to 1.1138 (-0.0626; the memory
-alone 1.1196), and whitening the keys (`whiten=0.5`) to 1.1118 (-0.0646; memory alone 1.1163); each step and its tuning is in `docs/tiers_design.md`. The memory search is exact
+alone 1.1196), whitening the keys (`whiten=0.5`) to 1.1118 (-0.0646; memory alone 1.1163), and a line-wrap rule tier (`wrap:0.95` after the memory) to 1.0956 (-0.0807); each step and its tuning is in `docs/tiers_design.md`. The memory search is exact
 and took ~5 s per 32-window chunk of 4.5M keys in f32 (2.5x faster than the first version: sampled per-query thresholds,
 multi-thread top-k, unscored rows skipped); the f16 matrix-core search is the default now, and the whole held-out run takes
 826 s (13.8 min; ~1.7 s per chunk, flat as the memory grows to 5M keys; CE identical to 4 decimals). Earlier full runs
