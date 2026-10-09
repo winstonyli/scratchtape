@@ -750,14 +750,30 @@ semicolons 0.9%, `!` 0.5%, `-` 0.5%, `?` 0.3%. The model's CE there is 1.8-4.0 n
 after `\xe2\x80`) already costs 0.03-0.17 nats, so quote matching has nothing to win. What is left is where a clause or
 sentence ends, which is language modelling. KILL: no rule tier for punctuation.
 
-### Longer training, 16M windows (started 2026-10-08 19:16)
+### Longer training, 16M windows (2026-10-08/09)
 
 Question: is the model undertrained? Held-out CE of the 8M run at 1M-window marks: 1.3349 1.2870 1.2684 1.2578 1.2518 1.2475
 1.2430 1.2408 (steps of 0.006, 0.004, 0.0045, 0.002 near the end, with the schedule decaying to the end); the train
 probe is 1.1172 against 1.2408 held out, so the gap is large and more steps may mostly overfit (dropout 0.1 helped at
-4M and 8M). `scripts/train_16m.sh` = the same recipe at `windows=16384000`, `nov_big_k1_d0.1_16m`. Command: `bash
-scripts/train_16m.sh`; log `runs/nov_big_k1_d0.1_16m.log`; PID 20136 (fused_models_check.exe); ~10 ms/step, expected
-~2.4 h; resumable (`runs/nov_big_k1_d0.1_16m.resume`). Result and the stack re-run (`warm=32`, best stack, wrap) go here.
+4M and 8M). `scripts/train_16m.sh` = the same recipe at `windows=16384000` (`nov_big_k1_d0.1_16m`; log
+`runs/nov_big_k1_d0.1_16m.log`; started 19:16, killed once at 20:12 for a pause and resumed from the checkpoint, 5535 s of
+wall time plus the gap; 6.75 ms/step in the training clock, ~9.7 in the log's rows because other sessions loaded the CPU).
+
+Result: held-out CE **1.2319** (8M run 1.2408, -0.0089); train probe 1.0919 (1.1172), so the train/held-out gap rose from
+0.124 to 0.140: more steps help, with diminishing returns (a doubling bought what the last 1M windows of the 8M run
+bought in 4). Full stack (`scripts/tier_full_16m.sh`, `warm=32`, whiten 0.5, 773.6 s; CPU 44% from other sessions):
+
+| | 8M model | 16M model | change |
+|---|---|---|---|
+| model alone | 1.1764 | 1.1651 | -0.0113 |
+| + lexicon, words, memory | 1.1118 | 1.1041 | -0.0077 |
+| + wrap:0.95 | 1.0956 | **1.0876** | -0.0080 |
+| gain of all tiers over the model | -0.0807 | -0.0775 | the tiers add 0.003 less |
+
+The better model carries most of its gain through the tiers (0.0080 of 0.0113); the tiers' own contribution shrinks a
+little, as expected when the model learns some of what they supplied. Doubling the steps again would cost ~3 h for a
+guessed -0.005; width at matched steps gave 0.002 (d = 384), so the next model-side lever is the window (option 3) rather
+than more of the same.
 
 ## Order
 
