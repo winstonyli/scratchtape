@@ -730,6 +730,12 @@ gain since the memory itself. Not tried: lambda 1.0, richer conditioning than th
 indentation, blank lines), the same rule for the other classes with a visible target.
 
 
+Tried and reverted (model-only, full held-out; the experiment code was removed, grid: wrap:0.95, 1.0, each with and without :w): wrap lambda 1.0 equals 0.95 (1.1608);
+conditioning the rate on the column relative to the longest complete line in the 256-byte context (this book's wrap
+width, `wrap:<lambda>:w`) is worse than the plain column, 1.1630 vs 1.1608 (-0.0134 vs -0.0155): a context shows only
+2-3 lines, and the longest of them is a noisy width (paragraph ends, verse, indentation), so it blurs a column table that
+already pools well. The plain column stays; the code was removed.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
