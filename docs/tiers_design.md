@@ -834,6 +834,21 @@ training ms/step 10.75 -> 6.36 (light), 11.02 -> 7.72 (heavy). Left in the f16 p
 matrices per cube might save 0.2-0.3 ms), QKV forward 0.24, then mostly non-matmul rows.rs / tokens.rs / tape.rs work.
 Still open: a longer f16 run before making `TRAIN_F16` the default, and a loosened f16 `device_step_matches_cpu_tape`.
 
+### Bias gradients folded into the dW matmul (2026-10-09)
+
+Commit 35b93db. `Epilogue::col_sum` makes the weight-gradient matmul also sum dY's columns (the bias gradient) in the m-tile-0
+cubes over their k-slice: no split-k adds it straight into the bias location, split-k writes per-slice partials that
+`k_split_sum` adds in slice order (deterministic, no float atomics); the f16 kernel sums the raw f32 values before the f16
+cast. All 17 bias gradients (QKV, out-proj, FFN1, FFN2 in 4 blocks, final projection) are folded, `col_sum` and its kernel
+and test are deleted, and an f32 split-scratch size that looked undersized for batch > 1 was corrected (`batch*splits*m*n`).
+Tests: 19 of 19 `gpu_step` ignored tests pass with `TRAIN_F16` unset (re-run by the lead); with `TRAIN_F16=1` only the known
+`device_step_matches_cpu_tape` fails. Loss (512000 windows, real recipe, fresh baselines from a worktree): new f32 final 1.4028
+vs baseline 1.4056 (max gap 0.0041), new f16 1.4057 vs 1.4070 (max gap 0.0043), new f16 vs new f32 max gap 0.0085: float-order
+drift, no divergence. Profile (`TRAIN_F16=1`, contended, CPU 40-90%, Defender off): launches 177 -> 160, GPU 4.81 -> 4.24
+ms/step, host 9.37 -> 5.86 ms/step (the largest host site, 0.86 ms, is gone); training ms/step at low CPU load 4.64 -> 4.49 and
+4.84 -> 4.61 (~4%). Left: `tokens.rs:51` 0.31, layer-norm backward `rows.rs:97` 0.26 and `:94` 0.18, the attention
+`256x[64x64]T.[64x32]N` 0.25, then the matmuls (0.16-0.25 each).
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
