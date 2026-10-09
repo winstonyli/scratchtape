@@ -51,7 +51,7 @@ pub fn embed_backward(dy: &Handle, ids: &Handle, rows: usize, d: usize, t: usize
     super::count_launch();
     k_embed_bwd_tok::launch(
         c,
-        cubes(m.k * vocab * d),
+        CubeCount::Static((vocab * d).div_ceil(EW_DIM as usize) as u32, m.k as u32, 1),
         CubeDim::new_1d(EW_DIM),
         whole(dy),
         whole(ids),
@@ -60,7 +60,6 @@ pub fn embed_backward(dy: &Handle, ids: &Handle, rows: usize, d: usize, t: usize
         d as u32,
         vocab as u32,
         tok_off as u32,
-        m.k as u32,
         stride,
     );
     super::count_launch();
@@ -134,22 +133,43 @@ fn k_embed(ids: &[u32], p: &[f32], y: &mut [f32], rows: u32, d: u32, t: u32, tok
     }
 }
 
-/// One unit per (model, table element); `rows` is per model.
+/// Ids staged in shared memory per pass of `k_embed_bwd_tok`.
+const ID_CHUNK: u32 = 512;
+
+/// One unit per (model, table element) (cube y = model, `rows` per model).
+/// Every unit scans all the model's ids in row order; the cube stages each
+/// chunk of ids in shared memory, so the scan is not a chain of dependent
+/// global loads (it was 0.43 ms for 65k units x 2048 rows).
 #[cube(launch)]
-fn k_embed_bwd_tok(dy: &[f32], ids: &[u32], g: &mut [f32], rows: u32, d: u32, vocab: u32, tok_off: u32, models: u32, stride: u32) {
-    let i = ABSOLUTE_POS as u32;
-    if i < models * vocab * d {
-        let model = i / (vocab * d);
-        let e = i % (vocab * d);
-        let v = e / d;
-        let j = e % d;
-        let r0 = model * rows;
-        let mut s = 0.0f32;
-        for r in 0..rows {
-            if ids[(r0 + r) as usize] == v {
-                s += dy[((r0 + r) * d + j) as usize];
+fn k_embed_bwd_tok(dy: &[f32], ids: &[u32], g: &mut [f32], rows: u32, d: u32, vocab: u32, tok_off: u32, stride: u32) {
+    let mut sh = Shared::<[u32]>::new_slice(512usize);
+    let model = CUBE_POS_Y;
+    let e = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+    let live = e < vocab * d;
+    let v = e / d;
+    let j = e % d;
+    let r0 = model * rows;
+    let mut s = 0.0f32;
+    let mut c0 = 0u32;
+    while c0 < rows {
+        let n = u32::min(ID_CHUNK, rows - c0);
+        let mut q = UNIT_POS_X;
+        while q < n {
+            sh[q as usize] = ids[(r0 + c0 + q) as usize];
+            q += CUBE_DIM_X;
+        }
+        sync_cube();
+        if live {
+            for q in 0..n {
+                if sh[q as usize] == v {
+                    s += dy[((r0 + c0 + q) * d + j) as usize];
+                }
             }
         }
+        sync_cube();
+        c0 += ID_CHUNK;
+    }
+    if live {
         g[(model * stride + tok_off + e) as usize] += s;
     }
 }
@@ -254,7 +274,8 @@ mod tests {
     #[test]
     #[ignore = "needs the discrete GPU"]
     fn embed_matches_cpu_tape() {
-        let (vocab, d, t, batch) = (11, 6, 5, 3);
+        // 750 rows (two id chunks) and 330 table elements (two cubes)
+        let (vocab, d, t, batch) = (11, 30, 5, 150);
         let rows = batch * t;
         let mut rng = Rng::new(8);
         let (tok, pos) = (Embedding::new(&mut rng, vocab, d), Embedding::new(&mut rng, t, d));
