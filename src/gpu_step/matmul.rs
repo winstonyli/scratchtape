@@ -87,6 +87,13 @@ pub fn matmul(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usiz
     matmul_with(a, b, out, batch, m, k, n, epi, f16_enabled());
 }
 
+/// `matmul` that always runs in f32: the attention matmuls, whose f16 rounding costs held-out CE over long training
+/// (+0.0067 at 8M windows with them in f16, +0.0019 without; docs/tiers_design.md).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_f32(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: usize, n: usize, epi: Epilogue) {
+    matmul_with(a, b, out, batch, m, k, n, epi, false);
+}
+
 /// `TRAIN_F16=1` and a device with f16 x f16 -> f32 matrix cores: eligible matmuls run on them (f32 operands are rounded
 /// to f16 while staged into shared memory, products accumulate in f32). Read once.
 fn f16_enabled() -> bool {

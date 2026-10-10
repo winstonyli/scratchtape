@@ -13,7 +13,7 @@
 //! - Fused models (`DeviceParams::upload_models`): every node holds K
 //!   models' rows, model m's the m-th slice. Linear runs as a K-batch
 //!   matmul over the models' weights; ops without parameters don't care.
-use super::matmul::{Epilogue, MatRef, matmul};
+use super::matmul::{Epilogue, MatRef, matmul, matmul_f32};
 use super::rows::{LnOut, layer_norm, layer_norm_backward, softmax, softmax_backward};
 use super::tokens::{CeOut, cross_entropy, cross_entropy_backward, embed, embed_backward, upload_ids};
 use super::{DeviceParams, EW_DIM, buf, client, cubes, k_fill};
@@ -205,7 +205,7 @@ impl<'p> DeviceTape<'p> {
         let y = client().empty(rows * cols * 4);
         let (av, bv) = (self.value(a), self.value(b));
         let (ac, bcols) = (self.nodes[a.0].cols, self.nodes[b.0].cols);
-        matmul(view(av, a_lay, ac, m, k, false), view(bv, b_lay, bcols, br, bc, trans_b), view(&y, out, cols, m, n, false), batch, m, k, n, Epilogue::default());
+        matmul_f32(view(av, a_lay, ac, m, k, false), view(bv, b_lay, bcols, br, bc, trans_b), view(&y, out, cols, m, n, false), batch, m, k, n, Epilogue::default());
         self.push(y, rows, cols, Op::BatchedMatmul { a: a.0, b: b.0, lay: [a_lay, b_lay, out], batch, m, k, n, trans_b })
     }
 
@@ -359,12 +359,12 @@ impl<'p> DeviceTape<'p> {
                     let da_ref = view(&da, a_lay, ac, m, k, false);
                     if trans_b {
                         // c = a bᵀ, b [n, k]: da = dc b, db = dcᵀ a
-                        matmul(dcr, bv_ref, da_ref, batch, m, n, k, Epilogue { accumulate: acc_a, ..Default::default() });
-                        matmul(MatRef { trans: true, ..dcr }, av_ref, db_ref, batch, n, m, k, Epilogue { accumulate: acc_b, ..Default::default() });
+                        matmul_f32(dcr, bv_ref, da_ref, batch, m, n, k, Epilogue { accumulate: acc_a, ..Default::default() });
+                        matmul_f32(MatRef { trans: true, ..dcr }, av_ref, db_ref, batch, n, m, k, Epilogue { accumulate: acc_b, ..Default::default() });
                     } else {
                         // c = a b, b [k, n]: da = dc bᵀ, db = aᵀ dc
-                        matmul(dcr, MatRef { trans: true, ..bv_ref }, da_ref, batch, m, n, k, Epilogue { accumulate: acc_a, ..Default::default() });
-                        matmul(MatRef { trans: true, ..av_ref }, dcr, db_ref, batch, k, m, n, Epilogue { accumulate: acc_b, ..Default::default() });
+                        matmul_f32(dcr, MatRef { trans: true, ..bv_ref }, da_ref, batch, m, n, k, Epilogue { accumulate: acc_a, ..Default::default() });
+                        matmul_f32(MatRef { trans: true, ..av_ref }, dcr, db_ref, batch, k, m, n, Epilogue { accumulate: acc_b, ..Default::default() });
                     }
                 }
                 Op::Softmax { x, scale } => {
