@@ -145,11 +145,13 @@ impl DeviceParams {
         k_sgd::launch(client(), cubes(self.len), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), lr, self.len as u32);
     }
 
-    /// One launch of heavy-ball momentum: v = mu * v + g, then p -= lr * v.
+    /// One launch of heavy-ball momentum: v = mu * v + g, then p -= lr * v, after `decay` = (shrink, mask) if given:
+    /// p *= 1 - shrink * mask (as `decay`, same arithmetic, without its launch).
     /// `v` holds the velocity (`len` f32s, zero at the start of training).
-    pub fn momentum(&self, lr: f32, mu: f32, v: &Handle) {
+    pub fn momentum(&self, lr: f32, mu: f32, v: &Handle, decay: Option<(f32, &Handle)>) {
         count_launch();
-        k_momentum::launch(client(), cubes(self.len), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), buf(v, self.len), lr, mu, self.len as u32);
+        let (shrink, mask) = decay.unwrap_or((0.0, v));
+        k_momentum::launch(client(), cubes(self.len), CubeDim::new_1d(EW_DIM), buf(&self.params, self.len), buf(&self.grads, self.len), buf(v, self.len), buf(mask, self.len), lr, mu, shrink, decay.is_some(), self.len as u32);
     }
 
     /// One launch: p *= 1 - shrink * mask over every parameter (mask is
@@ -225,9 +227,12 @@ fn k_sgd(p: &mut [f32], g: &[f32], lr: f32, len: u32) {
 }
 
 #[cube(launch)]
-fn k_momentum(p: &mut [f32], g: &[f32], v: &mut [f32], lr: f32, mu: f32, len: u32) {
+fn k_momentum(p: &mut [f32], g: &[f32], v: &mut [f32], mask: &[f32], lr: f32, mu: f32, shrink: f32, #[comptime] decay: bool, len: u32) {
     let i = ABSOLUTE_POS;
     if (i as u32) < len {
+        if decay {
+            p[i] *= 1.0 - shrink * mask[i];
+        }
         v[i] = mu * v[i] + g[i];
         p[i] -= lr * v[i];
     }
@@ -412,12 +417,18 @@ mod tests {
         let mut dev = DeviceParams::upload(&p);
         let v = upload_f32(&vec![0.0; n]);
         let mut vel = vec![0.0f32; n];
-        // Two steps, so the second one exercises the carried velocity.
-        for _ in 0..2 {
+        // Two steps, so the second one exercises the carried velocity and the fused decay.
+        let mask: Vec<f32> = (0..n).map(|i| (i % 3 == 0) as u32 as f32).collect();
+        let mask_h = upload_f32(&mask);
+        for step in 0..2 {
             let g: Vec<f32> = (0..n).map(|_| rng.next_gaussian()).collect();
             dev.grads = upload(&g);
-            dev.momentum(0.1, 0.9, &v);
+            let shrink = 0.05 * step as f32;
+            dev.momentum(0.1, 0.9, &v, (step == 1).then_some((shrink, &mask_h)));
             for i in 0..n {
+                if step == 1 {
+                    p[i] *= 1.0 - shrink * mask[i];
+                }
                 vel[i] = 0.9 * vel[i] + g[i];
                 p[i] -= 0.1 * vel[i];
             }

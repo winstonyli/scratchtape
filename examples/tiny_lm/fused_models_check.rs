@@ -360,12 +360,14 @@ fn main() {
         let mut dt = dt.with_distill(alpha * ((step + 1) as f32 / ramp as f32).min(1.0));
         let (_, _, loss) = model_forward(&mut dt, &cfg, &input, &target, k * batch);
         dt.backward(loss);
-        if let Some(ones) = &ones {
-            dev.decay(lr * weight_decay, ones);
-        }
         match &velocity {
-            Some(v) => dev.momentum(lr, momentum, v),
-            None => dev.sgd(lr),
+            Some(v) => dev.momentum(lr, momentum, v, ones.as_ref().map(|m| (lr * weight_decay, m))),
+            None => {
+                if let Some(ones) = &ones {
+                    dev.decay(lr * weight_decay, ones);
+                }
+                dev.sgd(lr)
+            }
         }
         if sync_every > 0 && ((step + 1) % sync_every == 0 || step + 1 == steps) {
             match &outer {

@@ -310,12 +310,14 @@ fn main() {
             };
             let (_, _, dloss) = model_forward(&mut dt, &cfg, &input, &target, batch);
             dt.backward(dloss);
-            if let Some(mask) = &decay_mask {
-                dev.decay(lr * weight_decay, mask);
-            }
             match &velocity {
-                Some(v) => dev.momentum(lr, momentum, v),
-                None => dev.sgd(lr),
+                Some(v) => dev.momentum(lr, momentum, v, decay_mask.as_ref().map(|m| (lr * weight_decay, m))),
+                None => {
+                    if let Some(mask) = &decay_mask {
+                        dev.decay(lr * weight_decay, mask);
+                    }
+                    dev.sgd(lr)
+                }
             }
             continue;
         }

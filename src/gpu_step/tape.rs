@@ -93,6 +93,8 @@ struct Node {
     rows: usize,
     cols: usize,
     grad: Option<Handle>,
+    /// `grad` already has the ReLU mask applied (a fused dropout backward put it there): the node's own backward skips the mask.
+    relu_masked: bool,
     op: Op,
 }
 
@@ -148,7 +150,7 @@ impl<'p> DeviceTape<'p> {
     }
 
     fn push(&mut self, value: Handle, rows: usize, cols: usize, op: Op) -> DVar {
-        self.nodes.push(Node { value, rows, cols, grad: None, op });
+        self.nodes.push(Node { value, rows, cols, grad: None, relu_masked: false, op });
         DVar(self.nodes.len() - 1)
     }
 
@@ -266,6 +268,7 @@ impl<'p> DeviceTape<'p> {
     /// Adds a finished gradient buffer into node v's: aliases it if v has
     /// none yet (see the module doc), otherwise one add launch.
     fn add_grad(&mut self, v: usize, g: Handle) {
+        assert!(!self.nodes[v].relu_masked, "a fused dropout+ReLU backward needs the dropout to be the ReLU node's only gradient source");
         match &self.nodes[v].grad {
             None => self.nodes[v].grad = Some(g),
             Some(dst) => {
@@ -305,7 +308,7 @@ impl<'p> DeviceTape<'p> {
                 }
                 Op::Linear { x, inp, w_off, relu, residual } => {
                     let mut dz = dy.unwrap();
-                    if relu {
+                    if relu && !self.nodes[i].relu_masked {
                         let masked = client().empty(rows * cols * 4);
                         let len = rows * cols;
                         super::count_launch();
@@ -373,8 +376,11 @@ impl<'p> DeviceTape<'p> {
                 }
                 Op::Dropout { x, rate, seed } => {
                     // The forward's mask and scale, regenerated from the seed.
-                    let dx = dropout(&dy.unwrap(), rows * cols, rate, seed);
+                    // Into a ReLU Linear that has no other gradient yet: apply that ReLU's mask in the same launch.
+                    let fuse = matches!(self.nodes[x].op, Op::Linear { relu: true, .. }) && self.nodes[x].grad.is_none();
+                    let dx = if fuse { dropout_relu_backward(&dy.unwrap(), &self.nodes[x].value, rows * cols, rate, seed) } else { dropout(&dy.unwrap(), rows * cols, rate, seed) };
                     self.add_grad(x, dx);
+                    self.nodes[x].relu_masked = fuse;
                 }
             }
         }
@@ -527,23 +533,50 @@ pub fn dropout(x: &Handle, len: usize, rate: f32, seed: u32) -> Handle {
     y
 }
 
-/// `dropout`'s kernel. The mask bits are lowbias32 (Wellons) of
-/// i + seed·golden ratio: an independent-looking 32-bit value per (seed, i).
+/// `dropout` applied to dy (its backward) and then ReLU's backward from the ReLU's output `relu_y`: one launch.
+pub fn dropout_relu_backward(dy: &Handle, relu_y: &Handle, len: usize, rate: f32, seed: u32) -> Handle {
+    let dx = client().empty(len * 4);
+    let threshold = (rate as f64 * 4294967296.0) as u32;
+    super::count_launch();
+    k_dropout_relu_bwd::launch(client(), cubes(len), CubeDim::new_1d(EW_DIM), buf(dy, len), buf(relu_y, len), buf(&dx, len), seed, threshold, 1.0 / (1.0 - rate), len as u32);
+    dx
+}
+
+/// The mask bits of `k_dropout`: lowbias32 (Wellons) of i + seed·golden ratio, an independent-looking 32-bit
+/// value per (seed, i).
+#[cube]
+fn dropout_bits(i: u32, seed: u32) -> u32 {
+    let mut h = i + seed * 0x9e37_79b9u32;
+    h ^= h >> 16;
+    h *= 0x7feb_352du32;
+    h ^= h >> 15;
+    h *= 0x846c_a68bu32;
+    h ^ (h >> 16)
+}
+
+/// `dropout`'s kernel.
 #[cube(launch)]
 fn k_dropout(x: &[f32], y: &mut [f32], seed: u32, threshold: u32, scale: f32, len: u32) {
     let i = ABSOLUTE_POS;
     if (i as u32) < len {
-        let mut h = (i as u32) + seed * 0x9e37_79b9u32;
-        h ^= h >> 16;
-        h *= 0x7feb_352du32;
-        h ^= h >> 15;
-        h *= 0x846c_a68bu32;
-        h ^= h >> 16;
         let mut v = 0.0f32;
-        if h >= threshold {
+        if dropout_bits(i as u32, seed) >= threshold {
             v = x[i] * scale;
         }
         y[i] = v;
+    }
+}
+
+/// dx = dropout(dy) where relu_y > 0, else 0.
+#[cube(launch)]
+fn k_dropout_relu_bwd(dy: &[f32], relu_y: &[f32], dx: &mut [f32], seed: u32, threshold: u32, scale: f32, len: u32) {
+    let i = ABSOLUTE_POS;
+    if (i as u32) < len {
+        let mut v = 0.0f32;
+        if dropout_bits(i as u32, seed) >= threshold && relu_y[i] > 0.0 {
+            v = dy[i] * scale;
+        }
+        dx[i] = v;
     }
 }
 
