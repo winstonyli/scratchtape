@@ -1001,5 +1001,23 @@ against 1.2307 on novels6 (-0.0114); train probe 1.1329 against 1.0756 (less mem
 novels6: 4M 1.2679/1.2583, 8M 1.2454/1.2447, 16M 1.2300/1.2339, 24M 1.2252/1.2323: the extra text loses early and wins once
 novels6 starts to overfit (crossover between 8M and 16M). Stack (`scripts/tier_full_32m_novels22.sh`): model alone 1.1478
 (1.1633), + lexicon/words/memory 1.0981 (1.1008), + wrap **1.0821** (1.0844; new best, -0.0023). The model gained 0.0155 but
-the stack only 0.0023: the tiers add -0.0657 here against -0.0789 on novels6; a likely reading (untested) is that the memory/lexicon tiers already carried
-much of what the extra text teaches the model (the memory is built from the same training text, now partly novel to it).
+the stack only 0.0023: the tiers add -0.0657 here against -0.0789 on novels6. That run used the default `corpus=novels6` for
+the lexicon, words and memory (the checkpoint only fixes the model), so they knew none of the extra books. Rerun with
+`corpus=novels22` for them (`scripts/tier_full_32m_novels22_corpus22.sh`): lexicon misses fall from 1.40% to 0.77% of held-out
+words, but the stack is **1.0827**, not better (model 1.1478; + lexicon/words/memory 1.0986; + wrap 1.0827; tiers -0.0651).
+The memory is capped at `store=100000` evenly spaced windows, so a larger train pool thins the sampling rather than adding
+keys, and a bigger lexicon did not help: more text reaches the stack only through the model. Best stack stays 1.0821.
+
+### Where the stack's remaining CE sits: survey (2026-10-10)
+
+`tier_eval ... survey=1` (last spec; `survey_report`, test `survey_splits_letters_by_lexicon_and_recency`) splits the CE of the
+1.0827 stack by target kind. Of 1.0827 nats: letters of words **in the train lexicon 83.4%** (first letter 42.4%, 2nd-3rd 31.1%,
+4th+ 9.9%); punctuation `. , ; : ! ? -` 6.5%; space 4.7%; other bytes 1.4%; newline 1.2%; quote/bracket/marks 0.3%; digits 0.1%;
+words not in the lexicon 2.1% (new to the book 1.9%, seen earlier in the book 0.3%). Consequences:
+- An in-document word cache has a ceiling of **0.0011 nats** (every seen-earlier out-of-lexicon letter brought down to the
+  in-lexicon mean CE at the same word position): dead end with a 22-novel lexicon (0.77% of held-out words are out of it).
+- Structural rules (quotes, brackets, newline, digits, other) hold 3.0% of the CE (0.033 nats) in total, so even a perfect rule
+  tier gains under 0.03 and a realistic one a few thousandths.
+- What is left is choosing the next word among words the lexicon knows: 18% of positions (word-initial letters) carry 42% of the
+  CE at 2.5 nats each. That is syntax/semantics, not vocabulary or layout. A KR&R tier that matters has to predict word
+  classes or topics (the grammar or residual-mined-rule options), not store more words.

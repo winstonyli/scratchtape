@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [classes=1] [dump=<path>] [wdump=<path>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [classes=1] [survey=1] [dump=<path>] [wdump=<path>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -42,6 +42,7 @@
 // a query in window w sees the train keys and only those held-out windows before w in the same book (`store` counts
 // train windows; 0 for no train keys). `stride`/`offset`/`part` still choose what is scored.
 // `classes=1` prints the loss by position class (letter or not before, kind of byte predicted): where the model's CE sits and which tier gains where.
+// `survey=1` (needs a tier spec; reads the LAST spec) splits the CE by what the target is: letters by whether the word is in the train lexicon, was seen earlier in the same book, or is new, and by position in the word; other bytes by kind. It prints where the stack's CE sits and a ceiling for an in-document word cache.
 // `whiten=<alpha>` (default off) centres the memory's keys and queries and multiplies them by Sigma^(-alpha/2) (Sigma: the covariance of
 // 128k train positions, total variance kept); alpha 0.5 gave the best stack (docs/tiers_design.md).
 // `store_from` chooses the memory's contents: `train` (default; `store` evenly spaced train windows), `held` (every
@@ -130,6 +131,93 @@ fn class_of(input: usize, target: usize) -> usize {
         _ => 4,
     };
     kind + 5 * is_letter(input) as usize
+}
+
+/// `survey=1`: the last spec's CE by what the target byte is. A letter target belongs to a word that is in the train lexicon,
+/// or is not but occurred earlier in the same book, or is new to the book, and is split by how many letters of the word
+/// precede it; other targets are split by kind. Also the ceiling for an in-document word cache: every "seen earlier" letter
+/// target brought down to the mean CE of in-lexicon targets at the same word position (a bound, not a prediction).
+/// `rows` are (input position, model CE, stack CE); `n` is the number of scored positions.
+fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &HashSet<Vec<u8>>, rows: &[(usize, f64, f64)], n: f64) -> std::collections::HashMap<(String, &'static str), (usize, f64, f64)> {
+    use std::collections::HashMap;
+    let doc_of = |pos: usize| docs.partition_point(|&b| b <= pos) - 1;
+    let word_at = |t: usize| -> (usize, usize) {
+        let lo = docs[doc_of(t)];
+        let (mut s, mut e) = (t, t);
+        while s > lo && is_letter(held_out[s - 1]) {
+            s -= 1;
+        }
+        while e < held_out.len() && is_letter(held_out[e]) {
+            e += 1;
+        }
+        (s, e)
+    };
+    // First occurrence of each word in each book.
+    let mut first: HashMap<(usize, Vec<u8>), usize> = HashMap::new();
+    let mut i = 0;
+    while i < held_out.len() {
+        if is_letter(held_out[i]) && (i == 0 || !is_letter(held_out[i - 1]) || docs[doc_of(i)] == i) {
+            let (s, e) = word_at(i);
+            first.entry((doc_of(s), held_out[s..e].iter().map(|&b| b as u8).collect())).or_insert(s);
+            i = e.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    const LETTER_KINDS: [&str; 3] = ["in lexicon", "not in lexicon, seen earlier in book", "not in lexicon, new to book"];
+    const POS: [&str; 3] = ["1st letter", "2nd-3rd letter", "4th+ letter"];
+    let other_kind = |b: u8| match b {
+        b' ' => "space",
+        b'\n' => "newline",
+        b'0'..=b'9' => "digit",
+        b'.' | b',' | b';' | b':' | b'!' | b'?' | b'-' => "punctuation . , ; : ! ? -",
+        b'"' | b'(' | b')' | b'[' | b']' | b'_' | b'*' => "quote / bracket / marks",
+        _ => "other",
+    };
+    // key: (kind label, position label) -> (count, model CE sum, stack CE sum)
+    let mut table: HashMap<(String, &'static str), (usize, f64, f64)> = HashMap::new();
+    for &(abs, cm, cs) in rows {
+        let t = abs + 1;
+        let target = held_out[t];
+        let (kind, pos) = if is_letter(target) {
+            let (s, e) = word_at(t);
+            let word: Vec<u8> = held_out[s..e].iter().map(|&b| b as u8).collect();
+            let kind = if lexicon.contains(&word) {
+                0
+            } else if first[&(doc_of(s), word)] < s {
+                1
+            } else {
+                2
+            };
+            (LETTER_KINDS[kind].to_string(), POS[match t - s { 0 => 0, 1 | 2 => 1, _ => 2 }])
+        } else {
+            (other_kind(target as u8).to_string(), "")
+        };
+        let cell = table.entry((kind, pos)).or_default();
+        *cell = (cell.0 + 1, cell.1 + cm, cell.2 + cs);
+    }
+    let total_stack: f64 = rows.iter().map(|r| r.2).sum();
+    println!("survey: stack CE by target kind (positions {}, stack CE {:.4}); contrib = 1e-3 nats of overall CE", rows.len(), total_stack / n);
+    println!("{:44} {:16} {:>7} {:>7} {:>8} {:>8} {:>8}", "kind", "word position", "share%", "modelCE", "stackCE", "contrib", "of CE%");
+    let mut keys: Vec<_> = table.keys().cloned().collect();
+    keys.sort();
+    for k in &keys {
+        let (c, m, s) = table[k];
+        println!("{:44} {:16} {:7.2} {:7.3} {:8.3} {:8.2} {:8.1}", k.0, k.1, 100.0 * c as f64 / n, m / c as f64, s / c as f64, 1e3 * s / n, 100.0 * s / total_stack);
+    }
+    println!("cache ceiling (seen-earlier letters brought down to the in-lexicon mean stack CE at the same word position):");
+    let mut gain = 0.0;
+    for pos in &POS {
+        let lex = table.get(&(LETTER_KINDS[0].to_string(), *pos));
+        let seen = table.get(&(LETTER_KINDS[1].to_string(), *pos));
+        if let (Some(&(lc, _, ls)), Some(&(sc, _, ss))) = (lex, seen) {
+            let g = (ss - sc as f64 * ls / lc as f64).max(0.0);
+            println!("  {pos:16} {:>6} positions, mean stack CE {:.3} vs in-lexicon {:.3}: ceiling {:.2}e-3", sc, ss / sc as f64, ls / lc as f64, 1e3 * g / n);
+            gain += g;
+        }
+    }
+    println!("  total ceiling {:.2}e-3 nats ({:.2}% of the stack CE)", 1e3 * gain / n, 100.0 * gain / total_stack);
+    table
 }
 
 /// Every maximal run of letters/apostrophes, in order.
@@ -890,7 +978,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
-            | "recent" | "whiten" | "classes" | "dump" | "wdump" => {
+            | "recent" | "whiten" | "classes" | "survey" | "dump" | "wdump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -1028,6 +1116,9 @@ fn main() {
     let (mut ce_model, mut ce_device) = (0.0f64, 0.0f64);
     let mut ce_tier = vec![0.0f64; tiers.len()];
     // `classes=1`: per position class, the count and the summed CE of the model and of each spec.
+    let survey = opt.contains_key("survey");
+    assert!(!survey || !specs.is_empty(), "survey=1 needs a tier spec");
+    let mut survey_rows: Vec<(usize, f64, f64)> = vec![]; // (position of the input byte, model CE, last spec's CE)
     let mut cls_n = [0usize; 10];
     let mut cls_model = [0.0f64; 10];
     let mut cls_tier = vec![[0.0f64; 10]; tiers.len()];
@@ -1102,6 +1193,9 @@ fn main() {
                 }
                 ce_tier[i] -= p[f.targets[r]].max(1e-300).ln();
                 cls_tier[i][cls] -= p[f.targets[r]].max(1e-300).ln();
+                if survey && i + 1 == specs.len() {
+                    survey_rows.push((abs, -probs[f.targets[r]].ln(), -p[f.targets[r]].max(1e-300).ln()));
+                }
             }
         }
         phase[2] += t0.elapsed();
@@ -1161,6 +1255,9 @@ fn main() {
             println!();
         }
     }
+    if survey {
+        let _ = survey_report(&held_out, &held_out_docs(&corpus), &train_words, &survey_rows, n);
+    }
     if let Some(path) = opt.get("dump") {
         for tier in tiers.last().unwrap() {
             tier.dump(path, true);
@@ -1176,6 +1273,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "aa bb aa bb\n" with only "aa" in the lexicon: the second "bb" is seen earlier in the book, the first is new.
+    #[test]
+    fn survey_splits_letters_by_lexicon_and_recency() {
+        let text: Vec<usize> = "aa bb aa bb\n".bytes().map(|b| b as usize).collect();
+        let rows: Vec<(usize, f64, f64)> = (0..text.len() - 1).map(|a| (a, 2.0, 1.0)).collect();
+        let lexicon: HashSet<Vec<u8>> = [b"aa".to_vec()].into_iter().collect();
+        let t = survey_report(&text, &[0], &lexicon, &rows, rows.len() as f64);
+        let count = |k: &str, p: &'static str| t.get(&(k.to_string(), p)).map_or(0, |c| c.0);
+        assert_eq!(count("in lexicon", "1st letter"), 1);
+        assert_eq!(count("in lexicon", "2nd-3rd letter"), 2);
+        assert_eq!(count("not in lexicon, new to book", "1st letter"), 1);
+        assert_eq!(count("not in lexicon, new to book", "2nd-3rd letter"), 1);
+        assert_eq!(count("not in lexicon, seen earlier in book", "1st letter"), 1);
+        assert_eq!(count("not in lexicon, seen earlier in book", "2nd-3rd letter"), 1);
+        assert_eq!(count("space", ""), 3);
+        assert_eq!(count("newline", ""), 1);
+    }
 
     /// Lines of nine letters: a newline always follows a letter at column 9, a letter never does at column 5. The tier
     /// moves the model's newline/space split towards the train rate only where the window shows no newline.
