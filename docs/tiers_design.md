@@ -903,6 +903,14 @@ train probe (1.1922, below f32). Attention is the cheapest to keep in f32 (+1.3 
 +2.4 to +3.3). Reading: a diffuse rounding effect rather than one bad class; the 8M run with attention in f32
 (`scripts/train_8m_f16_keepattn.sh`) tests whether the cheapest fix closes the 8M gap.
 
+**Result (8M windows, attention in f32, `runs/nov_big_k1_d0.1_8m_f16attn.log`):** held-out CE **1.2427** against f32 1.2408 and
+all-f16 1.2475, so the gap shrinks from +0.0067 to **+0.0019**; the train probe is 1.1170 (f32 1.1172, all-f16 1.1430), so the
+fit to the training text is fully recovered. Training clock 4.93 ms/step (all-f16 4.33, f32 11.4; contended, one session's
+jobs in parallel), 1261 s against 1109 s and 2928 s. So attention is the class that mattered at length (it accumulates over
+long training; the 2M ablation could not show that), and keeping only it in f32 keeps ~2.3x the f32 speed. The patch is
+`runs/f16_class_ablation.patch` (git-ignored); making this the recipe means replacing the flag with "attention matmuls
+always f32 under `TRAIN_F16`" (not done: `TRAIN_F16` is still off by default).
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
