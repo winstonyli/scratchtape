@@ -96,7 +96,7 @@ pub fn matmul_f32(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: 
 
 /// `TRAIN_F16=1` and a device with f16 x f16 -> f32 matrix cores: eligible matmuls run on them (f32 operands are rounded
 /// to f16 while staged into shared memory, products accumulate in f32). Read once.
-fn f16_enabled() -> bool {
+pub(super) fn f16_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("TRAIN_F16").is_ok_and(|v| v == "1") && client().features().matmul.cmma.contains(&super::knn::f16_config()))
 }

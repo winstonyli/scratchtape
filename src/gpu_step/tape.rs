@@ -683,6 +683,8 @@ mod tests {
     /// One step_case of device_step_matches_cpu_tape. False (having checked
     /// the forward) if the ReLUs disagree anywhere.
     fn step_case(cfg: Config, batch: usize, seed: u64) -> bool {
+        // f16 matrix cores (TRAIN_F16=1) round the linear layers' operands: far looser bounds, and any ReLU disagreement is a tie
+        let (tol, tie) = if crate::gpu_step::matmul::f16_enabled() { (6e-2, 1e-1) } else { (1e-4, 1e-5) };
         {
             let what = format!("{cfg:?} batch {batch} seed {seed}");
             let mut rng = Rng::new(seed);
@@ -721,12 +723,12 @@ mod tests {
             let (douts, dlogits, dloss) = model_forward(&mut dt, &cfg, &ids, &targets, batch);
             for (i, (d, c)) in douts.iter().zip(&bouts).enumerate() {
                 let e = rel_err(&read(dt.value(*d)), &tape.value(c.y).data);
-                assert!(e < 1e-4, "{what}: block {i} output off by {e}");
+                assert!(e < tol, "{what}: block {i} output off by {e}");
             }
             let e = rel_err(&read(dt.value(dlogits)), &tape.value(po2.y).data);
-            assert!(e < 1e-4, "{what}: logits off by {e}");
+            assert!(e < tol, "{what}: logits off by {e}");
             let (gl, cl) = (read(dt.value(dloss))[0], tape.value(loss).data[0]);
-            assert!((gl - cl).abs() <= 1e-4 * cl.abs(), "{what}: loss {gl} vs {cl}");
+            assert!((gl - cl).abs() <= tol * cl.abs(), "{what}: loss {gl} vs {cl}");
 
             // ReLU ties: the GPU's FFN hidden (post-ReLU) against the CPU's
             // pre-activation, block by block
@@ -736,12 +738,12 @@ mod tests {
                 let (h, z) = (read(&dt.nodes[n].value), &tape.value(o.ffn1_out.y).data);
                 for (hv, zv) in h.iter().zip(z) {
                     if (*hv > 0.0) != (*zv > 0.0) {
-                        assert!(zv.abs() < 1e-5, "{what}: ReLUs disagree on pre-activation {zv}, not a rounding tie");
+                        assert!(zv.abs() < tie, "{what}: ReLUs disagree on pre-activation {zv}, not a rounding tie");
                         ties += 1;
                     }
                 }
             }
-            if ties > 0 {
+            if ties > 0 && tol < 1e-3 {
                 eprintln!("{what}: {ties} ReLU tie(s); next seed");
                 return false;
             }
@@ -776,7 +778,7 @@ mod tests {
                 if e > worst.0 {
                     worst = (e, name.clone());
                 }
-                assert!(e < 1e-4, "{what}: {name} gradient off by {e}");
+                assert!(e < tol, "{what}: {name} gradient off by {e}");
                 off += w.len();
             }
             assert_eq!(off, g.len(), "{what}: gradient layout");
