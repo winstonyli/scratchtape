@@ -944,3 +944,11 @@ unmeasured: the speed of a full fused kernel (threshold lookup, survivor compact
 earlier "default off" and "TRAIN_F16=1" wording in the entries above is history. All 29 `gpu_step` tests pass both ways.
 Cost: ~0.0019 held-out CE at 8M windows (single seed) for ~2.3x the step speed. The 16M recipe is rerun in this mode by
 `scripts/train_16m_f16.sh` (reference: f32 16M, CE 1.2319).
+
+### 16M model trained in f16: the full stack (2026-10-10)
+
+`scripts/train_16m_f16.sh` (f16 default, attention f32; `runs/nov_big_k1_d0.1_16m_f16.log`): held-out **1.2333** against f32
+1.2319 (+0.0014; the 8M gap was +0.0019, so it did not grow with the longer schedule), train probe 1.0919 (1.0906); 2848 s of
+training, 5.56 ms/step (contended), against ~2.4 h for f32. Best stack on it (`scripts/tier_full_16m_f16.sh`, same specs as
+the f32 16M stack): model alone 1.1684 (f32 1.1651), + lexicon/words/knn 1.1057 (1.1041), + wrap **1.0892** (**1.0876**). So the
+tiers give the same gain on the f16 model (-0.0792 against -0.0775) and the stack ends +0.0016 behind, at ~2x less training time.
