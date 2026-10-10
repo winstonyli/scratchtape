@@ -301,28 +301,33 @@ pub fn corpus(name: &str) -> &'static str {
     }
 }
 
-/// The texts of a bundled corpus, one per book.
-fn books(name: &str) -> Vec<String> {
+/// The texts of a bundled corpus, one per book, with the fraction of each that is training text (the rest, from the
+/// end, is held out).
+fn books(name: &str) -> Vec<(String, f32)> {
+    let read = |dir: &str, n: &str, script: &str| std::fs::read_to_string(format!("data/{dir}/{n}.txt")).unwrap_or_else(|e| panic!("data/{dir}/{n}.txt: {e} (run scripts/{script})"));
+    let novels6 = || ["frankenstein", "pride_and_prejudice", "tale_of_two_cities", "dracula", "great_expectations", "moby_dick"].map(|n| (read("gutenberg", n, "fetch_gutenberg.sh"), 0.9f32));
     match name {
-        "all_four" => ["aesops_fables", "leaves_of_grass", "origin_of_species", "sherlock_holmes"].iter().map(|n| corpus(n).to_string()).collect(),
+        "all_four" => ["aesops_fables", "leaves_of_grass", "origin_of_species", "sherlock_holmes"].iter().map(|n| (corpus(n).to_string(), 0.9)).collect(),
         // Fetched by scripts/fetch_gutenberg.sh into the gitignored data/gutenberg/.
-        "novels6" => ["frankenstein", "pride_and_prejudice", "tale_of_two_cities", "dracula", "great_expectations", "moby_dick"]
-            .iter()
-            .map(|n| std::fs::read_to_string(format!("data/gutenberg/{n}.txt")).unwrap_or_else(|e| panic!("data/gutenberg/{n}.txt: {e} (run scripts/fetch_gutenberg.sh)")))
-            .collect(),
-        _ => vec![corpus(name).to_string()],
+        "novels6" => novels6().to_vec(),
+        // novels6 with the same held-out text, plus sixteen more novels (scripts/fetch_gutenberg_extra.sh) used for training only.
+        "novels22" => {
+            let extra = ["emma", "sense_and_sensibility", "persuasion", "oliver_twist", "david_copperfield", "hound_of_the_baskervilles", "tom_sawyer", "huckleberry_finn", "time_machine", "war_of_the_worlds", "tess", "heart_of_darkness", "jane_eyre", "wuthering_heights", "dorian_gray", "treasure_island"];
+            novels6().into_iter().chain(extra.iter().map(|n| (read("gutenberg_extra", n, "fetch_gutenberg_extra.sh"), 1.0))).collect()
+        }
+        _ => vec![(corpus(name).to_string(), 0.9)],
     }
 }
 
 /// (train, held-out) bytes of a bundled corpus: the last 10% of the text
 /// is held out. `all_four` and `novels6` take the last 10% of *each* book,
-/// so the held-out set mixes all the books.
+/// so the held-out set mixes all the books; `novels22`'s extra books are all training.
 #[allow(dead_code)]
 pub fn split_corpus(name: &str) -> (Vec<usize>, Vec<usize>) {
     let (mut train, mut held_out) = (vec![], vec![]);
-    for book in books(name) {
+    for (book, train_share) in books(name) {
         let full = encode_bytes(&book);
-        let split = (full.len() as f32 * 0.9) as usize;
+        let split = (full.len() as f32 * train_share) as usize;
         train.extend_from_slice(&full[..split]);
         held_out.extend_from_slice(&full[split..]);
     }
@@ -333,10 +338,13 @@ pub fn split_corpus(name: &str) -> (Vec<usize>, Vec<usize>) {
 #[allow(dead_code)]
 pub fn held_out_docs(name: &str) -> Vec<usize> {
     let (mut starts, mut at) = (vec![], 0);
-    for book in books(name) {
+    for (book, train_share) in books(name) {
         let full = encode_bytes(&book);
-        starts.push(at);
-        at += full.len() - (full.len() as f32 * 0.9) as usize;
+        let held = full.len() - (full.len() as f32 * train_share) as usize;
+        if held > 0 {
+            starts.push(at);
+        }
+        at += held;
     }
     starts
 }
