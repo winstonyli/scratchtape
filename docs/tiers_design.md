@@ -882,6 +882,27 @@ operands rounded), the f16 forward, or the attention matmuls (the first validati
 512000-window gap stayed small throughout). An ablation by matmul class (forward only, dX only, dW only, attention only in f32)
 on a 2M-window run would say which one matters.
 
+### f16 ablation by matmul class, 2M windows (2026-10-09)
+
+`scripts/ablate_f16_classes.sh`: six 2M-window runs (`runs/abl2m_*.log`), `TRAIN_F16=1` with one class kept on f32 through a
+throwaway flag (`F16_F32` bits; patch in git-ignored `runs/f16_class_ablation.patch`, source reverted). Machine contended
+(CPU ~100% at times), single seed, so timings are rough and CE differences of ~0.001 are near noise.
+
+| run | held-out CE | train probe | train ms/step |
+|---|---|---|---|
+| all f32 | 1.2849 | 1.1934 | 10.7 |
+| all f16 | 1.2869 | 1.1948 | 4.4 |
+| keep forward f32 | 1.2858 | 1.1946 | 6.8 |
+| keep dX f32 | 1.2866 | 1.1950 | 7.5 |
+| keep dW f32 | 1.2859 | 1.1922 | 7.7 |
+| keep attention f32 | 1.2859 | 1.1946 | 5.7 |
+
+The gap at 2M windows is only +0.0020 (it is +0.0067 at 8M: it grows with training length). No single class explains it:
+forward, dW and attention each recover about half (~0.0010), dX almost none (0.0003). dW is the one that also fixes the
+train probe (1.1922, below f32). Attention is the cheapest to keep in f32 (+1.3 ms/step; keeping forward or dW costs
++2.4 to +3.3). Reading: a diffuse rounding effect rather than one bad class; the 8M run with attention in f32
+(`scripts/train_8m_f16_keepattn.sh`) tests whether the cheapest fix closes the 8M gap.
+
 ## Order
 
 0. `tier_eval.rs` with Gate 0 (needs the GPU for a forward pass only; the d = 384 run is using it, shared lease).
