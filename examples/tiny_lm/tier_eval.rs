@@ -138,7 +138,10 @@ fn class_of(input: usize, target: usize) -> usize {
 /// precede it; other targets are split by kind. Also the ceiling for an in-document word cache: every "seen earlier" letter
 /// target brought down to the mean CE of in-lexicon targets at the same word position (a bound, not a prediction).
 /// `rows` are (input position, model CE, stack CE); `n` is the number of scored positions.
-fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &HashSet<Vec<u8>>, rows: &[(usize, f64, f64)], n: f64) -> std::collections::HashMap<(String, &'static str), (usize, f64, f64)> {
+/// One scored position of `survey=1`: (input position, model CE, stack CE, the stack's three likeliest next bytes with probabilities).
+type SurveyRow = (usize, f64, f64, [(u8, f32); 3]);
+
+fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &HashSet<Vec<u8>>, rows: &[SurveyRow], n: f64) -> std::collections::HashMap<(String, &'static str), (usize, f64, f64)> {
     use std::collections::HashMap;
     let doc_of = |pos: usize| docs.partition_point(|&b| b <= pos) - 1;
     let word_at = |t: usize| -> (usize, usize) {
@@ -176,7 +179,8 @@ fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &HashSet<Vec<u8>>,
     };
     // key: (kind label, position label) -> (count, model CE sum, stack CE sum)
     let mut table: HashMap<(String, &'static str), (usize, f64, f64)> = HashMap::new();
-    for &(abs, cm, cs) in rows {
+    let mut word_starts: Vec<usize> = vec![]; // rows whose target starts a word in the lexicon
+    for (ri, &(abs, cm, cs, _)) in rows.iter().enumerate() {
         let t = abs + 1;
         let target = held_out[t];
         let (kind, pos) = if is_letter(target) {
@@ -193,6 +197,9 @@ fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &HashSet<Vec<u8>>,
         } else {
             (other_kind(target as u8).to_string(), "")
         };
+        if kind == LETTER_KINDS[0] && pos == POS[0] {
+            word_starts.push(ri);
+        }
         let cell = table.entry((kind, pos)).or_default();
         *cell = (cell.0 + 1, cell.1 + cm, cell.2 + cs);
     }
@@ -217,6 +224,17 @@ fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &HashSet<Vec<u8>>,
         }
     }
     println!("  total ceiling {:.2}e-3 nats ({:.2}% of the stack CE)", 1e3 * gain / n, 100.0 * gain / total_stack);
+    // A fixed-stride sample of word-initial targets, with the stack's three likeliest bytes: for reading by hand.
+    println!("sample of word-initial letters in the lexicon (context | target word: stack top3, stack CE, model CE):");
+    let show = |b: usize| if b == b'\n' as usize { '~' } else { b as u8 as char };
+    for &ri in word_starts.iter().step_by((word_starts.len() / 60).max(1)) {
+        let (abs, cm, cs, top) = rows[ri];
+        let (s, e) = word_at(abs + 1);
+        let ctx: String = held_out[(abs + 1).saturating_sub(60)..=abs].iter().map(|&b| show(b)).collect();
+        let word: String = held_out[s..e].iter().map(|&b| show(b)).collect();
+        let guess: Vec<String> = top.iter().map(|&(b, q)| format!("{}:{:.2}", show(b as usize), q)).collect();
+        println!("  {ctx:>60} | {word:<12} {} {cs:.2} {cm:.2}", guess.join(" "));
+    }
     table
 }
 
@@ -1118,7 +1136,7 @@ fn main() {
     // `classes=1`: per position class, the count and the summed CE of the model and of each spec.
     let survey = opt.contains_key("survey");
     assert!(!survey || !specs.is_empty(), "survey=1 needs a tier spec");
-    let mut survey_rows: Vec<(usize, f64, f64)> = vec![]; // (position of the input byte, model CE, last spec's CE)
+    let mut survey_rows: Vec<SurveyRow> = vec![]; // (position of the input byte, model CE, last spec's CE, its three likeliest bytes)
     let mut cls_n = [0usize; 10];
     let mut cls_model = [0.0f64; 10];
     let mut cls_tier = vec![[0.0f64; 10]; tiers.len()];
@@ -1194,7 +1212,15 @@ fn main() {
                 ce_tier[i] -= p[f.targets[r]].max(1e-300).ln();
                 cls_tier[i][cls] -= p[f.targets[r]].max(1e-300).ln();
                 if survey && i + 1 == specs.len() {
-                    survey_rows.push((abs, -probs[f.targets[r]].ln(), -p[f.targets[r]].max(1e-300).ln()));
+                    let mut top = [(0u8, 0f32); 3];
+                    for (b, &q) in p.iter().enumerate() {
+                        let q = q as f32;
+                        if q > top[2].1 {
+                            top[2] = (b as u8, q);
+                            top.sort_by(|a, b| b.1.total_cmp(&a.1));
+                        }
+                    }
+                    survey_rows.push((abs, -probs[f.targets[r]].ln(), -p[f.targets[r]].max(1e-300).ln(), top));
                 }
             }
         }
@@ -1278,7 +1304,7 @@ mod tests {
     #[test]
     fn survey_splits_letters_by_lexicon_and_recency() {
         let text: Vec<usize> = "aa bb aa bb\n".bytes().map(|b| b as usize).collect();
-        let rows: Vec<(usize, f64, f64)> = (0..text.len() - 1).map(|a| (a, 2.0, 1.0)).collect();
+        let rows: Vec<SurveyRow> = (0..text.len() - 1).map(|a| (a, 2.0, 1.0, [(0, 0.0); 3])).collect();
         let lexicon: HashSet<Vec<u8>> = [b"aa".to_vec()].into_iter().collect();
         let t = survey_report(&text, &[0], &lexicon, &rows, rows.len() as f64);
         let count = |k: &str, p: &'static str| t.get(&(k.to_string(), p)).map_or(0, |c| c.0);

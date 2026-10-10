@@ -1021,3 +1021,12 @@ words not in the lexicon 2.1% (new to the book 1.9%, seen earlier in the book 0.
 - What is left is choosing the next word among words the lexicon knows: 18% of positions (word-initial letters) carry 42% of the
   CE at 2.5 nats each. That is syntax/semantics, not vocabulary or layout. A KR&R tier that matters has to predict word
   classes or topics (the grammar or residual-mined-rule options), not store more words.
+
+Hand reading of 61 word-initial targets (`survey=1` prints a fixed-stride sample with the stack's top 3 bytes; log
+`runs/tier_full_32m_novels22_corpus22_samples.log`, git-ignored). The stack is 2-3.5 nats at most of them and its top 3 hold
+only 0.25-0.5 of the mass: open choices ("my imagination was vivid, yet my | powers", "the grimness", "in the | site"),
+where no short-context rule or word-class prior would move the target far; no recurring pattern a rule could name (the
+sentence-initial capital and the opening of a quotation are uncertain by nature). The one visible lead is rare in-lexicon
+names that recur in a book: Hertfordshire 5.5 nats, Greenland 6.2, Mast(-head) 3.7. They are in the train lexicon, so the
+"seen earlier" ceiling above (out-of-lexicon words only) did not count them; whether an in-document recency boost for in-lexicon
+words has room is unmeasured (split first-letter CE by "word occurred in the last N bytes" and by train frequency).
