@@ -952,3 +952,23 @@ Cost: ~0.0019 held-out CE at 8M windows (single seed) for ~2.3x the step speed. 
 training, 5.56 ms/step (contended), against ~2.4 h for f32. Best stack on it (`scripts/tier_full_16m_f16.sh`, same specs as
 the f32 16M stack): model alone 1.1684 (f32 1.1651), + lexicon/words/knn 1.1057 (1.1041), + wrap **1.0892** (**1.0876**). So the
 tiers give the same gain on the f16 model (-0.0792 against -0.0775) and the stack ends +0.0016 behind, at ~2x less training time.
+
+### Small step costs round 2, and fused f32 attention (KILL) (2026-10-10)
+
+Fresh profile of the f16 default (attention f32, contended, CPU 45-70%): 4.21 ms/step over 38 sites: f16 linear matmuls 1.9
+(45%), f32 attention matmuls 0.89 + softmax 0.17 (25%), layer-norm/softmax rows 0.54, embedding/dropout/ReLU-mask/optimiser
+~0.6. Done: weight decay folded into the momentum kernel (`DeviceParams::momentum(.., decay)`, the same arithmetic, one
+launch fewer) and the dropout backward applying the ReLU mask in the same launch when the dropout is the ReLU node's only
+gradient source (guarded: `Node::relu_masked`, asserted in `add_grad`): GPU **4.21 -> 4.15 ms/step** (-1.4%).
+**Fused f32 attention: killed.** One cube of 64 units per (sample, head), unit i = query row i, K/V/scores or dS in shared
+memory (the exact 32 KiB: dS XOR-swizzled), scores + softmax + weights.V in one launch and a one-launch backward (dQ, dK, dV
+and dS together). Correct (matches an f64 reference to 1e-5, all `gpu_step` tests pass, the 1e-4 device-vs-CPU step test
+included), but **2.7 ms/step against 1.05 for the matmul + softmax chain it replaces**: first version (private arrays
+indexed at run time) 5.6 ms (spilled to scratch); with comptime head width, unrolled channel loops and scores in shared
+memory 2.7 (fwd 0.56, bwd 2.14). The structure is the limit: each unit does a serial chain of dot products through
+shared memory and the causal triangle idles half the lanes of a wave; a better version needs several units per row or
+row-pairing (i, 63-i) plus a split of the channel sum, for a best case ~1.3 ms, still above the existing path. The
+attention matmuls' real cost is f32; the f16 matrix-core path is what made the linear layers cheap. Patch and kernel text:
+`runs/fused_attention_attempt.patch`, `runs/attention_fused.rs.txt` (git-ignored); source reverted. Parked: attention
+sites split by precision (scores vs weights.V vs backward, each an 8M run) to move part of the 0.89 ms to f16; and a
+quiet-machine re-time, which the GPU-time column cannot replace for the host side.
