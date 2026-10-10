@@ -94,11 +94,11 @@ pub fn matmul_f32(a: MatRef, b: MatRef, out: MatRef, batch: usize, m: usize, k: 
     matmul_with(a, b, out, batch, m, k, n, epi, false);
 }
 
-/// `TRAIN_F16=1` and a device with f16 x f16 -> f32 matrix cores: eligible matmuls run on them (f32 operands are rounded
+/// On unless `TRAIN_F16=0`, and a device with f16 x f16 -> f32 matrix cores: eligible matmuls run on them (f32 operands are rounded
 /// to f16 while staged into shared memory, products accumulate in f32). Read once.
 pub(super) fn f16_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TRAIN_F16").is_ok_and(|v| v == "1") && client().features().matmul.cmma.contains(&super::knn::f16_config()))
+    *ON.get_or_init(|| !std::env::var("TRAIN_F16").is_ok_and(|v| v == "0") && client().features().matmul.cmma.contains(&super::knn::f16_config()))
 }
 
 /// `matmul` with the f16 matrix-core path chosen by the caller (tests); it still falls back to f32 for shapes it can't tile.

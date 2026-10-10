@@ -909,7 +909,7 @@ fit to the training text is fully recovered. Training clock 4.93 ms/step (all-f1
 jobs in parallel), 1261 s against 1109 s and 2928 s. So attention is the class that mattered at length (it accumulates over
 long training; the 2M ablation could not show that), and keeping only it in f32 keeps ~2.3x the f32 speed. The patch is
 `runs/f16_class_ablation.patch` (git-ignored); making this the recipe means replacing the flag with "attention matmuls
-always f32 under `TRAIN_F16`" (done in 5cb6392, `matmul_f32`; `TRAIN_F16` is still off by default).
+always f32 under `TRAIN_F16`" (done in 5cb6392, `matmul_f32`).
 
 **Plus dW in f32 (8M, `scripts/train_8m_f16_keepattn_dw.sh`, `runs/nov_big_k1_d0.1_8m_f16attn_dw.log`):** held-out CE **1.2417**
 (attention only 1.2427, f32 1.2408), train probe 1.1164 (1.1170), 7.0 ms/step (4.9; contended, CPU ~50%). The 0.0010 gain is
@@ -937,3 +937,10 @@ matches (test `matrix_core_tile_goes_through_shared_memory`, f16 x f16 -> f32, 1
 main unknown is settled: the accumulator tile can be filtered in-kernel without writing `dist` to global memory. Still
 unmeasured: the speed of a full fused kernel (threshold lookup, survivor compaction via `Atomic<u32>::fetch_add` or
 `plane_exclusive_sum`, a per-tile survivor buffer feeding a smaller top-k). Guess ~2x on search; not started.
+
+### f16 is the training default (2026-10-09)
+
+`TRAIN_F16` now defaults on (`TRAIN_F16=0` gives the f32 kernels), attention always f32, on devices with f16 matrix cores; the
+earlier "default off" and "TRAIN_F16=1" wording in the entries above is history. All 29 `gpu_step` tests pass both ways.
+Cost: ~0.0019 held-out CE at 8M windows (single seed) for ~2.3x the step speed. The 16M recipe is rerun in this mode by
+`scripts/train_16m_f16.sh` (reference: f32 16M, CE 1.2319).
