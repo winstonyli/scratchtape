@@ -972,3 +972,13 @@ attention matmuls' real cost is f32; the f16 matrix-core path is what made the l
 `runs/fused_attention_attempt.patch`, `runs/attention_fused.rs.txt` (git-ignored); source reverted. Parked: attention
 sites split by precision (scores vs weights.V vs backward, each an 8M run) to move part of the 0.89 ms to f16; and a
 quiet-machine re-time, which the GPU-time column cannot replace for the host side.
+
+### 32M model in f16: the full stack (2026-10-10)
+
+`scripts/train_32m_f16.sh` (the 16M recipe at 32768000 windows, f16 default, attention f32; `runs/nov_big_k1_d0.1_32m_f16.log`):
+held-out **1.2307** at 5471 s of training (5.34 ms/step, contended), against 1.2333 at 16M (f16) and 1.2319 at 16M (f32): a
+doubling buys 0.0026 and already beats the 16M f32 model, in about 1.5 h. Held-out at 4M/8M/16M/24M: 1.2583 1.2447 1.2339 1.2323;
+the train probe falls faster (1.0756 against 1.0919 at 16M), so the held-out curve is flattening while the fit to the training
+text keeps improving: the novels6 corpus, not the training time, is becoming the limit. Best stack (`scripts/tier_full_32m_f16.sh`):
+model alone 1.1633, + lexicon/words/memory 1.1008, + wrap **1.0844** (16M f16 1.0892, 16M f32 1.0876; best so far). The tiers add
+-0.0789 on this stronger model (-0.0792 at 16M f16, -0.0775 at 16M f32), so their gain is stable as the model improves.
