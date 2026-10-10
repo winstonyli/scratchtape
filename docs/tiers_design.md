@@ -909,7 +909,13 @@ fit to the training text is fully recovered. Training clock 4.93 ms/step (all-f1
 jobs in parallel), 1261 s against 1109 s and 2928 s. So attention is the class that mattered at length (it accumulates over
 long training; the 2M ablation could not show that), and keeping only it in f32 keeps ~2.3x the f32 speed. The patch is
 `runs/f16_class_ablation.patch` (git-ignored); making this the recipe means replacing the flag with "attention matmuls
-always f32 under `TRAIN_F16`" (not done: `TRAIN_F16` is still off by default).
+always f32 under `TRAIN_F16`" (done in 5cb6392, `matmul_f32`; `TRAIN_F16` is still off by default).
+
+**Plus dW in f32 (8M, `scripts/train_8m_f16_keepattn_dw.sh`, `runs/nov_big_k1_d0.1_8m_f16attn_dw.log`):** held-out CE **1.2417**
+(attention only 1.2427, f32 1.2408), train probe 1.1164 (1.1170), 7.0 ms/step (4.9; contended, CPU ~50%). The 0.0010 gain is
+within single-seed noise and costs ~40% more step time, so dW stays f16. Recipe: `TRAIN_F16=1`, attention f32. The residual
++0.0019 is not attributed to a class (forward and dX were not run at 8M); `device_step_matches_cpu_tape` now also runs under
+`TRAIN_F16=1` (6e-2 bounds, worst gradient 5.4e-2, ReLU flips allowed).
 
 ## Order
 
