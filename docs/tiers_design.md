@@ -993,3 +993,13 @@ worse); at 4M 1.2679 against 1.2580. The extra text dilutes the style the held-o
 has not yet started to overfit enough for more text to pay (train probe 1.1170 against held-out 1.2427 at 8M; the 32M
 novels6 model has 1.0756 against 1.2307). 4.56 ms/step. So at this training length more text does not help; whether it helps
 at 32M windows (where novels6 flattens) is untested (~2.7 h).
+
+### novels22 at 32M windows: the full stack (2026-10-10)
+
+`scripts/train_32m_novels22.sh` (32768000 windows, f16 default, 4.75 ms/step, 2h09m wall, contended): held-out **1.2193**
+against 1.2307 on novels6 (-0.0114); train probe 1.1329 against 1.0756 (less memorisation). Held-out by marker, novels22 vs
+novels6: 4M 1.2679/1.2583, 8M 1.2454/1.2447, 16M 1.2300/1.2339, 24M 1.2252/1.2323: the extra text loses early and wins once
+novels6 starts to overfit (crossover between 8M and 16M). Stack (`scripts/tier_full_32m_novels22.sh`): model alone 1.1478
+(1.1633), + lexicon/words/memory 1.0981 (1.1008), + wrap **1.0821** (1.0844; new best, -0.0023). The model gained 0.0155 but
+the stack only 0.0023: the tiers add -0.0657 here against -0.0789 on novels6; a likely reading (untested) is that the memory/lexicon tiers already carried
+much of what the extra text teaches the model (the memory is built from the same training text, now partly novel to it).
