@@ -982,3 +982,14 @@ the train probe falls faster (1.0756 against 1.0919 at 16M), so the held-out cur
 text keeps improving: the novels6 corpus, not the training time, is becoming the limit. Best stack (`scripts/tier_full_32m_f16.sh`):
 model alone 1.1633, + lexicon/words/memory 1.1008, + wrap **1.0844** (16M f16 1.0892, 16M f32 1.0876; best so far). The tiers add
 -0.0789 on this stronger model (-0.0792 at 16M f16, -0.0775 at 16M f32), so their gain is stable as the model improves.
+
+### More training text: novels22 at 8M windows (2026-10-10)
+
+`scripts/fetch_gutenberg_extra.sh` fetches sixteen more Gutenberg novels (10 MB, Austen, Dickens, Doyle, Twain, Wells, Hardy,
+Conrad, the Brontes, Wilde, Stevenson) into git-ignored `data/gutenberg_extra/`; corpus `novels22` = novels6 (same
+held-out text, step-0 CE 6.2606 identical) plus those books as training only (14.5 MB; 8M windows is ~35 passes instead of
+~112). `scripts/train_8m_novels22.sh`, f16 default, 8M windows: held-out **1.2454** against 1.2427 on novels6 (+0.0027,
+worse); at 4M 1.2679 against 1.2580. The extra text dilutes the style the held-out books share, and at 8M the novels6 model
+has not yet started to overfit enough for more text to pay (train probe 1.1170 against held-out 1.2427 at 8M; the 32M
+novels6 model has 1.0756 against 1.2307). 4.56 ms/step. So at this training length more text does not help; whether it helps
+at 32M windows (where novels6 flattens) is untested (~2.7 h).
