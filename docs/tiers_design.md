@@ -1030,3 +1030,23 @@ sentence-initial capital and the opening of a quotation are uncertain by nature)
 names that recur in a book: Hertfordshire 5.5 nats, Greenland 6.2, Mast(-head) 3.7. They are in the train lexicon, so the
 "seen earlier" ceiling above (out-of-lexicon words only) did not count them; whether an in-document recency boost for in-lexicon
 words has room is unmeasured (split first-letter CE by "word occurred in the last N bytes" and by train frequency).
+
+### Recency of in-lexicon words at word starts (2026-10-10)
+
+`survey=1` also splits the stack's CE at word-initial targets in the lexicon (91641 positions) by the word's train count and
+the distance to its previous occurrence in the same book (`runs/tier_full_32m_novels22_corpus22_recency.log`; stack 1.0827):
+
+| train count | prev <=500 B | prev <=5000 B | prev farther | none earlier |
+|---|---|---|---|---|
+| <20 | 3.56 (233) | 3.66 (306) | 3.27 (514) | 3.42 (3719) |
+| 20-199 | 3.18 (1293) | 3.18 (1814) | 3.16 (3314) | 3.22 (7396) |
+| >=200 | 1.97 (34178) | 2.48 (23102) | 2.90 (10625) | 3.00 (5147) |
+
+(mean stack CE in nats, position count in brackets.) For rare and mid-frequency words the CE does not fall when the word
+occurred a few hundred bytes earlier (3.56 against 3.42 for rare; 3.18 against 3.22 for mid), so the stack does not use a
+repeat as a cue for the first letter, and neither does the online memory at these positions. The common words do fall with
+recency (1.97 near, 3.00 none), but that mixes in predictability. Room: 7474 rare and mid-frequency word starts that repeat a
+word from the book, at 1.5% of the positions; each nat saved on all of them is 0.0148 nats of overall CE, so a cache that
+saves a third of a nat on them is worth about 0.005: the same size as the whole novels22 effect on the stack (0.0023) or the
+wrap rule's remaining gain, and the only measured KR&R lead. Untested; the cache is a recency prior over the first letters of
+book words not frequent in the train text, mixed in like `words`.

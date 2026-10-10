@@ -133,15 +133,16 @@ fn class_of(input: usize, target: usize) -> usize {
     kind + 5 * is_letter(input) as usize
 }
 
+/// One scored position of `survey=1`: (input position, model CE, stack CE, the stack's three likeliest next bytes with probabilities).
+type SurveyRow = (usize, f64, f64, [(u8, f32); 3]);
+
 /// `survey=1`: the last spec's CE by what the target byte is. A letter target belongs to a word that is in the train lexicon,
 /// or is not but occurred earlier in the same book, or is new to the book, and is split by how many letters of the word
 /// precede it; other targets are split by kind. Also the ceiling for an in-document word cache: every "seen earlier" letter
 /// target brought down to the mean CE of in-lexicon targets at the same word position (a bound, not a prediction).
-/// `rows` are (input position, model CE, stack CE); `n` is the number of scored positions.
-/// One scored position of `survey=1`: (input position, model CE, stack CE, the stack's three likeliest next bytes with probabilities).
-type SurveyRow = (usize, f64, f64, [(u8, f32); 3]);
-
-fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &HashSet<Vec<u8>>, rows: &[SurveyRow], n: f64) -> std::collections::HashMap<(String, &'static str), (usize, f64, f64)> {
+/// For word-initial targets in the lexicon it also prints the CE by train frequency of the word and by how far back its
+/// previous occurrence in the book is. `rows` are as `SurveyRow`; `n` is the number of scored positions.
+fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &std::collections::HashMap<Vec<u8>, u32>, rows: &[SurveyRow], n: f64) -> std::collections::HashMap<(String, &'static str), (usize, f64, f64)> {
     use std::collections::HashMap;
     let doc_of = |pos: usize| docs.partition_point(|&b| b <= pos) - 1;
     let word_at = |t: usize| -> (usize, usize) {
@@ -155,13 +156,13 @@ fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &HashSet<Vec<u8>>,
         }
         (s, e)
     };
-    // First occurrence of each word in each book.
-    let mut first: HashMap<(usize, Vec<u8>), usize> = HashMap::new();
+    // Start of every occurrence of each word in each book, in order.
+    let mut occ: HashMap<(usize, Vec<u8>), Vec<usize>> = HashMap::new();
     let mut i = 0;
     while i < held_out.len() {
         if is_letter(held_out[i]) && (i == 0 || !is_letter(held_out[i - 1]) || docs[doc_of(i)] == i) {
             let (s, e) = word_at(i);
-            first.entry((doc_of(s), held_out[s..e].iter().map(|&b| b as u8).collect())).or_insert(s);
+            occ.entry((doc_of(s), held_out[s..e].iter().map(|&b| b as u8).collect())).or_default().push(s);
             i = e.max(i + 1);
         } else {
             i += 1;
@@ -180,15 +181,16 @@ fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &HashSet<Vec<u8>>,
     // key: (kind label, position label) -> (count, model CE sum, stack CE sum)
     let mut table: HashMap<(String, &'static str), (usize, f64, f64)> = HashMap::new();
     let mut word_starts: Vec<usize> = vec![]; // rows whose target starts a word in the lexicon
+    let mut recency = [[(0usize, 0.0f64); 4]; 3]; // [train count <20, <200, more][previous occurrence <=500 bytes back, <=5000, farther, none in the book] -> (count, stack CE sum)
     for (ri, &(abs, cm, cs, _)) in rows.iter().enumerate() {
         let t = abs + 1;
         let target = held_out[t];
         let (kind, pos) = if is_letter(target) {
             let (s, e) = word_at(t);
             let word: Vec<u8> = held_out[s..e].iter().map(|&b| b as u8).collect();
-            let kind = if lexicon.contains(&word) {
+            let kind = if lexicon.contains_key(&word) {
                 0
-            } else if first[&(doc_of(s), word)] < s {
+            } else if occ[&(doc_of(s), word)][0] < s {
                 1
             } else {
                 2
@@ -199,6 +201,15 @@ fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &HashSet<Vec<u8>>,
         };
         if kind == LETTER_KINDS[0] && pos == POS[0] {
             word_starts.push(ri);
+            let (s, e) = word_at(abs + 1);
+            let word: Vec<u8> = held_out[s..e].iter().map(|&b| b as u8).collect();
+            let starts = &occ[&(doc_of(s), word.clone())];
+            let back = starts.partition_point(|&o| o < s).checked_sub(1).map(|j| s - starts[j]);
+            let by_recency = match back { Some(d) if d <= 500 => 0, Some(d) if d <= 5000 => 1, Some(_) => 2, None => 3 };
+            let count = lexicon[&word];
+            let by_freq = if count < 20 { 0 } else if count < 200 { 1 } else { 2 };
+            let cell = &mut recency[by_freq][by_recency];
+            *cell = (cell.0 + 1, cell.1 + cs);
         }
         let cell = table.entry((kind, pos)).or_default();
         *cell = (cell.0 + 1, cell.1 + cm, cell.2 + cs);
@@ -224,6 +235,15 @@ fn survey_report(held_out: &[usize], docs: &[usize], lexicon: &HashSet<Vec<u8>>,
         }
     }
     println!("  total ceiling {:.2}e-3 nats ({:.2}% of the stack CE)", 1e3 * gain / n, 100.0 * gain / total_stack);
+    println!("word-initial letters in the lexicon: stack CE by train count of the word and distance to its previous occurrence in the book (positions, mean CE, contrib 1e-3):");
+    for (fi, fname) in ["train count <20", "train count 20-199", "train count >=200"].iter().enumerate() {
+        for (ri, rname) in ["prev <=500 B back", "prev <=5000 B back", "prev farther", "none earlier in book"].iter().enumerate() {
+            let (c, s) = recency[fi][ri];
+            if c > 0 {
+                println!("  {fname:20} {rname:22} {c:7} {:7.3} {:8.2}", s / c as f64, 1e3 * s / n);
+            }
+        }
+    }
     // A fixed-stride sample of word-initial targets, with the stack's three likeliest bytes: for reading by hand.
     println!("sample of word-initial letters in the lexicon (context | target word: stack top3, stack CE, model CE):");
     let show = |b: usize| if b == b'\n' as usize { '~' } else { b as u8 as char };
@@ -1041,9 +1061,12 @@ fn main() {
     let dev = DeviceParams::upload(&flat);
 
     // Held-out words the train split has never shown: the ceiling on what a train-split lexicon can know.
-    let train_words: HashSet<Vec<u8>> = word_list(&train).into_iter().collect();
+    let mut train_words: std::collections::HashMap<Vec<u8>, u32> = std::collections::HashMap::new();
+    for w in word_list(&train) {
+        *train_words.entry(w).or_default() += 1;
+    }
     let held_words = word_list(&held_out);
-    let oov: Vec<&Vec<u8>> = held_words.iter().filter(|w| !train_words.contains(*w)).collect();
+    let oov: Vec<&Vec<u8>> = held_words.iter().filter(|w| !train_words.contains_key(*w)).collect();
     let oov_bytes: usize = oov.iter().map(|w| w.len()).sum();
     println!(
         "held-out words: {} tokens, {} ({:.2}%) not in the train lexicon, covering {:.2}% of held-out bytes",
@@ -1305,7 +1328,7 @@ mod tests {
     fn survey_splits_letters_by_lexicon_and_recency() {
         let text: Vec<usize> = "aa bb aa bb\n".bytes().map(|b| b as usize).collect();
         let rows: Vec<SurveyRow> = (0..text.len() - 1).map(|a| (a, 2.0, 1.0, [(0, 0.0); 3])).collect();
-        let lexicon: HashSet<Vec<u8>> = [b"aa".to_vec()].into_iter().collect();
+        let lexicon: std::collections::HashMap<Vec<u8>, u32> = [(b"aa".to_vec(), 1)].into_iter().collect();
         let t = survey_report(&text, &[0], &lexicon, &rows, rows.len() as f64);
         let count = |k: &str, p: &'static str| t.get(&(k.to_string(), p)).map_or(0, |c| c.0);
         assert_eq!(count("in lexicon", "1st letter"), 1);
