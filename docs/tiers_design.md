@@ -1090,3 +1090,27 @@ Both halves pick lr 0.2: **-0.0330** (-2.9%) on the model alone, 491 steps per p
 the checkpoint. Model alone with dynamic evaluation (1.1148) is already within 0.033 of the whole tier stack (1.0821).
 Not yet tried: the stack on top (the memory keys come from the frozen model), RMS-normalised steps, more or smaller steps,
 a pull back toward the checkpoint.
+
+### Dynamic evaluation: finer steps, and under the tier stack (2026-10-10)
+
+Model alone, mean of the two held-out halves (`dyn_every=<windows per chunk>`, `dyn_steps=<k per chunk>`;
+`scripts/dyn_eval_sweep3.sh`, `dyn_eval_sweep4.sh`; baseline 1.1478, 32-window chunks at lr 0.2 gave 1.1148):
+
+| windows per step | lr 0.005 | 0.01 | 0.02 | 0.03 | 0.05 | 0.1 | 0.2 |
+|---|---|---|---|---|---|---|---|
+| 16 | | | | | 1.1204 | 1.1126 | 1.1103 |
+| 8 | | | | | 1.1114 | 1.1077 | 1.1208 |
+| 4 | | | 1.1132 | 1.1086 | **1.1061** | 1.1191 | 1.1740 |
+| 2 | | 1.1128 | 1.1057 | **1.1055** | | | |
+| 1 | 1.1127 | **1.1055** | 1.1094 | | | | |
+
+The best learning rate falls with the chunk size (0.2 at 32 windows, 0.05 at 4, 0.03 at 2, 0.01 at 1; collapse above it) and
+the optimum plateaus at **1.1055-1.1061 (-0.042, -3.6%)**: finer steps beyond 4 windows add nothing at plain SGD. Several steps
+per chunk are no better than one finer step (2 steps at 0.1: 1.1152; 4 steps at 0.05: 1.1159). Halves agree on the choice.
+
+The stack with dynamic evaluation (`scripts/tier_full_32m_novels22_dyn.sh`; tiers built from the default novels6 train split as the
+1.0821 run, memory train keys from the frozen model, queries and in-document keys from the adapted one; 32-window chunks, lr 0.2):
+model alone 1.1138, + lexicon/words/memory 1.0876, + wrap **1.0719** (new best; 1.0821 without). The tiers now add -0.0419
+against -0.0657 (-0.0789 on the novels6 model): adaptation takes over part of what the memory and lexicon gave, as the
+in-document memory and fast weights both learn the book. The stack could not use the finer chunks: the tier machinery works
+in 32-window chunks (online memory writes), so the finer optimum (1.1055 model alone) is not yet reachable under it.
