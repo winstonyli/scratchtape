@@ -1162,3 +1162,11 @@ in-document temperature 30/20/15/10 -> 1.0151/1.0141/1.0141/1.0144; shift 50/100
 with the old tuning, 1.0821 without dynamic evaluation). The memory now gets -0.0323 and wrap -0.0156 on the adapted model; the
 lower in-document temperature makes the in-book neighbours count for more, the same direction as the adaptation itself. The
 tuning is one-at-a-time and two rounds deep; the other parameters (whiten, tap, store) and the wrap lambda are not re-tuned.
+
+**Round 3 and which parameters to adapt.** `scripts/tier_dyn_retune3.sh` (half 0, base 1.0130): wrap lambda 0.9/0.98 1.0131/1.0130; query
+temperature 25/35 1.0133/1.0141; shift 75/125 1.0131/1.0150; knn lambda 0.35 1.0129; k 96 1.0127; whiten 0.75 1.0125, whiten 0.25 1.0150;
+tap=2 1.0386. Every gain is at most 0.0005: the tier mix has converged, so no full pass. `dyn_layers` masks the adapted parameters
+(model alone, half 0, 8-window plain SGD lr 0.1, `scripts/dyn_eval_sweep7.sh`; the all-parameter mask reproduces device SGD, 1.0597
+against 1.0595): all 1.0597; **blocks only 1.0590**; b2+b3+head 1.0643; b3+head 1.0714; head only 1.0862 (lr 0.3: 1.0848); embedding
+only 1.0942. The blocks carry the adaptation, the more of them the better, and embedding/head add nothing; restricting to a few layers
+is not a shortcut. Low-rank adapters are not tried; with blocks-only already as good as everything, they would at best match it.
