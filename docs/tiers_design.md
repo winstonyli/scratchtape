@@ -1067,3 +1067,26 @@ words, 42%; it does not use repeats of rare words in the book):
    gained 0.0155 alone but 0.0023 in the stack, so the two overlap). Earlier mutual distillation (same-size teacher) hurt.
 6. Context-dependent tier gating (`gate_fit`, `words_gate_fit` exist; outcomes not re-read).
 Also open: the recency prior for rare in-lexicon words (~0.005 est.; see "Recency of in-lexicon words").
+
+### Dynamic evaluation, model alone (2026-10-10)
+
+`tier_eval ... dyn=<lr>` (`adapt_step`; `scripts/dyn_eval_sweep.sh`, `dyn_eval_sweep2.sh`; logs `runs/dyn_sweep/`, git-ignored): after each
+32-window chunk is scored, one plain SGD step (no dropout, f16 default) on that chunk, which is text already scored; the
+parameters are re-uploaded from the checkpoint at each book boundary. The 32M novels22 model, warm=32, no tiers. `dyn=0`
+reproduces the baseline (halves 1.0969 / 1.1987, mean 1.1478 = the full-pass value). Held-out CE by half (part=0/2 chooses,
+part=1/2 confirms) and the control (each step taken from a chunk half the held-out text away, i.e. another book):
+
+| dyn lr | half 0 | half 1 | mean | control mean |
+|---|---|---|---|---|
+| 0 | 1.0969 | 1.1987 | 1.1478 | |
+| 0.01 | 1.0914 | 1.1893 | 1.1404 | 1.1459 |
+| 0.05 | 1.0810 | 1.1769 | 1.1290 | 1.1468 |
+| 0.1 | 1.0741 | 1.1692 | 1.1217 | |
+| **0.2** | **1.0672** | **1.1624** | **1.1148** | 1.1557 |
+| 0.4 | 1.0683 | 1.1638 | 1.1161 | |
+
+Both halves pick lr 0.2: **-0.0330** (-2.9%) on the model alone, 491 steps per pass, a few seconds of extra time. The control
+(adapting on another book) is flat to harmful (+0.0079 at 0.2), so the gain is from the book being read, not from re-tuning
+the checkpoint. Model alone with dynamic evaluation (1.1148) is already within 0.033 of the whole tier stack (1.0821).
+Not yet tried: the stack on top (the memory keys come from the frozen model), RMS-normalised steps, more or smaller steps,
+a pull back toward the checkpoint.

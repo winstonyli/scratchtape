@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [classes=1] [survey=1] [dump=<path>] [wdump=<path>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [classes=1] [survey=1] [dyn=<lr>] [dyn_control=1] [dump=<path>] [wdump=<path>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -42,6 +42,7 @@
 // a query in window w sees the train keys and only those held-out windows before w in the same book (`store` counts
 // train windows; 0 for no train keys). `stride`/`offset`/`part` still choose what is scored.
 // `classes=1` prints the loss by position class (letter or not before, kind of byte predicted): where the model's CE sits and which tier gains where.
+// `dyn=<lr>` is dynamic evaluation (model alone, no tiers): after each chunk is scored, one SGD step at that lr on the same chunk (text already scored), parameters reset to the checkpoint at each book boundary. `dyn_control=1` takes each step from a chunk half the held-out text away instead (it must not help).
 // `survey=1` (needs a tier spec; reads the LAST spec) splits the CE by what the target is: letters by whether the word is in the train lexicon, was seen earlier in the same book, or is new, and by position in the word; other bytes by kind. It prints where the stack's CE sits and a ceiling for an in-document word cache.
 // `whiten=<alpha>` (default off) centres the memory's keys and queries and multiplies them by Sigma^(-alpha/2) (Sigma: the covariance of
 // 128k train positions, total variance kept); alpha 0.5 gave the best stack (docs/tiers_design.md).
@@ -878,6 +879,20 @@ fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], t
     Forward { ids, targets, logits, row_loss, hidden }
 }
 
+/// One plain SGD step at `lr` on the windows of `data` starting at `starts` (the same step as training, without dropout).
+fn adapt_step(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], lr: f32) {
+    let (mut ids, mut targets) = (vec![], vec![]);
+    for &s in starts {
+        ids.extend(&data[s..s + SEQ_LEN]);
+        targets.extend(&data[s + 1..s + SEQ_LEN + 1]);
+    }
+    dev.zero_grads();
+    let mut dt = DeviceTape::new(dev);
+    let (_, _, loss) = model_forward(&mut dt, cfg, &ids, &targets, starts.len());
+    dt.backward(loss);
+    dev.sgd(lr);
+}
+
 /// `whiten=<alpha>`: keys and queries are centred and multiplied by Sigma^(-alpha/2) (symmetric, total variance kept, so
 /// distances keep their scale), Sigma estimated from a sample of train positions. Set once before the memory is built.
 static WHITEN: std::sync::OnceLock<(Vec<f32>, Vec<f32>)> = std::sync::OnceLock::new();
@@ -1016,7 +1031,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
-            | "recent" | "whiten" | "classes" | "survey" | "dump" | "wdump" => {
+            | "recent" | "whiten" | "classes" | "survey" | "dyn" | "dyn_control" | "dump" | "wdump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -1058,7 +1073,7 @@ fn main() {
     assert_eq!(flat.len(), cfg.len(), "{ckpt} has {} parameters, this config needs {}", flat.len(), cfg.len());
     let (train, held_out) = split_corpus(&corpus);
     let _lease = gpu_lease::hold(Kind::Shared, "scratchtape tier_eval", Duration::from_secs(4 * 3600));
-    let dev = DeviceParams::upload(&flat);
+    let mut dev = DeviceParams::upload(&flat);
 
     // Held-out words the train split has never shown: the ceiling on what a train-split lexicon can know.
     let mut train_words: std::collections::HashMap<Vec<u8>, u32> = std::collections::HashMap::new();
@@ -1158,6 +1173,12 @@ fn main() {
     let mut ce_tier = vec![0.0f64; tiers.len()];
     // `classes=1`: per position class, the count and the summed CE of the model and of each spec.
     let survey = opt.contains_key("survey");
+    let dyn_lr: Option<f32> = opt.get("dyn").map(|v| v.parse().unwrap());
+    let dyn_control = opt.contains_key("dyn_control");
+    assert!(dyn_lr.is_some() || !dyn_control, "dyn_control=1 needs dyn=<lr>");
+    assert!(dyn_lr.is_none() || specs.is_empty(), "dyn=<lr> is model alone for now: no tier specs (the memory keys come from the frozen model)");
+    let dyn_docs = held_out_docs(&corpus);
+    let mut dyn_doc = usize::MAX;
     assert!(!survey || !specs.is_empty(), "survey=1 needs a tier spec");
     let mut survey_rows: Vec<SurveyRow> = vec![]; // (position of the input byte, model CE, last spec's CE, its three likeliest bytes)
     let mut cls_n = [0usize; 10];
@@ -1188,6 +1209,14 @@ fn main() {
                 for tier in tiers.last().unwrap() {
                     tier.wdump(path, false);
                 }
+            }
+        }
+        if dyn_lr.is_some() {
+            // A new book starts from the checkpoint again: nothing adapted on one book carries into the next.
+            let doc = dyn_docs.partition_point(|&b| b <= chunk[0]) - 1;
+            if doc != dyn_doc {
+                dev = DeviceParams::upload(&flat);
+                dyn_doc = doc;
             }
         }
         let t0 = std::time::Instant::now();
@@ -1248,6 +1277,11 @@ fn main() {
             }
         }
         phase[2] += t0.elapsed();
+        if let Some(lr) = dyn_lr {
+            // The step reads only text that has just been scored (or, for the control, text from far away).
+            let source: Vec<usize> = if dyn_control { chunk.iter().map(|&s| (s + held_out.len() / 2) % (held_out.len() - SEQ_LEN - 1)).collect() } else { chunk.to_vec() };
+            adapt_step(&dev, &cfg, &held_out, &source, lr);
+        }
     }
     let total = t_all.elapsed().as_secs_f64();
     let pct = |d: std::time::Duration| format!("{:.1}s ({:.0}%)", d.as_secs_f64(), 100.0 * d.as_secs_f64() / total);
