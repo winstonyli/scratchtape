@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [classes=1] [survey=1] [dyn=<lr>] [dyn_every=<windows>] [dyn_steps=<k>] [dyn_control=1] [dump=<path>] [wdump=<path>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [classes=1] [survey=1] [dyn=<lr>] [dyn_every=<windows>] [dyn_steps=<k>] [dyn_rms=<beta>] [dyn_pull=<f>] [dyn_control=1] [dump=<path>] [wdump=<path>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -42,7 +42,8 @@
 // a query in window w sees the train keys and only those held-out windows before w in the same book (`store` counts
 // train windows; 0 for no train keys). `stride`/`offset`/`part` still choose what is scored.
 // `classes=1` prints the loss by position class (letter or not before, kind of byte predicted): where the model's CE sits and which tier gains where.
-// `dyn_every=<windows>` (default 32, model alone only) scores and adapts in chunks of that many windows; `dyn_steps=<k>` (default 1) takes k steps per chunk.
+// `dyn_every=<windows>` (default 32) scores, writes the online memory and adapts in chunks of that many windows; `dyn_steps=<k>` (default 1) takes k steps per chunk.
+// `dyn_rms=<beta>` divides each gradient by a bias-corrected running RMS (decay beta; lr is then per-parameter step size, ~1e-4); `dyn_pull=<f>` moves each parameter the fraction f back towards the checkpoint after each step (both: host-side prototype, `Adapter`).
 // `dyn=<lr>` is dynamic evaluation (with tiers, the memory's train keys stay from the frozen model while queries and in-document keys come from the adapted one): after each chunk is scored, one SGD step at that lr on the same chunk (text already scored), parameters reset to the checkpoint at each book boundary. `dyn_control=1` takes each step from a chunk half the held-out text away instead (it must not help).
 // `survey=1` (needs a tier spec; reads the LAST spec) splits the CE by what the target is: letters by whether the word is in the train lexicon, was seen earlier in the same book, or is new, and by position in the word; other bytes by kind. It prints where the stack's CE sits and a ceiling for an in-document word cache.
 // `whiten=<alpha>` (default off) centres the memory's keys and queries and multiplies them by Sigma^(-alpha/2) (Sigma: the covariance of
@@ -880,18 +881,62 @@ fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], t
     Forward { ids, targets, logits, row_loss, hidden }
 }
 
-/// One plain SGD step at `lr` on the windows of `data` starting at `starts` (the same step as training, without dropout).
-fn adapt_step(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], lr: f32) {
-    let (mut ids, mut targets) = (vec![], vec![]);
-    for &s in starts {
-        ids.extend(&data[s..s + SEQ_LEN]);
-        targets.extend(&data[s + 1..s + SEQ_LEN + 1]);
+/// Test-time optimiser for `dyn=<lr>`: plain SGD on the device (the training step, without dropout), or, with `dyn_rms=<beta>` /
+/// `dyn_pull=<f>`, a host-side step (a prototype: reads the gradients and parameters back, updates, uploads) that normalises each
+/// gradient by a bias-corrected running RMS and moves every parameter the fraction `f` of the way back to the checkpoint.
+struct Adapter {
+    lr: f32,
+    rms_beta: Option<f32>,
+    pull: f32,
+    start: Vec<f32>,
+    v: Vec<f32>,
+    t: i32,
+}
+
+impl Adapter {
+    fn new(lr: f32, rms_beta: Option<f32>, pull: f32, start: &[f32]) -> Self {
+        Adapter { lr, rms_beta, pull, start: start.to_vec(), v: vec![0.0; start.len()], t: 0 }
     }
-    dev.zero_grads();
-    let mut dt = DeviceTape::new(dev);
-    let (_, _, loss) = model_forward(&mut dt, cfg, &ids, &targets, starts.len());
-    dt.backward(loss);
-    dev.sgd(lr);
+
+    /// A new book: the optimiser state starts again (the caller re-uploads the checkpoint).
+    fn reset(&mut self) {
+        self.v.fill(0.0);
+        self.t = 0;
+    }
+
+    fn step(&mut self, dev: &mut DeviceParams, cfg: &Config, data: &[usize], starts: &[usize]) {
+        let (mut ids, mut targets) = (vec![], vec![]);
+        for &s in starts {
+            ids.extend(&data[s..s + SEQ_LEN]);
+            targets.extend(&data[s + 1..s + SEQ_LEN + 1]);
+        }
+        dev.zero_grads();
+        let mut dt = DeviceTape::new(dev);
+        let (_, _, loss) = model_forward(&mut dt, cfg, &ids, &targets, starts.len());
+        dt.backward(loss);
+        drop(dt);
+        if self.rms_beta.is_none() && self.pull == 0.0 {
+            dev.sgd(self.lr);
+            return;
+        }
+        let (g, mut p) = (dev.read(&dev.grads), dev.read(&dev.params));
+        self.t += 1;
+        let (beta, corr) = match self.rms_beta {
+            Some(b) => (b, 1.0 - b.powi(self.t)),
+            None => (0.0, 1.0),
+        };
+        for i in 0..p.len() {
+            let step = match self.rms_beta {
+                Some(_) => {
+                    self.v[i] = beta * self.v[i] + (1.0 - beta) * g[i] * g[i];
+                    self.lr * g[i] / ((self.v[i] / corr).sqrt() + 1e-8)
+                }
+                None => self.lr * g[i],
+            };
+            p[i] = p[i] - step + self.pull * (self.start[i] - p[i]);
+        }
+        *dev = DeviceParams::upload(&p);
+    }
 }
 
 /// `whiten=<alpha>`: keys and queries are centred and multiplied by Sigma^(-alpha/2) (symmetric, total variance kept, so
@@ -1032,7 +1077,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
-            | "recent" | "whiten" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dump" | "wdump" => {
+            | "recent" | "whiten" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dump" | "wdump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -1177,8 +1222,8 @@ fn main() {
     let dyn_lr: Option<f32> = opt.get("dyn").map(|v| v.parse().unwrap());
     let dyn_control = opt.contains_key("dyn_control");
     let dyn_steps = size("dyn_steps", "1");
-    let chunk_n = if dyn_lr.is_some() && specs.is_empty() { size("dyn_every", &CHUNK.to_string()) } else { CHUNK };
-    assert!(chunk_n == CHUNK || specs.is_empty(), "dyn_every needs no tier specs");
+    let mut adapter = Adapter::new(dyn_lr.unwrap_or(0.0), opt.get("dyn_rms").map(|v| v.parse().unwrap()), get("dyn_pull", "0").parse().unwrap(), &flat);
+    let chunk_n = size("dyn_every", &CHUNK.to_string());
     assert!(dyn_lr.is_some() || !dyn_control, "dyn_control=1 needs dyn=<lr>");
     let dyn_docs = held_out_docs(&corpus);
     let mut dyn_doc = usize::MAX;
@@ -1219,6 +1264,7 @@ fn main() {
             let doc = dyn_docs.partition_point(|&b| b <= chunk[0]) - 1;
             if doc != dyn_doc {
                 dev = DeviceParams::upload(&flat);
+                adapter.reset();
                 dyn_doc = doc;
             }
         }
@@ -1280,11 +1326,11 @@ fn main() {
             }
         }
         phase[2] += t0.elapsed();
-        if let Some(lr) = dyn_lr {
+        if dyn_lr.is_some() {
             // The step reads only text that has just been scored (or, for the control, text from far away).
             let source: Vec<usize> = if dyn_control { chunk.iter().map(|&s| (s + held_out.len() / 2) % (held_out.len() - SEQ_LEN - 1)).collect() } else { chunk.to_vec() };
             for _ in 0..dyn_steps {
-                adapt_step(&dev, &cfg, &held_out, &source, lr);
+                adapter.step(&mut dev, &cfg, &held_out, &source);
             }
         }
     }

@@ -1114,3 +1114,33 @@ model alone 1.1138, + lexicon/words/memory 1.0876, + wrap **1.0719** (new best; 
 against -0.0657 (-0.0789 on the novels6 model): adaptation takes over part of what the memory and lexicon gave, as the
 in-document memory and fast weights both learn the book. The stack could not use the finer chunks: the tier machinery works
 in 32-window chunks (online memory writes), so the finer optimum (1.1055 model alone) is not yet reachable under it.
+
+### Dynamic evaluation under the stack at finer steps; RMS steps (2026-10-11)
+
+The tiers had to become chunk-size independent first: `dyn_every=<windows>` now sets the scoring / online-write / adapt chunk for
+the tiers too. Gate: the stack without dynamic evaluation on held-out half 0 gives 1.0366 at both 32 and 8 windows per chunk
+(`scripts/tier_dyn_chunks.sh`, `runs/dyn_tier/`). Stack on half 0 with dynamic evaluation: 32 windows at lr 0.2 **1.0271**; 8 windows
+at 0.1 **1.0245**; 4 windows at 0.05 **1.0235** (no dynamic evaluation 1.0366).
+
+Optimiser, model alone (`Adapter`: `dyn_rms=<beta>` divides each gradient by a bias-corrected running RMS, `dyn_pull=<f>` pulls
+each parameter back towards the checkpoint; a host-side prototype that reads gradients and parameters back every step, ~2-3x slower
+than the device SGD; gate: `dyn_pull=1e-12` reproduces the device SGD value 1.0577 exactly). Half 0 at 8-window steps (SGD best
+1.0595): RMS beta 0.99 lr 1e-4 **1.0568** (beta 0.9: 1.0572; lr 3e-4 1.0749, 5e-5 1.0640, 3e-5 1.0711, 1e-3 diverges); a pull of
+0.001 is neutral (1.0567), 0.01 hurts (1.0601). At 4-window steps lr 1e-4 gives half 0 **1.0550** and half 1 **1.1511**, mean
+**1.1031** against 1.1055 for the best SGD: the optimiser is worth ~0.002.
+
+Full-pass stack with dynamic evaluation at 4 windows per step (`scripts/tier_full_32m_novels22_dyn4.sh`; tiers from the novels6 train
+split; memory train keys from the frozen model):
+
+| dynamic evaluation | model alone | + lexicon/words/memory | + wrap |
+|---|---|---|---|
+| none | 1.1478 | 1.0981 | 1.0821 |
+| 32 windows, SGD 0.2 | 1.1138 | 1.0876 | 1.0719 |
+| 4 windows, SGD 0.05 | 1.1054 | 1.0848 | **1.0689** |
+| 4 windows, RMS 1e-4 | 1.1022 | 1.0846 | **1.0688** |
+
+Dynamic evaluation now buys -0.0132 on the stack (-0.0426 on the model alone); a model gain of 0.0084 from finer steps and RMS reaches
+the stack as 0.0030, and RMS's extra 0.0032 on the model alone as 0.0001: the memory and the adapted weights learn the same book. The
+tiers add -0.0364 on top of the adapted model (-0.0657 on the frozen one). Plain device SGD at 4-window steps is the setting to keep
+(RMS ties it and is a slow host prototype). Not tried: rebuilding the memory's train keys from the adapted model (~70 s per
+rebuild), adapting only some layers, and a different tier mix now that the model alone is close to the stack.
