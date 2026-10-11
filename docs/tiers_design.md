@@ -1050,3 +1050,20 @@ word from the book, at 1.5% of the positions; each nat saved on all of them is 0
 saves a third of a nat on them is worth about 0.005: the same size as the whole novels22 effect on the stack (0.0023) or the
 wrap rule's remaining gain, and the only measured KR&R lead. Untested; the cache is a recency prior over the first letters of
 book words not frequent in the train text, mixed in like `words`.
+
+## Direction: more capability at the current scale (2026-10-10)
+
+Set by the user: stay at about 2M parameters (4 blocks, d=256, ff=512, 64-byte windows) and look for new ideas, not larger
+models. Ideas, ranked by how directly they meet the survey above (the stack's CE sits on word-initial letters of known
+words, 42%; it does not use repeats of rare words in the book):
+1. **Dynamic evaluation** (fast weights; the short-term-memory tier): score a chunk, take a gradient step on the bytes just
+   scored, carry the weights through the book, reset between books. Extra cost ~80 s per held-out pass. Open: learning rate
+   (tune on a disjoint split), reset points, interaction with the kNN keys (the frozen model's train keys vs adapted queries).
+   **Started 2026-10-10.**
+2. In-model memory: kNN attention over earlier hidden states of the book (Memorizing Transformers), trained end to end.
+3. Auxiliary heads aimed at word starts (next 2-4 bytes, next word's first letter or class); free at inference.
+4. Hashed previous-word / prefix embeddings as extra inputs (capacity as lookups); adds parameters.
+5. Train with the tiers in mind: distil the stack into the model, or train on the residual the tiers leave (the 32M novels22 model
+   gained 0.0155 alone but 0.0023 in the stack, so the two overlap). Earlier mutual distillation (same-size teacher) hurt.
+6. Context-dependent tier gating (`gate_fit`, `words_gate_fit` exist; outcomes not re-read).
+Also open: the recency prior for rare in-lexicon words (~0.005 est.; see "Recency of in-lexicon words").
