@@ -1179,3 +1179,20 @@ train-probe 1.0377 / 1.0084 / 1.0008. Cost per step 4.7 / 5.1 / 6.9 ms (same byt
 wall time 45 / 39 / 49 min). Longer context helps the model itself, with diminishing returns
 (each doubling buys about 40% of the previous gain). The tiers read 256 bytes of context already, so part of this gain may
 overlap theirs; not yet measured (tier_eval has `SEQ_LEN` 64 as a constant, and its windows/`warm` assume it).
+
+**Context length under the tiers.** `tier_eval` takes `seq=` (default 64; window length, the launch chunk shrinks as 32*64/seq).
+Gate: the probe models alone on the same protocol (`warm = seq - 32`) give 1.1785 (seq 64) and 1.1418 (seq 256), matching the
+trainer's 1.1784 / 1.1418. `scripts/ctx_probe_tiers.sh`, novels6, held-out half 0, static stack (no dynamic evaluation),
+store fixed in bytes:
+
+| seq | model | + lexicon/words/memory | + wrap |
+|---|---|---|---|
+| 64 | 1.1315 | 1.0693 | 1.0532 |
+| 128 | 1.1039 | 1.0381 | 1.0381 |
+| 256 | 1.0953 | 1.0360 | 1.0360 |
+
+The model-alone gain (-0.0276, then -0.0086) shrinks under the tiers: the memory's gain falls from -0.0622 to -0.0592 at seq 256,
+and the stack gains -0.0151 at 128 and only -0.0021 more at 256. Wrap rule is now redundant: with a 128-byte window the window
+shows a newline whenever the context does ("applied at 0 positions"), so it is dropped from the stack at seq >= 128. Seq 128
+captures nearly all of the stack gain at 1.07x the step cost, so the 32M novels22 model is retrained at seq 128
+(`scripts/train_32m_novels22_seq128.sh`).

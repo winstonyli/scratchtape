@@ -77,10 +77,16 @@ use std::time::Duration;
 mod common;
 use common::{held_out_docs, split_corpus};
 
-const SEQ_LEN: usize = 64;
+/// Window length of the model under test: set once from `seq=` (default 64) before anything reads it.
+static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
+fn seq_len() -> usize {
+    SEQ.load(std::sync::atomic::Ordering::Relaxed)
+}
 const VOCAB: usize = 256;
 /// Windows per forward launch.
-const CHUNK: usize = 32;
+fn chunk_windows() -> usize {
+    32 * 64 / seq_len() // keeps windows * heads * seq under the 65535 launch limit
+}
 /// Bytes of preceding text the CPU tiers may read with the `h` flag (the model itself sees only its 64-byte window).
 const CONTEXT: usize = 256;
 
@@ -652,27 +658,27 @@ impl Store {
         let mut ranges: Option<(Vec<(u32, u32)>, u32)> = self.causal.as_ref().map(|c| {
             let r = (0..rows)
                 .map(|r| {
-                    let w = starts[r / SEQ_LEN] / SEQ_LEN;
+                    let w = starts[r / seq_len()] / seq_len();
                     let first = c.first_window[w].max(w.saturating_sub(c.recent));
-                    ((c.n_train + first * SEQ_LEN) as u32, (c.n_train + w * SEQ_LEN) as u32)
+                    ((c.n_train + first * seq_len()) as u32, (c.n_train + w * seq_len()) as u32)
                 })
                 .collect();
             (r, c.n_train as u32)
         });
         if let Some(on) = &self.online {
             let on = on.borrow();
-            let per_window = SEQ_LEN - self.warm;
+            let per_window = seq_len() - self.warm;
             let r = (0..rows)
                 .map(|r| {
-                    let d = on.docs.partition_point(|&b| b <= starts[r / SEQ_LEN]) - 1;
-                    let hi = (on.base + r / SEQ_LEN * per_window) as u32;
+                    let d = on.docs.partition_point(|&b| b <= starts[r / seq_len()]) - 1;
+                    let hi = (on.base + r / seq_len() * per_window) as u32;
                     (on.doc_first_key[d].map_or(hi, |k| k as u32), hi)
                 })
                 .collect();
             ranges = Some((r, on.n_train as u32));
         }
         // Only the scored rows (window position >= warm) are searched; the others keep (infinity, 0) entries.
-        let scored: Vec<usize> = (0..rows).filter(|r| r % SEQ_LEN >= self.warm).collect();
+        let scored: Vec<usize> = (0..rows).filter(|r| r % seq_len() >= self.warm).collect();
         let d = hidden.len() / rows;
         let q: Vec<f32> = scored.iter().flat_map(|&r| hidden[r * d..(r + 1) * d].iter().copied()).collect();
         let rg = ranges.as_ref().map(|(r, a)| (scored.iter().map(|&i| r[i]).collect::<Vec<_>>(), *a));
@@ -709,7 +715,7 @@ impl Store {
             if on.doc_first_key[doc].is_none() {
                 on.doc_first_key[doc] = Some(gpu.len());
             }
-            let rows = j * SEQ_LEN + warm..(j + 1) * SEQ_LEN;
+            let rows = j * seq_len() + warm..(j + 1) * seq_len();
             // `len()` counts keys not yet uploaded, so no flush per window (that made one 32-key device tile per window).
             gpu.add_doc(&hidden[rows.start * d..rows.end * d], &targets[rows].iter().map(|&t| t as u8).collect::<Vec<_>>());
         }
@@ -870,8 +876,8 @@ struct Forward {
 fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], tap: usize, want_hidden: bool, want_logits: bool) -> Forward {
     let (mut ids, mut targets) = (vec![], vec![]);
     for &s in starts {
-        ids.extend(&data[s..s + SEQ_LEN]);
-        targets.extend(&data[s + 1..s + SEQ_LEN + 1]);
+        ids.extend(&data[s..s + seq_len()]);
+        targets.extend(&data[s + 1..s + seq_len() + 1]);
     }
     let mut dt = DeviceTape::new(dev);
     let (outs, logits, loss) = model_forward(&mut dt, cfg, &ids, &targets, starts.len());
@@ -911,8 +917,8 @@ impl Adapter {
     fn step(&mut self, dev: &mut DeviceParams, cfg: &Config, data: &[usize], starts: &[usize]) {
         let (mut ids, mut targets) = (vec![], vec![]);
         for &s in starts {
-            ids.extend(&data[s..s + SEQ_LEN]);
-            targets.extend(&data[s + 1..s + SEQ_LEN + 1]);
+            ids.extend(&data[s..s + seq_len()]);
+            targets.extend(&data[s + 1..s + seq_len() + 1]);
         }
         dev.zero_grads();
         let mut dt = DeviceTape::new(dev);
@@ -1030,10 +1036,10 @@ fn whitening_matrix(cov: &[f64], d: usize, alpha: f64) -> (Vec<f32>, Vec<f64>) {
 
 fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, alpha: f64) {
     let d = cfg.d;
-    let total = (train.len() - 1) / SEQ_LEN;
-    let starts: Vec<usize> = (0..2000.min(total)).map(|i| i * total / 2000.min(total) * SEQ_LEN).collect();
+    let total = (train.len() - 1) / seq_len();
+    let starts: Vec<usize> = (0..2000.min(total)).map(|i| i * total / 2000.min(total) * seq_len()).collect();
     let mut h: Vec<f32> = vec![];
-    for chunk in starts.chunks(2 * CHUNK) {
+    for chunk in starts.chunks(2 * chunk_windows()) {
         h.extend(forward(dev, cfg, train, chunk, tap, true, false).hidden);
     }
     let n = h.len() / d;
@@ -1083,7 +1089,7 @@ fn main() {
         let (k, v) = a.split_once('=').unwrap_or_else(|| panic!("expected key=value, got {a}"));
         match k {
             "tier" => specs.push(v.to_string()),
-            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
+            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq"
             | "recent" | "whiten" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
@@ -1092,14 +1098,15 @@ fn main() {
     }
     let get = |k: &str, d: &str| opt.get(k).cloned().unwrap_or(d.to_string());
     let size = |k: &str, d: &str| -> usize { get(k, d).parse().unwrap() };
-    let cfg = Config { vocab: VOCAB, d: size("d_model", "256"), heads: size("heads", "8"), d_ff: size("d_ff", "512"), t: SEQ_LEN, n_blocks: size("blocks", "4"), softmax1: false };
+    SEQ.store(size("seq", "64"), std::sync::atomic::Ordering::Relaxed);
+    let cfg = Config { vocab: VOCAB, d: size("d_model", "256"), heads: size("heads", "8"), d_ff: size("d_ff", "512"), t: seq_len(), n_blocks: size("blocks", "4"), softmax1: false };
     let tap = size("tap", &(cfg.n_blocks - 1).to_string());
     assert!(tap < cfg.n_blocks, "tap must be a block index below {}", cfg.n_blocks);
     let stride = size("stride", "1");
     assert!(stride >= 1 && (stride == 1 || !opt.contains_key("expect")), "stride >= 1, and `expect` needs stride 1");
     let warm = size("warm", "0");
-    assert!(warm < SEQ_LEN && (warm == 0 || !opt.contains_key("expect")), "warm < {SEQ_LEN}, and `expect` needs warm 0");
-    let unit = SEQ_LEN - warm;
+    assert!(warm < seq_len() && (warm == 0 || !opt.contains_key("expect")), "warm < seq, and `expect` needs warm 0");
+    let unit = seq_len() - warm;
     let offset = size("offset", "0");
     assert!(offset < stride, "offset must be below stride");
     let part = |k: &str| -> (usize, usize) {
@@ -1165,7 +1172,7 @@ fn main() {
         let mut t_fwd = std::time::Duration::ZERO;
         let mut load = |data: &[usize], starts: &[usize], doc: bool| {
             // Only the hidden states are needed (no logits or losses), so launches can be twice as large.
-            for chunk in starts.chunks(2 * CHUNK) {
+            for chunk in starts.chunks(2 * chunk_windows()) {
                 let t0 = std::time::Instant::now();
                 let f = forward(&dev, &cfg, data, chunk, tap, true, false);
                 t_fwd += t0.elapsed();
@@ -1174,14 +1181,14 @@ fn main() {
             }
         };
         if from != "held" && want > 0 {
-            let total = (train.len() - 1) / SEQ_LEN;
-            let starts: Vec<usize> = (0..want.min(total)).map(|i| i * total / want.min(total) * SEQ_LEN).collect();
+            let total = (train.len() - 1) / seq_len();
+            let starts: Vec<usize> = (0..want.min(total)).map(|i| i * total / want.min(total) * seq_len()).collect();
             load(&train, &starts, false);
             n_train = starts.len();
         }
         if from != "train" {
-            let windows = (held_out.len() - 1) / SEQ_LEN;
-            let unscored: Vec<usize> = (0..windows).filter(|i| causal || (i % stride != offset && i * spart_n / windows == spart_i)).map(|i| i * SEQ_LEN).collect();
+            let windows = (held_out.len() - 1) / seq_len();
+            let unscored: Vec<usize> = (0..windows).filter(|i| causal || (i % stride != offset && i * spart_n / windows == spart_i)).map(|i| i * seq_len()).collect();
             let starts: Vec<usize> = if causal { unscored } else { (0..want.min(unscored.len())).map(|i| unscored[i * unscored.len() / want.min(unscored.len())]).collect() };
             load(&held_out, &starts, true);
             n_held = starts.len();
@@ -1202,15 +1209,15 @@ fn main() {
             if online { ", then written online as scored" } else { "" },
             if gpu.is_f16() { "f16 on matrix cores (KNN_F32=1 for exact f32)" } else { "f32" }
         );
-        let n_train_keys = n_train * SEQ_LEN;
+        let n_train_keys = n_train * seq_len();
         let online = online.then(|| {
             let docs = held_out_docs(&corpus);
             RefCell::new(Online { base: 0, n_train: n_train_keys, doc_first_key: vec![None; docs.len()], docs })
         });
         let causal = causal.then(|| {
             let docs = held_out_docs(&corpus);
-            let windows = (held_out.len() - 1) / SEQ_LEN;
-            let first_window = (0..windows).map(|w| docs[docs.partition_point(|&b| b <= w * SEQ_LEN) - 1].div_ceil(SEQ_LEN)).collect();
+            let windows = (held_out.len() - 1) / seq_len();
+            let first_window = (0..windows).map(|w| docs[docs.partition_point(|&b| b <= w * seq_len()) - 1].div_ceil(seq_len())).collect();
             Causal { n_train: n_train_keys, first_window, recent: size("recent", &usize::MAX.to_string()) }
         });
         Some(Rc::new(Store { gpu: RefCell::new(gpu), causal, online, warm, found: RefCell::new((None, vec![])) }))
@@ -1246,7 +1253,7 @@ fn main() {
         m
     });
     let mut adapter = Adapter::new(dyn_lr.unwrap_or(0.0), opt.get("dyn_rms").map(|v| v.parse().unwrap()), get("dyn_pull", "0").parse().unwrap(), &flat, layer_mask);
-    let chunk_n = size("dyn_every", &CHUNK.to_string());
+    let chunk_n = size("dyn_every", &chunk_windows().to_string());
     assert!(dyn_lr.is_some() || !dyn_control, "dyn_control=1 needs dyn=<lr>");
     let frozen_keys = get("dyn_keys", "adapted") == "frozen";
     assert!(!frozen_keys || dyn_lr.is_some(), "dyn_keys=frozen needs dyn=<lr>");
@@ -1260,8 +1267,8 @@ fn main() {
     let mut cls_tier = vec![[0.0f64; 10]; tiers.len()];
     // `classes=1`, line ends: [target is a newline or a space][a newline in the 64-byte window][column bucket] -> (count, model CE sum).
     let mut col = [[[(0usize, 0.0f64); COLUMN_EDGES.len() + 1]; 2]; 2];
-    let n_win = (held_out.len() - 1) / SEQ_LEN;
-    let starts: Vec<usize> = (offset * unit..held_out.len() - SEQ_LEN).step_by(unit * stride).filter(|s| s / SEQ_LEN * part_n / n_win == part_i).collect();
+    let n_win = (held_out.len() - 1) / seq_len();
+    let starts: Vec<usize> = (offset * unit..held_out.len() - seq_len()).step_by(unit * stride).filter(|s| s / seq_len() * part_n / n_win == part_i).collect();
     // Wall time per phase: forward launch + readback, tier prepare (kNN search + readback), per-row scoring, online writes.
     let mut phase = [std::time::Duration::ZERO; 4];
     let t_all = std::time::Instant::now();
@@ -1314,12 +1321,12 @@ fn main() {
         phase[1] += t0.elapsed();
         let t0 = std::time::Instant::now();
         for r in 0..rows {
-            let t = r % SEQ_LEN;
+            let t = r % seq_len();
             if t < warm {
                 continue;
             }
             let window = &f.ids[r - t..=r];
-            let abs = chunk[r / SEQ_LEN] + t;
+            let abs = chunk[r / seq_len()] + t;
             let context = &held_out[(abs + 1).saturating_sub(CONTEXT)..=abs];
             let probs = softmax(&f.logits[r * VOCAB..(r + 1) * VOCAB]);
             ce_model -= probs[f.targets[r]].ln();
@@ -1358,7 +1365,7 @@ fn main() {
         phase[2] += t0.elapsed();
         if dyn_lr.is_some() {
             // The step reads only text that has just been scored (or, for the control, text from far away).
-            let source: Vec<usize> = if dyn_control { chunk.iter().map(|&s| (s + held_out.len() / 2) % (held_out.len() - SEQ_LEN - 1)).collect() } else { chunk.to_vec() };
+            let source: Vec<usize> = if dyn_control { chunk.iter().map(|&s| (s + held_out.len() / 2) % (held_out.len() - seq_len() - 1)).collect() } else { chunk.to_vec() };
             for _ in 0..dyn_steps {
                 adapter.step(&mut dev, &cfg, &held_out, &source);
             }
