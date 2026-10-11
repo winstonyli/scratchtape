@@ -55,7 +55,8 @@ use std::time::{Duration, Instant};
 mod common;
 use common::{sample_window, split_corpus};
 
-const SEQ_LEN: usize = 64;
+/// Longest `seq`: scored-tail windows start at MAX_SEQ - seq so every seq scores the same target bytes.
+const MAX_SEQ: usize = 256;
 const VOCAB: usize = 256;
 /// Held-out windows per model per evaluation launch.
 const EVAL_CHUNK: usize = 32;
@@ -73,22 +74,25 @@ fn init(rng: &mut Rng, cfg: &Config) -> Vec<f32> {
 /// Each of `dev`'s models' mean CE over the corpus's non-overlapping
 /// windows, and the ensemble's (the mean over rows of -log of the models'
 /// mean probability of the target).
-fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f64) {
+fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize], tail: usize) -> (Vec<f64>, f64) {
     let k = dev.models.k;
-    let starts: Vec<usize> = (0..corpus.len() - SEQ_LEN).step_by(SEQ_LEN).collect();
+    let seq = cfg.t;
+    let first = if tail > 0 { MAX_SEQ - seq } else { 0 };
+    let (stride, from) = if tail > 0 { (tail, seq - tail) } else { (seq, 0) };
+    let starts: Vec<usize> = (first..corpus.len() - seq).step_by(stride).collect();
     let (mut each, mut ens) = (vec![0.0f64; k], 0.0f64);
     for chunk in starts.chunks(EVAL_CHUNK) {
         let (mut ids, mut targets) = (vec![], vec![]);
         for &s in chunk {
-            ids.extend(&corpus[s..s + SEQ_LEN]);
-            targets.extend(&corpus[s + 1..s + SEQ_LEN + 1]);
+            ids.extend(&corpus[s..s + seq]);
+            targets.extend(&corpus[s + 1..s + seq + 1]);
         }
         let rows = ids.len();
         let (ids, targets) = (ids.repeat(k), targets.repeat(k));
         let mut dt = DeviceTape::new(dev);
         let (_, _, loss) = model_forward(&mut dt, cfg, &ids, &targets, k * chunk.len());
         let rl = read(dt.row_losses(loss));
-        for r in 0..rows {
+        for r in (0..rows).filter(|r| r % seq >= from) {
             let l: Vec<f64> = (0..k).map(|m| rl[m * rows + r] as f64).collect();
             for m in 0..k {
                 each[m] += l[m];
@@ -98,7 +102,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
             ens += lo - (l.iter().map(|x| (lo - x).exp()).sum::<f64>() / k as f64).ln();
         }
     }
-    let n = (starts.len() * SEQ_LEN) as f64;
+    let n = (starts.len() * (seq - from)) as f64;
     (each.iter().map(|s| s / n).collect(), ens / n)
 }
 
@@ -106,7 +110,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize]) -> (Vec<f64>, f
 const PROFILE_WARM: usize = 20;
 const PROFILE_STEPS: usize = 50;
 
-const PARAMS: [(&str, &str); 25] = [
+const PARAMS: [(&str, &str); 27] = [
     ("name", ""),
     ("k", ""),
     ("batch", ""),
@@ -132,6 +136,8 @@ const PARAMS: [(&str, &str); 25] = [
     ("groups", "1"),
     ("checkpoint_secs", "600"),
     ("profile", "0"),
+    ("seq", "64"),
+    ("score_tail", "0"),
 ];
 
 /// Arguments after the program name: bare values fill PARAMS in order, `key=value` sets one by name
@@ -219,7 +225,9 @@ fn main() {
     let outer_mu: f32 = p.get("outer_mu");
     let corpus_name: String = p.get("corpus");
     let lr_decay_frac: f32 = p.get("lr_decay_frac");
-    let cfg = Config { vocab: VOCAB, d: p.get("d_model"), heads: p.get("heads"), d_ff: p.get("d_ff"), t: SEQ_LEN, n_blocks: p.get("blocks"), softmax1: false };
+    let (seq, score_tail): (usize, usize) = (p.get("seq"), p.get("score_tail"));
+    assert!(seq <= MAX_SEQ && score_tail <= seq, "seq <= {MAX_SEQ}, score_tail <= seq");
+    let cfg = Config { vocab: VOCAB, d: p.get("d_model"), heads: p.get("heads"), d_ff: p.get("d_ff"), t: seq, n_blocks: p.get("blocks"), softmax1: false };
     let groups: usize = p.get("groups");
     assert!(k % groups == 0 && (groups == 1 || (shared_init && sync_every > 0 && outer_lr == 0.0)), "groups needs K % groups == 0, shared_init, sync_every and no outer step");
     let warmup = (warmup_windows / batch).max(1);
@@ -327,7 +335,7 @@ fn main() {
                 0 => "-".to_string(),
                 n => format!("{:.2}", segment.0.elapsed().as_secs_f64() * 1e3 / n as f64),
             };
-            let (each, ens) = device_ce(&dev, &cfg, held_out);
+            let (each, ens) = device_ce(&dev, &cfg, held_out, score_tail);
             let mean = each.iter().sum::<f64>() / k as f64;
             let each_s: Vec<String> = each.iter().map(|c| format!("{c:.4}")).collect();
             println!("{step:>6} | {:>7} | {} | {mean:.4} | {ens:.4} | {:.0}s | {ms_per_step}", step * batch, each_s.join(" "), start.elapsed().as_secs_f32());
@@ -347,10 +355,10 @@ fn main() {
         if lr_decay_frac > 0.0 {
             lr *= ((steps - step) as f32 / (lr_decay_frac * steps as f32)).min(1.0);
         }
-        let (mut input, mut target) = (Vec::with_capacity(k * batch * SEQ_LEN), Vec::with_capacity(k * batch * SEQ_LEN));
+        let (mut input, mut target) = (Vec::with_capacity(k * batch * seq), Vec::with_capacity(k * batch * seq));
         for rng in &mut rngs {
             for _ in 0..batch {
-                let (i, t) = sample_window(rng, train, SEQ_LEN);
+                let (i, t) = sample_window(rng, train, seq);
                 input.extend(i);
                 target.extend(t);
             }
@@ -384,7 +392,7 @@ fn main() {
 
     // Train-probe: the first held-out-sized stretch of the training text, to
     // see the train/held-out gap per arm.
-    let (probe_each, probe_ens) = device_ce(&dev, &cfg, &train[..held_out.len()]);
+    let (probe_each, probe_ens) = device_ce(&dev, &cfg, &train[..held_out.len()], score_tail);
     let probe_s: Vec<String> = probe_each.iter().map(|c| format!("{c:.4}")).collect();
     println!("train-probe CE per model {} | mean {:.4} | ensemble {probe_ens:.4}", probe_s.join(" "), probe_each.iter().sum::<f64>() / k as f64);
 
@@ -392,7 +400,7 @@ fn main() {
     // check.
     let params = dev.read(&dev.params);
     for (m, p) in params.chunks(cfg.len()).enumerate() {
-        let solo = device_ce(&DeviceParams::upload(p), &cfg, held_out).0[0];
+        let solo = device_ce(&DeviceParams::upload(p), &cfg, held_out, score_tail).0[0];
         assert!((solo - last.0[m]).abs() < 1e-4, "model {m}: alone {solo:.5} vs fused {:.5}", last.0[m]);
         let text = p.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
         std::fs::write(format!("runs/{name}_m{m}.ckpt"), text).unwrap();
