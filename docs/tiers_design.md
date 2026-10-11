@@ -1086,7 +1086,7 @@ part=1/2 confirms) and the control (each step taken from a chunk half the held-o
 | 0.4 | 1.0683 | 1.1638 | 1.1161 | |
 
 Both halves pick lr 0.2: **-0.0330** (-2.9%) on the model alone, 491 steps per pass, a few seconds of extra time. The control
-(adapting on another book) is flat to harmful (+0.0079 at 0.2), so the gain is from the book being read, not from re-tuning
+(adapting on another book) helps a little at 0.01 (-0.0019), is neutral at 0.05 (-0.0010) and hurts at 0.2 (+0.0079), so the gain is from the book being read, not from re-tuning
 the checkpoint. Model alone with dynamic evaluation (1.1148) is already within 0.033 of the whole tier stack (1.0821).
 Not yet tried: the stack on top (the memory keys come from the frozen model), RMS-normalised steps, more or smaller steps,
 a pull back toward the checkpoint.
