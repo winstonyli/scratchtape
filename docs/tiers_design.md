@@ -1175,7 +1175,7 @@ is not a shortcut. Low-rank adapters are not tried; with blocks-only already as 
 bytes, equal bytes per step and equal step count; batch and warmup scale down with seq), seq 64/128/256 via the new `seq` option of
 `fused_models_check`. Held-out CE scores the same target bytes for every seq (`score_tail=32`: the last 32 positions of windows
 ending every 32 bytes, windows start at 256 - seq). Held-out **1.1784 / 1.1524 / 1.1418** (-0.0260, then -0.0106; -2.2%, -0.9%);
-train-probe 1.0377 / 1.0084 / 1.0008. Cost per step 4.7 / 5.1 / 6.9 ms (per byte processed 1.0x / 0.5x / 0.4x of the 64-byte
-step at the same bytes per step; wall time 45 / 39 / 49 min). Longer context helps the model itself, with diminishing returns
+train-probe 1.0377 / 1.0084 / 1.0008. Cost per step 4.7 / 5.1 / 6.9 ms
+wall time 45 / 39 / 49 min). Longer context helps the model itself, with diminishing returns
 (each doubling buys about 40% of the previous gain). The tiers read 256 bytes of context already, so part of this gain may
 overlap theirs; not yet measured (tier_eval has `SEQ_LEN` 64 as a constant, and its windows/`warm` assume it).
