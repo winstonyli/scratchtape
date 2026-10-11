@@ -1144,3 +1144,21 @@ the stack as 0.0030, and RMS's extra 0.0032 on the model alone as 0.0001: the me
 tiers add -0.0364 on top of the adapted model (-0.0657 on the frozen one). Plain device SGD at 4-window steps is the setting to keep
 (RMS ties it and is a slow host prototype). Not tried: rebuilding the memory's train keys from the adapted model (~70 s per
 rebuild), adapting only some layers, and a different tier mix now that the model alone is close to the stack.
+
+### Memory keys from the frozen model, and re-tuning the tiers for the adapted model (2026-10-11)
+
+**Keys.** `dyn_keys=frozen` takes the hidden states the memory uses (queries, in-document keys) from an extra forward of the
+unadapted checkpoint, so they live in the same space as the train keys; probabilities still come from the adapted model.
+Half 0, 4-window SGD 0.05: 1.0232 against 1.0235 with adapted hidden states: no effect (`scripts/tier_dyn_keys.sh`). The key-space
+mismatch does not matter; adapted hidden states are kept (one forward).
+
+**Tier mix.** `scripts/tier_dyn_retune.sh` (one parameter at a time on half 0, base 1.0235): the in-document temperature 30
+instead of 50 gives 1.0170 (-0.0065; 80 hurts: 1.0443); knn lambda 0.3 1.0222; words lambda 0.15 1.0218; k 128 1.0219; knn temp
+20/45, lexicon eps 0.2/0.5 and words 0.4: no gain. Round 2 (`tier_dyn_retune2.sh`, from lexicon 0.3 + words 0.15 + knn lambda 0.3):
+in-document temperature 30/20/15/10 -> 1.0151/1.0141/1.0141/1.0144; shift 50/100/150/200 (at 20) -> 1.0172/1.0141/1.0183/1.0269;
+**k 128 1.0130**; words 0.1 1.0137; lambda 0.25 1.0149. Half 1 confirms (`tier_dyn_confirm.sh`): old tuning 1.1145, new
+(words 0.15, `knn:128:0.3:30:20:100`) **1.1030** (-0.0115; half 0: 1.0235 -> 1.0130, -0.0105). Full pass
+(`scripts/tier_full_32m_novels22_dyn4_tuned.sh`): model alone 1.1054, + lexicon/words/memory 1.0731, + wrap **1.0575** (new best; 1.0689
+with the old tuning, 1.0821 without dynamic evaluation). The memory now gets -0.0323 and wrap -0.0156 on the adapted model; the
+lower in-document temperature makes the in-book neighbours count for more, the same direction as the adaptation itself. The
+tuning is one-at-a-time and two rounds deep; the other parameters (whiten, tap, store) and the wrap lambda are not re-tuned.

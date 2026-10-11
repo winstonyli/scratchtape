@@ -2,7 +2,7 @@
 // applied to its next-byte distribution on the CPU, scored in held-out nats/byte like every other number here.
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
-//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [classes=1] [survey=1] [dyn=<lr>] [dyn_every=<windows>] [dyn_steps=<k>] [dyn_rms=<beta>] [dyn_pull=<f>] [dyn_control=1] [dump=<path>] [wdump=<path>]
+//             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [classes=1] [survey=1] [dyn=<lr>] [dyn_every=<windows>] [dyn_steps=<k>] [dyn_rms=<beta>] [dyn_pull=<f>] [dyn_keys=adapted|frozen] [dyn_control=1] [dump=<path>] [wdump=<path>]
 //             [tier=<spec> ...]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
@@ -43,6 +43,7 @@
 // train windows; 0 for no train keys). `stride`/`offset`/`part` still choose what is scored.
 // `classes=1` prints the loss by position class (letter or not before, kind of byte predicted): where the model's CE sits and which tier gains where.
 // `dyn_every=<windows>` (default 32) scores, writes the online memory and adapts in chunks of that many windows; `dyn_steps=<k>` (default 1) takes k steps per chunk.
+// `dyn_keys=frozen` takes the hidden states the tiers use (memory queries, in-document keys) from an extra forward of the unadapted checkpoint, so they live in the same space as the train keys; the probabilities still come from the adapted model.
 // `dyn_rms=<beta>` divides each gradient by a bias-corrected running RMS (decay beta; lr is then per-parameter step size, ~1e-4); `dyn_pull=<f>` moves each parameter the fraction f back towards the checkpoint after each step (both: host-side prototype, `Adapter`).
 // `dyn=<lr>` is dynamic evaluation (with tiers, the memory's train keys stay from the frozen model while queries and in-document keys come from the adapted one): after each chunk is scored, one SGD step at that lr on the same chunk (text already scored), parameters reset to the checkpoint at each book boundary. `dyn_control=1` takes each step from a chunk half the held-out text away instead (it must not help).
 // `survey=1` (needs a tier spec; reads the LAST spec) splits the CE by what the target is: letters by whether the word is in the train lexicon, was seen earlier in the same book, or is new, and by position in the word; other bytes by kind. It prints where the stack's CE sits and a ceiling for an in-document word cache.
@@ -1077,7 +1078,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm"
-            | "recent" | "whiten" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dump" | "wdump" => {
+            | "recent" | "whiten" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dump" | "wdump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -1225,6 +1226,9 @@ fn main() {
     let mut adapter = Adapter::new(dyn_lr.unwrap_or(0.0), opt.get("dyn_rms").map(|v| v.parse().unwrap()), get("dyn_pull", "0").parse().unwrap(), &flat);
     let chunk_n = size("dyn_every", &CHUNK.to_string());
     assert!(dyn_lr.is_some() || !dyn_control, "dyn_control=1 needs dyn=<lr>");
+    let frozen_keys = get("dyn_keys", "adapted") == "frozen";
+    assert!(!frozen_keys || dyn_lr.is_some(), "dyn_keys=frozen needs dyn=<lr>");
+    let frozen = DeviceParams::upload(&flat);
     let dyn_docs = held_out_docs(&corpus);
     let mut dyn_doc = usize::MAX;
     assert!(!survey || !specs.is_empty(), "survey=1 needs a tier spec");
@@ -1269,7 +1273,11 @@ fn main() {
             }
         }
         let t0 = std::time::Instant::now();
-        let f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden, true);
+        let mut f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden && !frozen_keys, true);
+        if frozen_keys {
+            // Hidden states (memory queries and in-document keys) from the checkpoint, as the train keys are; probabilities from the adapted model.
+            f.hidden = forward(&frozen, &cfg, &held_out, chunk, tap, true, false).hidden;
+        }
         let rows = f.ids.len();
         phase[0] += t0.elapsed();
         let t0 = std::time::Instant::now();
