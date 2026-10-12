@@ -1264,3 +1264,11 @@ Normal and BelowNormal, with another session's `cargo` on the CPU (~35% load): N
 (identical CE 0.9566 in all). BelowNormal costs 3-18%, most when the machine is busy, which is when the priority matters; a
 disk cache of the memory keys was judged not worth it (the build is 70-110 s of 400-600 s, and 100k windows of f16 keys is 6.5 GB
 per file). Training alone runs at 4.7-5.3 ms/step; with an eval on the GPU 9.6-12.4 ms/step: do not overlap GPU jobs.
+
+**Where an eval spends its time.** `timing:` on the half-0 / 4 run: tier prepare (the kNN searches) is 95% of the scored loop (268 of
+283 s); model forward and dynamic-evaluation steps 3%, row scoring 1%. `KNN_TIMING=1` (synced stages), per chunk of 128 queries over
+6.4M keys: the train search costs ~285 ms matmul + ~390 ms top-k; the in-document tail search 12 ms. Per query row the cost is the
+same for 16-window and 4-window chunks (1.8 vs 2.1 ms), so it is not scan-bound; 3.3 GB of distances is written and read per
+chunk at ~10 GB/s against 320 GB/s of VRAM bandwidth. `KMAX` 256 -> 128 (the tiers use k = 128; same CE 0.9566) saves 9% of the
+search (243 vs 268 s). A real speedup (2-5x on every eval) would fuse the matmul with the thresholded top-k so the distance matrix
+is never materialised; not started. `KMAX` is left at 256 since `knn:256` specs need it.
