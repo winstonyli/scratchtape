@@ -1213,3 +1213,12 @@ New best **1.0392** (1.0575 at seq 64: -0.0183, -1.7%). Context length and dynam
 Caveat: the memory used `store=50000` windows of 128 bytes (6.4M keys) against 4.5M keys at seq 64, a small advantage not
 separated here; the tiers were tuned at seq 64 and not re-tuned for seq 128 (one-at-a-time tuning, as above, is next).
 Larger steps again won at the longer window (4 windows beat 2), so 8 is untried.
+
+**In-model memory: parked, with reasons.** Three variants were considered. (1) Cached previous-window K/V (Transformer-XL): it
+extends the reach to 2 windows, which the seq 128 -> 256 probe already measures (model -0.0086, stack -0.0021), so the headroom
+is about 0.002 and it needs new attention kernels (scores [T, 2T], offset causal mask, stop-gradient cache) in `gpu_step`.
+(3) Learning when to trust the memory: the gate fit on entropy and neighbour distance (above) gains 0.001 over the best
+fixed lambda, so there is little to learn at that level. (2) A kNN-attention layer trained end to end (Memorizing Transformers,
+Wu et al. 2022) is the only variant that changes what the model can represent, but the survey puts the remaining CE in
+word-initial letters of known words and in new words, which a book-level memory does not contain; it is the largest build for
+the least evidenced gain. None is started. Revisit if the context or the tier gains stop shrinking.
