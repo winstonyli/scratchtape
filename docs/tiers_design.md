@@ -1290,7 +1290,9 @@ share matmuls, and a sampled threshold prunes list insertions as in the exact se
 `batch=128`): recall of the exact top-128 0.972 / 0.986 / 0.993 at 4 / 8 / 16 probes (0.9972 on half 1);
 CE identical to exact on half 0 (**0.9941**) and half 1 (**1.0860**) and on `part=0/32` (1.0745); tier prepare 30.5 -> ~18 s on
 `part=0/32` (the batching alone gives 1.3x) and 526 -> 131 s on half 1 (whole eval 555 -> 160 s, 3.5x). Remaining cost: the exact
-in-document tail search (its top-k grows 74 -> 2100 ms per block as the window grows: the threshold from the every-61st-key sample
-is rank 32 = ~2000 keys, far looser than the 256 needed on a 15k-key window) and the IVF matmul stage's host gather (~1.8 s of 5).
-Parked, each worth ~3 s of 18: a dense tail-only sample (stride ~8) for the thresholds; a device gather kernel. `KNN_PARTS` does
-not help the tail. Use `ivf=1024:8 batch=128` for long evals; keep the exact path for final numbers.
+in-document tail search (its top-k grows 74 -> 2100 ms per block as the in-document window grows to ~15k keys) and the IVF matmul
+stage's host gather (~1.8 s of 5). Negative result: a denser threshold sample for the tail (every 24th in-document key, rank 32 =
+768 keys instead of ~2000) changed nothing (same per-block top-k times, same CE 1.0744), so the tail cost is not list insertions
+past a loose threshold; `KNN_PARTS` 16-64 does not help either. The cause is unknown (next: `KNN_TIMING` per kernel on one late
+block). Parked: that, and a device gather kernel for the IVF matmuls (~1.5 s). Use `ivf=1024:8 batch=128` for long evals; keep
+the exact path for final numbers.
