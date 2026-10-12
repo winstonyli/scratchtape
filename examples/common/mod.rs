@@ -315,6 +315,11 @@ fn books(name: &str) -> Vec<(String, f32)> {
             let extra = ["emma", "sense_and_sensibility", "persuasion", "oliver_twist", "david_copperfield", "hound_of_the_baskervilles", "tom_sawyer", "huckleberry_finn", "time_machine", "war_of_the_worlds", "tess", "heart_of_darkness", "jane_eyre", "wuthering_heights", "dorian_gray", "treasure_island"];
             novels6().into_iter().chain(extra.iter().map(|n| (read("gutenberg_extra", n, "fetch_gutenberg_extra.sh"), 1.0))).collect()
         }
+        // novels22 plus eighteen more novels (scripts/fetch_gutenberg_memory.sh), training text only; same held-out as novels22.
+        "novels40" => {
+            let extra = ["little_women", "middlemarch", "vanity_fair", "bleak_house", "mansfield_park", "northanger_abbey", "dombey_and_son", "nicholas_nickleby", "little_dorrit", "hard_times", "silas_marner", "adam_bede", "scarlet_letter", "kidnapped", "three_musketeers", "ivanhoe", "moonstone", "woman_in_white"];
+            books("novels22").into_iter().chain(extra.iter().map(|n| (read("gutenberg_memory", n, "fetch_gutenberg_memory.sh"), 1.0))).collect()
+        }
         _ => vec![(corpus(name).to_string(), 0.9)],
     }
 }

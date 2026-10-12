@@ -9,3 +9,4 @@ attention_uniformity_*.txt
 runs/
 data/gutenberg/
 data/gutenberg_extra/
+data/gutenberg_memory/

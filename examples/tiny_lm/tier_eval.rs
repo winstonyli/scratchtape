@@ -1089,7 +1089,7 @@ fn main() {
         let (k, v) = a.split_once('=').unwrap_or_else(|| panic!("expected key=value, got {a}"));
         match k {
             "tier" => specs.push(v.to_string()),
-            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq"
+            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
             | "recent" | "whiten" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
@@ -1132,6 +1132,9 @@ fn main() {
     let flat: Vec<f32> = std::fs::read_to_string(ckpt).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
     assert_eq!(flat.len(), cfg.len(), "{ckpt} has {} parameters, this config needs {}", flat.len(), cfg.len());
     let (train, held_out) = split_corpus(&corpus);
+    // `memory_corpus=<name>`: the memory is filled from that corpus's training text (it must share this corpus's held-out text); the lexicon, words and whitener keep `corpus`.
+    let memory_train = opt.get("memory_corpus").map(|m| split_corpus(m).0);
+    let memory_train: &[usize] = memory_train.as_deref().unwrap_or(&train);
     let _lease = gpu_lease::hold(Kind::Shared, "scratchtape tier_eval", Duration::from_secs(4 * 3600));
     let mut dev = DeviceParams::upload(&flat);
 
@@ -1181,9 +1184,9 @@ fn main() {
             }
         };
         if from != "held" && want > 0 {
-            let total = (train.len() - 1) / seq_len();
+            let total = (memory_train.len() - 1) / seq_len();
             let starts: Vec<usize> = (0..want.min(total)).map(|i| i * total / want.min(total) * seq_len()).collect();
-            load(&train, &starts, false);
+            load(memory_train, &starts, false);
             n_train = starts.len();
         }
         if from != "train" {

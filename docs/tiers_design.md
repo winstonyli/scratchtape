@@ -1239,3 +1239,13 @@ from the memory; 1.0392 at store 50000).
 The memory is capped by the training text: novels22 holds 116,733 windows of 128 bytes (14.9M keys, 7.6 GB f16). The whole of it
 on half 0 gives 0.9893 (store 100000: 0.9902; `s128_storemax`), so the size lever is spent (-0.0009 more, no full pass run;
 the full-pass number stays 1.0352). More memory now means more text, not a larger `store`.
+
+**Step size at the 100k memory.** SGD lr 0.03 / 0.05 / 0.07 at 4-window steps, half 0: 0.9919 / 0.9902 / 0.9909. 0.05 stays.
+
+**Memory-only extra text.** `scripts/fetch_gutenberg_memory.sh` (18 more Gutenberg novels, 23 MB, `data/gutenberg_memory/`, gitignored;
+corpus `novels40` = novels22 + them, training only, same held-out) and `tier_eval memory_corpus=novels40` (memory keys from that
+text; model, lexicon, words and whitener stay on novels22). At the same key budget as the whole of novels22 (116,733 windows =
+14.9M keys; the windows are sampled evenly, so each book is covered at a third) half 0 gives **0.9898** against 0.9893 for
+the contiguous novels22 memory: no gain. At a fixed budget, 2.2x more text (sampled) buys nothing over full coverage of the
+smaller text. The key budget is VRAM (16 GB eGPU; 14.9M f16 keys of 256 floats = 7.6 GB, 38M keys for all of novels40 would be
+19 GB), so more text can only help through smaller keys (fewer dims by PCA of the whitened keys, or int8), not tried.
