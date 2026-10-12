@@ -12,6 +12,8 @@ use cubecl::server::Handle;
 use half::f16;
 use std::cell::RefCell;
 
+mod ivf;
+
 /// Added to a value to mark an in-document key (`KnnStore::add_doc`).
 pub const DOC: u16 = 256;
 /// Neighbours kept per query.
@@ -61,6 +63,8 @@ pub struct KnnStore {
     pub flush_time: [std::time::Duration; 2],
     /// Device copy of `sample_keys` as (keys, norms, len) chunks, with the sample count it was built from.
     sample_dev: RefCell<(usize, Vec<(Handle, Handle, usize)>)>,
+    /// Set by `build_ivf`: the first keys are clustered for `search_ivf`.
+    ivf: Option<ivf::Ivf>,
 }
 
 impl KnnStore {
@@ -85,6 +89,7 @@ impl KnnStore {
             f16,
             flush_time: [std::time::Duration::ZERO; 2],
             sample_dev: RefCell::new((0, vec![])),
+            ivf: None,
         }
     }
 
@@ -212,14 +217,16 @@ impl KnnStore {
         out
     }
 
-    /// dist[j, i] = key_j . query_i for the `len` keys in `keys`, as [rows, qp] (qp = q unless f16-padded).
-    fn dots(&self, keys: &Handle, len: usize, qh: &Handle, dist: &Handle, q: usize, qp: usize) {
+    /// dist[j, i] = key_j . query_i for the `len` keys in `keys`, as [rows, qp] (qp = q unless f16-padded). With f16, the keys
+    /// start at row `a_row0` (a multiple of 16), and the result starts at element `out_off` of `dist`, a buffer of `dist_len` floats.
+    fn dots(&self, keys: &Handle, a_row0: usize, len: usize, qh: &Handle, dist: &Handle, dist_len: usize, out_off: usize, q: usize, qp: usize) {
         if self.f16 {
             let rows = len.next_multiple_of(16);
             let plane = client().properties().hardware.plane_size_max;
             #[rustfmt::skip]
-            k_dots_cmma::launch(client(), CubeCount::Static((qp / 16) as u32, (rows / 16) as u32, 1), CubeDim::new_1d(plane), buf(keys, rows * self.d), buf(qh, self.d * qp), buf(dist, self.tile * qp), self.d as u32, qp as u32);
+            k_dots_cmma::launch(client(), CubeCount::Static((qp / 16) as u32, (rows / 16) as u32, 1), CubeDim::new_1d(plane), buf(keys, rows * self.d), buf(qh, self.d * qp), buf(dist, dist_len), self.d as u32, qp as u32, a_row0 as u32, out_off as u32);
         } else {
+            assert!(a_row0 == 0 && out_off == 0);
             let (a, b, o) = (MatRef::new(keys), MatRef { trans: true, ..MatRef::new(qh) }, MatRef::new(dist));
             matmul(a, b, o, 1, len, self.d, q, Epilogue::default());
         }
@@ -249,14 +256,9 @@ impl KnnStore {
         let qp = if self.f16 { q.next_multiple_of(16) } else { q };
         let rounded: Vec<f32>;
         let (qh, block) = if self.f16 {
-            let mut t = vec![f16::ZERO; self.d * qp];
-            for r in 0..q {
-                for c in 0..self.d {
-                    t[c * qp + r] = f16::from_f32(block[r * self.d + c]);
-                }
-            }
-            rounded = (0..q * self.d).map(|i| t[(i % self.d) * qp + i / self.d].to_f32()).collect();
-            (client().create_from_slice(f16::as_bytes(&t)), &rounded[..])
+            let r16: Vec<f16> = block.iter().map(|&x| f16::from_f32(x)).collect();
+            rounded = r16.iter().map(|x| x.to_f32()).collect();
+            (transposed_f16(&r16, self.d).0, &rounded[..])
         } else {
             (upload_f32(block), block)
         };
@@ -283,7 +285,7 @@ impl KnnStore {
         let mut gbase = 0usize;
         for (sk, sn, len) in &sample {
             let t0 = std::time::Instant::now();
-            self.dots(sk, *len, &qh, &dist, q, qp);
+            self.dots(sk, 0, *len, &qh, &dist, self.tile * qp, 0, q, qp);
             if timing {
                 read(&hi);
                 stage[1] += t0.elapsed();
@@ -313,14 +315,23 @@ impl KnnStore {
         }
         // `KNN_SLICE` overrides the keys per top-k launch (experiments).
         let slice: usize = std::env::var("KNN_SLICE").ok().and_then(|v| v.parse().ok()).unwrap_or(SLICE);
+        // Without always-included keys, no query reads outside [min lo, max hi): skip the tiles beyond that window.
+        let (win_lo, win_hi) = if always == 0 {
+            (ranges.iter().map(|r| r.0 as usize).min().unwrap_or(0).max(from_key), ranges.iter().map(|r| r.1 as usize).max().unwrap_or(0))
+        } else {
+            (from_key, usize::MAX)
+        };
         let mut base = 0usize;
         for t in self.tiles.iter().chain(tail) {
-            if base + t.len <= from_key {
+            if base >= win_hi {
+                break;
+            }
+            if base + t.len <= win_lo {
                 base += t.len;
                 continue;
             }
             let t0 = std::time::Instant::now();
-            self.dots(&t.keys, t.len, &qh, &dist, q, qp);
+            self.dots(&t.keys, 0, t.len, &qh, &dist, self.tile * qp, 0, q, qp);
             if timing {
                 read(&hi);
                 t_mm += t0.elapsed();
@@ -372,6 +383,19 @@ impl KnnStore {
     }
 }
 
+/// `rows` (row-major [n, d], n inferred) transposed to [d, np] with np = n padded to 16: the f16 matmul's second operand.
+fn transposed_f16(rows: &[f16], d: usize) -> (Handle, usize) {
+    let n = rows.len() / d;
+    let np = n.next_multiple_of(16);
+    let mut t = vec![f16::ZERO; d * np];
+    for r in 0..n {
+        for c in 0..d {
+            t[c * np + r] = rows[r * d + c];
+        }
+    }
+    (client().create_from_slice(f16::as_bytes(&t)), np)
+}
+
 /// A threshold just above `t`, so keys at exactly that distance (duplicate keys are common: a window's first position
 /// sees only its own byte) still qualify under the kernel's strict `<`.
 fn widen(t: f32) -> f32 {
@@ -390,21 +414,21 @@ pub(super) fn f16_config() -> cubecl::features::MmaConfig {
 }
 
 /// out[M, N] (f32) = a[M, K] @ b[K, N] (f16, row-major) on matrix cores: one plane per cube computes one 16x16 tile
-/// (the spike's `k_matmul_cmma`). M, N, K are multiples of 16.
+/// (the spike's `k_matmul_cmma`). M, N, K are multiples of 16; the rows computed start at row `a_row0` of `a`, and `out` is written from element `out_off`.
 #[cube(launch)]
-fn k_dots_cmma(a: &[f16], b: &[f16], out: &mut [f32], #[comptime] k: u32, n: u32) {
+fn k_dots_cmma(a: &[f16], b: &[f16], out: &mut [f32], #[comptime] k: u32, n: u32, a_row0: u32, out_off: u32) {
     let row0 = CUBE_POS_Y * 16;
     let col0 = CUBE_POS_X * 16;
     let c = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0);
     #[unroll]
     for kk in 0..k / 16 {
-        let a_off = (row0 * k + kk * 16) as usize;
+        let a_off = ((a_row0 + row0) * k + kk * 16) as usize;
         let b_off = (kk * 16 * n + col0) as usize;
         let at = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &a[a_off..a.len()], k);
         let bt = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &b[b_off..b.len()], n);
         cmma::execute(&at, &bt, &c, &c);
     }
-    let o_off = (row0 * n + col0) as usize;
+    let o_off = (out_off + row0 * n + col0) as usize;
     let len = out.len();
     cmma::store(&mut out[o_off..len], &c, n, cmma::MatrixLayout::RowMajor);
 }

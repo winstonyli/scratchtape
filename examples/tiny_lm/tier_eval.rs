@@ -68,7 +68,7 @@ use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::knn::{DOC, KMAX, KnnStore};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, read};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
@@ -614,9 +614,14 @@ struct Store {
     online: Option<RefCell<Online>>,
     /// Rows at window positions below this are never scored, so they are not searched.
     warm: usize,
-    /// (chunk searched, per row the KMAX nearest (squared distance, value), ascending; online, the train list then
-    /// the in-document list)
-    found: RefCell<(Option<usize>, Vec<(f32, u16)>)>,
+    /// Per searched chunk, per row the KMAX nearest (squared distance, value), ascending; online, the train list then
+    /// the in-document list.
+    found: RefCell<std::collections::HashMap<usize, Vec<(f32, u16)>>>,
+    /// `ivf=<cells>:<probes>`: the train keys are searched approximately (`KnnStore::search_ivf`), probing this many cells.
+    nprobe: Option<usize>,
+    /// `ivf_check=<n>`: on the first batch, report how many of the exact 128 nearest train keys the approximate search finds
+    /// for n queries.
+    check: Cell<usize>,
 }
 
 /// Makes the memory causal: the first `n_train` keys (train windows) are always visible, and of the held-out windows
@@ -632,8 +637,6 @@ struct Causal {
 /// A memory written as the text is read: each chunk's scored positions are appended before its search, and a query sees
 /// the train keys and, from its own book, only the keys of earlier windows.
 struct Online {
-    /// Index of the first key written from the current chunk.
-    base: usize,
     n_train: usize,
     /// Where each book's held-out text starts (bytes), and the first key written from it (None until then).
     docs: Vec<usize>,
@@ -651,65 +654,75 @@ impl Store {
         if self.split() { 2 * KMAX } else { KMAX }
     }
 
-    fn prepare(&self, chunk: usize, hidden: &[f32], rows: usize, starts: &[usize]) {
-        if self.found.borrow().0 == Some(chunk) {
+    /// Searches the queries of several chunks together (bigger batches search faster per query) and files each chunk's
+    /// neighbour lists under its id in `found`. Chunks must be written (`write_chunk`) before they are searched.
+    fn search_batch(&self, items: &[Pending]) {
+        if items.is_empty() {
             return;
         }
-        let mut ranges: Option<(Vec<(u32, u32)>, u32)> = self.causal.as_ref().map(|c| {
-            let r = (0..rows)
-                .map(|r| {
-                    let w = starts[r / seq_len()] / seq_len();
-                    let first = c.first_window[w].max(w.saturating_sub(c.recent));
-                    ((c.n_train + first * seq_len()) as u32, (c.n_train + w * seq_len()) as u32)
-                })
-                .collect();
-            (r, c.n_train as u32)
-        });
-        if let Some(on) = &self.online {
-            let on = on.borrow();
-            let per_window = seq_len() - self.warm;
-            let r = (0..rows)
-                .map(|r| {
-                    let d = on.docs.partition_point(|&b| b <= starts[r / seq_len()]) - 1;
-                    let hi = (on.base + r / seq_len() * per_window) as u32;
-                    (on.doc_first_key[d].map_or(hi, |k| k as u32), hi)
-                })
-                .collect();
-            ranges = Some((r, on.n_train as u32));
+        let d = items[0].hidden.len() / items[0].rows;
+        let (mut q, mut ranges, mut who): (Vec<f32>, Vec<(u32, u32)>, Vec<(usize, usize)>) = (vec![], vec![], vec![]);
+        for (i, it) in items.iter().enumerate() {
+            // Only the scored rows (window position >= warm) are searched; the others keep (infinity, 0) entries.
+            for r in (0..it.rows).filter(|r| r % seq_len() >= self.warm) {
+                q.extend_from_slice(&it.hidden[r * d..(r + 1) * d]);
+                who.push((i, r));
+                let w = it.starts[r / seq_len()];
+                if let Some(c) = &self.causal {
+                    let (w, first) = (w / seq_len(), c.first_window[w / seq_len()]);
+                    let first = first.max(w.saturating_sub(c.recent));
+                    ranges.push(((c.n_train + first * seq_len()) as u32, (c.n_train + w * seq_len()) as u32));
+                }
+                if let Some(on) = &self.online {
+                    let on = on.borrow();
+                    let doc = on.docs.partition_point(|&b| b <= w) - 1;
+                    let hi = (it.base + r / seq_len() * (seq_len() - self.warm)) as u32;
+                    ranges.push((on.doc_first_key[doc].map_or(hi, |k| k as u32), hi));
+                }
+            }
         }
-        // Only the scored rows (window position >= warm) are searched; the others keep (infinity, 0) entries.
-        let scored: Vec<usize> = (0..rows).filter(|r| r % seq_len() >= self.warm).collect();
-        let d = hidden.len() / rows;
-        let q: Vec<f32> = scored.iter().flat_map(|&r| hidden[r * d..(r + 1) * d].iter().copied()).collect();
-        let rg = ranges.as_ref().map(|(r, a)| (scored.iter().map(|&i| r[i]).collect::<Vec<_>>(), *a));
+        let n = who.len();
         let gpu = self.gpu.borrow();
         let stride = self.stride();
-        let mut found = vec![(f32::INFINITY, 0u16); rows * stride];
+        let mut lists = vec![(f32::INFINITY, 0u16); n * stride];
         if self.split() {
             // Per-source lists: the KMAX nearest train keys, then the KMAX nearest in-document keys (the last keys, so only
             // the tail tiles are scanned).
-            let (r, n_train) = rg.as_ref().unwrap();
-            let train = gpu.search_tagged(&q, scored.len(), Some((&vec![(0, 0); scored.len()], *n_train)));
-            let doc = gpu.search_tail(&q, scored.len(), r, *n_train as usize);
-            for (j, &row) in scored.iter().enumerate() {
-                found[row * stride..row * stride + KMAX].copy_from_slice(&train[j * KMAX..(j + 1) * KMAX]);
-                found[row * stride + KMAX..(row + 1) * stride].copy_from_slice(&doc[j * KMAX..(j + 1) * KMAX]);
+            let n_train = self.online.as_ref().unwrap().borrow().n_train as u32;
+            let train = match self.nprobe {
+                Some(p) => gpu.search_ivf(&q, n, p),
+                None => gpu.search_tagged(&q, n, Some((&vec![(0, 0); n], n_train))),
+            };
+            if let (Some(_), m @ 1..) = (self.nprobe, self.check.replace(0).min(n)) {
+                let exact = gpu.search_tagged(&q[..m * d], m, Some((&vec![(0, 0); m], n_train)));
+                let hits: usize = (0..m).map(|j| (0..128).filter(|&i| train[j * KMAX + i].0 <= exact[j * KMAX + 127].0 * (1.0 + 2e-3)).count()).sum();
+                println!("ivf recall: {:.4} of the exact 128 nearest train keys, over {m} queries", hits as f64 / (128 * m) as f64);
+            }
+            let doc = gpu.search_tail(&q, n, &ranges, n_train as usize);
+            for j in 0..n {
+                lists[j * stride..j * stride + KMAX].copy_from_slice(&train[j * KMAX..(j + 1) * KMAX]);
+                lists[j * stride + KMAX..(j + 1) * stride].copy_from_slice(&doc[j * KMAX..(j + 1) * KMAX]);
             }
         } else {
-            let part = gpu.search_tagged(&q, scored.len(), rg.as_ref().map(|(r, a)| (r.as_slice(), *a)));
-            for (j, &r) in scored.iter().enumerate() {
-                found[r * KMAX..(r + 1) * KMAX].copy_from_slice(&part[j * KMAX..(j + 1) * KMAX]);
-            }
+            let mask = self.causal.as_ref().map(|c| (ranges.as_slice(), c.n_train as u32));
+            lists = gpu.search_tagged(&q, n, mask);
         }
         drop(gpu);
-        *self.found.borrow_mut() = (Some(chunk), found);
+        let mut found = self.found.borrow_mut();
+        for it in items {
+            found.insert(it.chunk, vec![(f32::INFINITY, 0u16); it.rows * stride]);
+        }
+        for (j, &(i, r)) in who.iter().enumerate() {
+            found.get_mut(&items[i].chunk).unwrap()[r * stride..(r + 1) * stride].copy_from_slice(&lists[j * stride..(j + 1) * stride]);
+        }
     }
 
-    /// Online memory only: appends the chunk's scored positions (window position >= warm) as new keys.
-    fn write_chunk(&self, hidden: &[f32], targets: &[usize], starts: &[usize], warm: usize, d: usize) {
-        let Some(on) = &self.online else { return };
+    /// Online memory only: appends the chunk's scored positions (window position >= warm) as new keys; returns the index of
+    /// the first one.
+    fn write_chunk(&self, hidden: &[f32], targets: &[usize], starts: &[usize], warm: usize, d: usize) -> usize {
+        let Some(on) = &self.online else { return 0 };
         let (mut on, mut gpu) = (on.borrow_mut(), self.gpu.borrow_mut());
-        on.base = gpu.len();
+        let base = gpu.len();
         for (j, &s) in starts.iter().enumerate() {
             let doc = on.docs.partition_point(|&b| b <= s) - 1;
             if on.doc_first_key[doc].is_none() {
@@ -719,7 +732,18 @@ impl Store {
             // `len()` counts keys not yet uploaded, so no flush per window (that made one 32-key device tile per window).
             gpu.add_doc(&hidden[rows.start * d..rows.end * d], &targets[rows].iter().map(|&t| t as u8).collect::<Vec<_>>());
         }
+        base
     }
+}
+
+/// A chunk waiting for its neighbour search: its id, hidden states ([rows, d]), window starts, and (online memory) the
+/// index of the first key written from it.
+struct Pending<'a> {
+    chunk: usize,
+    hidden: &'a [f32],
+    rows: usize,
+    starts: &'a [usize],
+    base: usize,
 }
 
 struct Knn {
@@ -745,14 +769,13 @@ impl Tier for Knn {
     fn needs_hidden(&self) -> bool {
         true
     }
-    fn prepare(&mut self, chunk: usize, hidden: &[f32], rows: usize, starts: &[usize]) {
+    fn prepare(&mut self, chunk: usize, _hidden: &[f32], _rows: usize, _starts: &[usize]) {
         self.chunk = chunk;
-        self.store.prepare(chunk, hidden, rows, starts);
     }
     fn adjust(&mut self, ctx: &Ctx, probs: &mut [f64]) {
         let found = self.store.found.borrow();
         let stride = self.store.stride();
-        let row = &found.1[ctx.row * stride..(ctx.row + 1) * stride];
+        let row = &found[&self.chunk][ctx.row * stride..(ctx.row + 1) * stride];
         // A causal memory can have fewer than k keys to offer (the start of a book): use those, or leave p alone.
         let finite = |l: &[(f32, u16)]| l[..self.k].iter().take_while(|n| n.0.is_finite()).count();
         let merged: Vec<(f32, u16)>;
@@ -1094,7 +1117,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
-            | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" => {
+            | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -1201,6 +1224,12 @@ fn main() {
             n_held = starts.len();
         }
         gpu.finish();
+        let nprobe = opt.get("ivf").map(|v| {
+            let (cells, probes) = v.split_once(':').unwrap_or_else(|| panic!("ivf=<cells>:<probes>, got {v}"));
+            assert!(online && from == "train", "ivf needs memory=online and store_from=train");
+            gpu.build_ivf(cells.parse().unwrap());
+            probes.parse::<usize>().unwrap()
+        });
         println!(
             "memory build: {:.1}s = forward + hidden readback {:.1}s, host copy + norms {:.1}s, upload {:.1}s, other {:.1}s",
             build.elapsed().as_secs_f64(),
@@ -1219,7 +1248,7 @@ fn main() {
         let n_train_keys = n_train * seq_len();
         let online = online.then(|| {
             let docs = held_out_docs(&corpus);
-            RefCell::new(Online { base: 0, n_train: n_train_keys, doc_first_key: vec![None; docs.len()], docs })
+            RefCell::new(Online { n_train: n_train_keys, doc_first_key: vec![None; docs.len()], docs })
         });
         let causal = causal.then(|| {
             let docs = held_out_docs(&corpus);
@@ -1227,7 +1256,7 @@ fn main() {
             let first_window = (0..windows).map(|w| docs[docs.partition_point(|&b| b <= w * seq_len()) - 1].div_ceil(seq_len())).collect();
             Causal { n_train: n_train_keys, first_window, recent: size("recent", &usize::MAX.to_string()) }
         });
-        Some(Rc::new(Store { gpu: RefCell::new(gpu), causal, online, warm, found: RefCell::new((None, vec![])) }))
+        Some(Rc::new(Store { gpu: RefCell::new(gpu), causal, online, warm, found: RefCell::new(Default::default()), nprobe, check: Cell::new(size("ivf_check", "0")) }))
     } else {
         None
     };
@@ -1280,47 +1309,70 @@ fn main() {
     let mut phase = [std::time::Duration::ZERO; 4];
     let t_all = std::time::Instant::now();
     let (mut t_lap, mut paused) = (std::time::Instant::now(), std::time::Duration::ZERO);
-    for (ci, chunk) in starts.chunks(chunk_n).enumerate() {
-        // Yield to another job's exclusive lease, and log speed per 20 chunks (paused time excluded) so a slow stretch reads as contention.
-        let t_p = std::time::Instant::now();
-        gpu_lease::pause_while_exclusive();
-        paused += t_p.elapsed();
-        if ci > 0 && ci % 20 == 0 {
-            eprintln!("speed: chunks {}..{} {:.2} s/chunk ({:.0} s paused)", ci - 20, ci, (t_lap.elapsed() - paused).as_secs_f64() / 20.0, paused.as_secs_f64());
-            (t_lap, paused) = (std::time::Instant::now(), std::time::Duration::ZERO);
-            if let Some(path) = opt.get("dump") {
-                for tier in tiers.last().unwrap() {
-                    tier.dump(path, false);
+    // Chunks are run through the model (and adapted) `batch` at a time, then their neighbour searches are done together,
+    // then they are scored: adaptation and memory writes never depend on the tiers' output.
+    let batch = size("batch", "1");
+    let all_chunks: Vec<&[usize]> = starts.chunks(chunk_n).collect();
+    let mut ready: std::collections::VecDeque<(Forward, usize)> = Default::default();
+    for (ci, &chunk) in all_chunks.iter().enumerate() {
+        if ready.is_empty() {
+            for (cj, &chunk) in all_chunks.iter().enumerate().take(ci + batch).skip(ci) {
+                // Yield to another job's exclusive lease, and log speed per 20 chunks (paused time excluded) so a slow stretch reads as contention.
+                let t_p = std::time::Instant::now();
+                gpu_lease::pause_while_exclusive();
+                paused += t_p.elapsed();
+                if cj > 0 && cj % 20 == 0 {
+                    eprintln!("speed: chunks {}..{} {:.2} s/chunk ({:.0} s paused)", cj - 20, cj, (t_lap.elapsed() - paused).as_secs_f64() / 20.0, paused.as_secs_f64());
+                    (t_lap, paused) = (std::time::Instant::now(), std::time::Duration::ZERO);
+                    if let Some(path) = opt.get("dump") {
+                        for tier in tiers.last().unwrap() {
+                            tier.dump(path, false);
+                        }
+                    }
+                    if let Some(path) = opt.get("wdump") {
+                        for tier in tiers.last().unwrap() {
+                            tier.wdump(path, false);
+                        }
+                    }
                 }
-            }
-            if let Some(path) = opt.get("wdump") {
-                for tier in tiers.last().unwrap() {
-                    tier.wdump(path, false);
+                if dyn_lr.is_some() {
+                    // A new book starts from the checkpoint again: nothing adapted on one book carries into the next.
+                    let doc = dyn_docs.partition_point(|&b| b <= chunk[0]) - 1;
+                    if doc != dyn_doc {
+                        dev = DeviceParams::upload(&flat);
+                        adapter.reset();
+                        dyn_doc = doc;
+                    }
                 }
+                let t0 = std::time::Instant::now();
+                let mut f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden && !frozen_keys, true);
+                if frozen_keys {
+                    // Hidden states (memory queries and in-document keys) from the checkpoint, as the train keys are; probabilities from the adapted model.
+                    f.hidden = forward(&frozen, &cfg, &held_out, chunk, tap, true, false).hidden;
+                }
+                phase[0] += t0.elapsed();
+                let t0 = std::time::Instant::now();
+                let base = store.as_ref().map_or(0, |st| st.write_chunk(&f.hidden, &f.targets, chunk, warm, cfg.d));
+                phase[3] += t0.elapsed();
+                if dyn_lr.is_some() {
+                    // The step reads only text that has just been scored (or, for the control, text from far away).
+                    let source: Vec<usize> = if dyn_control { chunk.iter().map(|&s| (s + held_out.len() / 2) % (held_out.len() - seq_len() - 1)).collect() } else { chunk.to_vec() };
+                    for _ in 0..dyn_steps {
+                        adapter.step(&mut dev, &cfg, &held_out, &source);
+                    }
+                }
+                ready.push_back((f, base));
+                debug_assert_eq!(ready.len(), cj - ci + 1);
             }
-        }
-        if dyn_lr.is_some() {
-            // A new book starts from the checkpoint again: nothing adapted on one book carries into the next.
-            let doc = dyn_docs.partition_point(|&b| b <= chunk[0]) - 1;
-            if doc != dyn_doc {
-                dev = DeviceParams::upload(&flat);
-                adapter.reset();
-                dyn_doc = doc;
+            let t0 = std::time::Instant::now();
+            if let Some(st) = &store {
+                let items: Vec<Pending> = ready.iter().enumerate().map(|(i, (f, base))| Pending { chunk: ci + i, hidden: &f.hidden, rows: f.ids.len(), starts: all_chunks[ci + i], base: *base }).collect();
+                st.search_batch(&items);
             }
+            phase[1] += t0.elapsed();
         }
-        let t0 = std::time::Instant::now();
-        let mut f = forward(&dev, &cfg, &held_out, chunk, tap, need_hidden && !frozen_keys, true);
-        if frozen_keys {
-            // Hidden states (memory queries and in-document keys) from the checkpoint, as the train keys are; probabilities from the adapted model.
-            f.hidden = forward(&frozen, &cfg, &held_out, chunk, tap, true, false).hidden;
-        }
+        let (f, _) = ready.pop_front().unwrap();
         let rows = f.ids.len();
-        phase[0] += t0.elapsed();
-        let t0 = std::time::Instant::now();
-        if let Some(st) = &store {
-            st.write_chunk(&f.hidden, &f.targets, chunk, warm, cfg.d);
-        }
-        phase[3] += t0.elapsed();
         let t0 = std::time::Instant::now();
         for tier in tiers.iter_mut().flatten() {
             tier.prepare(ci, &f.hidden, rows, chunk);
@@ -1370,12 +1422,8 @@ fn main() {
             }
         }
         phase[2] += t0.elapsed();
-        if dyn_lr.is_some() {
-            // The step reads only text that has just been scored (or, for the control, text from far away).
-            let source: Vec<usize> = if dyn_control { chunk.iter().map(|&s| (s + held_out.len() / 2) % (held_out.len() - seq_len() - 1)).collect() } else { chunk.to_vec() };
-            for _ in 0..dyn_steps {
-                adapter.step(&mut dev, &cfg, &held_out, &source);
-            }
+        if let Some(st) = &store {
+            st.found.borrow_mut().remove(&ci);
         }
     }
     let total = t_all.elapsed().as_secs_f64();

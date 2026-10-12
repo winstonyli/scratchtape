@@ -1280,3 +1280,17 @@ at the optimum and the search is not launch-bound (4x fewer matmul launches chan
 themselves: the cmma matmul (one plane per 16x16 output tile, no shared-memory tiling, ~1.5 TFLOPS) and the per-thread top-k
 insertion (58% of the synced search time). A better matmul would save at most the ~42% it takes; a fused kernel is a research
 project for perhaps 1.5x. Parked; the cheaper levers are not overlapping GPU jobs and `KMAX` 128 (-9%).
+
+**Approximate kNN search (IVF), adopted for evals.** Dynamic evaluation never lets the tiers influence adaptation, so `tier_eval`
+now collects hidden states first and runs the searches in batches (`batch=<chunks>`, default 1 = the old per-chunk path, unchanged).
+`ivf=<cells>:<probes>` clusters the train keys (k-means on the key sample, chain-ordered cells, cell-ordered storage; ~29 s once) and
+searches each query's `probes` nearest cells (`src/gpu_step/knn/ivf.rs`); queries are sorted by nearest cell and grouped so cells
+share matmuls, and a sampled threshold prunes list insertions as in the exact search. The in-document keys are still searched exactly.
+`ivf_check=<n>` prints the recall of n queries against the exact search. Gates (seq 128, store 50000, 1024 cells x 8 probes,
+`batch=128`): recall of the exact top-128 0.972 / 0.986 / 0.993 at 4 / 8 / 16 probes (0.9972 on half 1);
+CE identical to exact on half 0 (**0.9941**) and half 1 (**1.0860**) and on `part=0/32` (1.0745); tier prepare 30.5 -> ~18 s on
+`part=0/32` (the batching alone gives 1.3x) and 526 -> 131 s on half 1 (whole eval 555 -> 160 s, 3.5x). Remaining cost: the exact
+in-document tail search (its top-k grows 74 -> 2100 ms per block as the window grows: the threshold from the every-61st-key sample
+is rank 32 = ~2000 keys, far looser than the 256 needed on a 15k-key window) and the IVF matmul stage's host gather (~1.8 s of 5).
+Parked, each worth ~3 s of 18: a dense tail-only sample (stride ~8) for the thresholds; a device gather kernel. `KNN_PARTS` does
+not help the tail. Use `ivf=1024:8 batch=128` for long evals; keep the exact path for final numbers.
