@@ -1272,3 +1272,11 @@ same for 16-window and 4-window chunks (1.8 vs 2.1 ms), so it is not scan-bound;
 chunk at ~10 GB/s against 320 GB/s of VRAM bandwidth. `KMAX` 256 -> 128 (the tiers use k = 128; same CE 0.9566) saves 9% of the
 search (243 vs 268 s). A real speedup (2-5x on every eval) would fuse the matmul with the thresholded top-k so the distance matrix
 is never materialised; not started. `KMAX` is left at 256 since `knn:256` specs need it.
+
+**kNN search knobs (negative result).** `scripts/knn_knobs.sh`, `knn_tile.sh` (seq 128, half 0 / 32, 123 chunks of 128 queries over 6.4M
+keys; tier-prepare seconds, same CE 1.0745 throughout): `KNN_PARTS` 16 / 32 (default) / 64 / 128: 45.3 / **30.5** / 35.6 / 55.6;
+`KNN_SLICE` 8192 / 16384 / 32768: 33.1 / 30.5 / 29.9; tile 4096 / 16384 / 65536 / 262144: 34.6 / 30.5 / 33.3 / 34.6. The defaults are
+at the optimum and the search is not launch-bound (4x fewer matmul launches changes nothing), so the time is in the kernels
+themselves: the cmma matmul (one plane per 16x16 output tile, no shared-memory tiling, ~1.5 TFLOPS) and the per-thread top-k
+insertion (58% of the synced search time). A better matmul would save at most the ~42% it takes; a fused kernel is a research
+project for perhaps 1.5x. Parked; the cheaper levers are not overlapping GPU jobs and `KMAX` 128 (-9%).
