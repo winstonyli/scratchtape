@@ -105,6 +105,11 @@ impl KnnStore {
 
     fn add_tagged(&mut self, keys: &[f32], vals: &[u8], tag: u16) {
         assert_eq!(keys.len(), vals.len() * self.d);
+        // Sampled on arrival, not at upload: an online memory's in-document keys wait in the pending tile and must be sampled too.
+        let first = self.len();
+        for i in (first.next_multiple_of(SAMPLE_STRIDE) - first..vals.len()).step_by(SAMPLE_STRIDE) {
+            self.sample_keys.extend_from_slice(&keys[i * self.d..(i + 1) * self.d]);
+        }
         self.pending_keys.extend_from_slice(keys);
         self.pending_vals.extend(vals.iter().map(|&v| v as u16 + tag));
         while self.pending_vals.len() >= self.tile {
@@ -124,10 +129,6 @@ impl KnnStore {
     fn flush(&mut self, n: usize) {
         let t0 = std::time::Instant::now();
         let keys: Vec<f32> = self.pending_keys.drain(..n * self.d).collect();
-        let first = self.uploaded();
-        for i in (first.next_multiple_of(SAMPLE_STRIDE) - first..n).step_by(SAMPLE_STRIDE) {
-            self.sample_keys.extend_from_slice(&keys[i * self.d..(i + 1) * self.d]);
-        }
         let vals: Vec<u16> = self.pending_vals.drain(..n).collect();
         let tile = self.tile_of(&keys, &vals);
         self.flush_time[0] += t0.elapsed();
