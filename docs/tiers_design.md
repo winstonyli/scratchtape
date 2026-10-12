@@ -1196,3 +1196,20 @@ and the stack gains -0.0151 at 128 and only -0.0021 more at 256. Wrap rule is no
 shows a newline whenever the context does ("applied at 0 positions"), so it is dropped from the stack at seq >= 128. Seq 128
 captures nearly all of the stack gain at 1.07x the step cost, so the 32M novels22 model is retrained at seq 128
 (`scripts/train_32m_novels22_seq128.sh`).
+
+**Seq-128 novels22 model, full pass.** `scripts/train_32m_novels22_seq128.sh` (same step count and bytes per step as the seq-64
+model; 1.0M steps, 5.3 ms/step, 1h30 training): held-out 1.1189 on the shared protocol (tail 32 bytes; the seq-64 model, same
+protocol, 1.1478). `scripts/tier_full_32m_novels22_s128.sh`, `warm=96`, no wrap (redundant), full held-out:
+
+| | model | + lexicon/words/memory |
+|---|---|---|
+| static, old tiers (words 0.25, knn:256:0.4:30:50:100) | 1.1189 | 1.0647 |
+| static, tuned tiers (words 0.15, knn:128:0.3:30:20:100) | 1.1189 | 1.0599 |
+| dynamic evaluation, SGD 0.05, 2-window steps (256 bytes) | 1.0848 | 1.0468 |
+| dynamic evaluation, SGD 0.05, 4-window steps (512 bytes) | 1.0722 | **1.0392** |
+
+New best **1.0392** (1.0575 at seq 64: -0.0183, -1.7%). Context length and dynamic evaluation compose: dynamic evaluation takes
+-0.0467 off the model and -0.0207 off the stack (seq 64: -0.0424 and -0.0168 at the same 256-byte step, from 1.1478/1.0821).
+Caveat: the memory used `store=50000` windows of 128 bytes (6.4M keys) against 4.5M keys at seq 64, a small advantage not
+separated here; the tiers were tuned at seq 64 and not re-tuned for seq 128 (one-at-a-time tuning, as above, is next).
+Larger steps again won at the longer window (4 windows beat 2), so 8 is untried.
