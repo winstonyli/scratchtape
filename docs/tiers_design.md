@@ -1258,3 +1258,9 @@ train/held-out gap is not what limits the model at this schedule; more dropout o
 rank 128 **0.9990** (memory gain -0.0306 -> -0.0257; r 64/32 not run, they only get worse). Halving the key width would allow twice
 the keys in the same VRAM, which is worth about -0.0039 (store 50000 -> 100000), so compression loses about 0.001 net. The keys
 carry their information across the whole spectrum; PCA truncation is not the way to a bigger memory. (int8 keys, half the size of f16, are untried.)
+
+**Eval priority (A/B).** `scripts/prio_ab.sh`: the same eval (seq 128, half 0 / 4, store 50000, dynamic evaluation) alternating
+Normal and BelowNormal, with another session's `cargo` on the CPU (~35% load): Normal 366 s / 375 s, BelowNormal 431 s / 384 s
+(identical CE 0.9566 in all). BelowNormal costs 3-18%, most when the machine is busy, which is when the priority matters; a
+disk cache of the memory keys was judged not worth it (the build is 70-110 s of 400-600 s, and 100k windows of f16 keys is 6.5 GB
+per file). Training alone runs at 4.7-5.3 ms/step; with an eval on the GPU 9.6-12.4 ms/step: do not overlap GPU jobs.
