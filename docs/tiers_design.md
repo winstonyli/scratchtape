@@ -1222,3 +1222,13 @@ fixed lambda, so there is little to learn at that level. (2) A kNN-attention lay
 Wu et al. 2022) is the only variant that changes what the model can represent, but the survey puts the remaining CE in
 word-initial letters of known words and in new words, which a book-level memory does not contain; it is the largest build for
 the least evidenced gain. None is started. Revisit if the context or the tier gains stop shrinking.
+
+**Re-tune at seq 128 (half 0, dynamic evaluation 4 windows SGD 0.05, model alone 1.0246, stack 0.9941).**
+`scripts/tier_s128_retune.sh`: the tiers are flat. One at a time: lexicon 0.2/0.45 0.9939/0.9944; words 0.1/0.2 0.9941/0.9945; knn
+lambda 0.25/0.35 0.9945/0.9943; k 96/192 0.9939/0.9947; temperature 25/35 0.9948/0.9949; in-document temperature 15/30
+0.9942/0.9949; shift 75/150 0.9939/1.0005. No gain above 0.0002: the seq-64 tuning carries over unchanged. Adaptation step 8
+windows: SGD 0.05 0.9968, 0.1 0.9949 (both worse than 4 windows, 0.9941; the model alone 1.0304/1.0261 against 1.0246).
+**Memory size is a lever**: store 35000 windows (4.5M keys) 0.9965, 50000 (6.4M) 0.9941, 100000 (12.8M) **0.9902**
+(memory gain -0.0281, -0.0306, -0.0344), model alone unchanged. So the 0.0183 improvement over the seq-64 stack included about 0.0024
+from a bigger memory (6.4M against 4.5M keys); the seq-128 gain itself is a little smaller than the headline. 100000 windows
+is 12.8M f16 keys = 6.5 GB of the 16 GB eGPU, near the practical limit for a second resident job.
