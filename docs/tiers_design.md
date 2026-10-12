@@ -1232,3 +1232,6 @@ windows: SGD 0.05 0.9968, 0.1 0.9949 (both worse than 4 windows, 0.9941; the mod
 (memory gain -0.0281, -0.0306, -0.0344), model alone unchanged. So the 0.0183 improvement over the seq-64 stack included about 0.0024
 from a bigger memory (6.4M against 4.5M keys); the seq-128 gain itself is a little smaller than the headline. 100000 windows
 is 12.8M f16 keys = 6.5 GB of the 16 GB eGPU, near the practical limit for a second resident job.
+
+Full pass with store 100000 (`scripts/tier_full_32m_novels22_s128_store100k.sh`): model alone 1.0722, stack **1.0352** (-0.0370
+from the memory; 1.0392 at store 50000).
