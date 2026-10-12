@@ -1297,3 +1297,11 @@ for the same reason). The sample is now taken when keys are added. Tail top-k pe
 `ivf=1024:8 batch=128` 19 -> **11.1 s** (CE 1.0744), exact `batch=128` ~23 -> **15.3 s** (CE 1.0745), exact `batch=1` unchanged
 at ~30 s (a chunk's window is too small to have samples). The IVF matmul operands are gathered on the device (matmul stage 1.8 -> 1.0 s).
 Use `ivf=1024:8 batch=128` for long evals; keep the exact path for final numbers.
+
+**int8 keys are not needed; a bigger store is, and IVF makes it cheap.** Simulated key quantisation (per-key symmetric scale, rounded
+then kept as f16; `part=0/32`, IVF `1024:8`, store 50000): CE 1.0745 at f16 / **1.0746 at 8 bits** / 1.0745 at 6 / 1.0749 at 4, so
+quantised keys cost nothing, but the point of halving the key size (twice the keys in the same VRAM) is moot here: the corpus
+holds only ~117k windows (14.9M keys). With IVF (2048 cells x 8 probes, f16) the store size no longer drives the search time:
+store 50000 / 100000 / 200000 (= all 117k windows): CE 1.0744 / **1.0714** / **1.0705**, tier prepare 11.1 / 8.8 / 8.0 s (the
+build grows: k-means + reorder 30 / 65 / 78 s). So `store=0`-style "everything" is -0.0040 vs 50000 for free; int8 only matters
+for a larger corpus. The simulation code was removed; `scripts/ivf_eval.sh` takes `STORE=`.
