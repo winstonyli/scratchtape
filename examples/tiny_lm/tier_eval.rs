@@ -1019,12 +1019,16 @@ fn jacobi_eigen(mut a: Vec<f64>, d: usize) -> (Vec<f64>, Vec<f64>) {
 
 /// W = c V diag(lam^(-alpha/2)) V^T for the covariance `cov` (a ridge of 1e-3 of the mean eigenvalue keeps tiny
 /// eigenvalues from exploding), with c chosen so that W cov W has the trace of cov. Also returns the ridged eigenvalues.
-fn whitening_matrix(cov: &[f64], d: usize, alpha: f64) -> (Vec<f32>, Vec<f64>) {
+fn whitening_matrix(cov: &[f64], d: usize, alpha: f64, rank: usize) -> (Vec<f32>, Vec<f64>) {
     let (lam, v) = jacobi_eigen(cov.to_vec(), d);
     let mean_lam = lam.iter().map(|l| l.max(0.0)).sum::<f64>() / d as f64;
     let lam: Vec<f64> = lam.iter().map(|l| l.max(0.0) + 1e-3 * mean_lam).collect();
     let scale = (lam.iter().sum::<f64>() / lam.iter().map(|l| l.powf(1.0 - alpha)).sum::<f64>()).sqrt();
-    let g: Vec<f64> = lam.iter().map(|l| scale * l.powf(-alpha / 2.0)).collect();
+    // `rank` < d keeps only the top-`rank` eigen-directions (a rank-`rank` W; the keys stay d wide).
+    let mut sorted = lam.clone();
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    let keep = sorted[rank - 1];
+    let g: Vec<f64> = lam.iter().map(|l| if *l >= keep { scale * l.powf(-alpha / 2.0) } else { 0.0 }).collect();
     let mut w = vec![0f32; d * d];
     for i in 0..d {
         for j in 0..d {
@@ -1034,7 +1038,7 @@ fn whitening_matrix(cov: &[f64], d: usize, alpha: f64) -> (Vec<f32>, Vec<f64>) {
     (w, lam)
 }
 
-fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, alpha: f64) {
+fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, alpha: f64, rank: usize) {
     let d = cfg.d;
     let total = (train.len() - 1) / seq_len();
     let starts: Vec<usize> = (0..2000.min(total)).map(|i| i * total / 2000.min(total) * seq_len()).collect();
@@ -1067,7 +1071,7 @@ fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, a
             cov[j * d + i] = cov[i * d + j];
         }
     }
-    let (w, lam) = whitening_matrix(&cov, d, alpha);
+    let (w, lam) = whitening_matrix(&cov, d, alpha, rank);
     let mut sorted = lam.clone();
     sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
     println!(
@@ -1090,7 +1094,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
-            | "recent" | "whiten" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" => {
+            | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -1167,7 +1171,7 @@ fn main() {
         assert!(["train", "held", "both"].contains(&from.as_str()), "store_from is train, held or both");
         assert!(from == "train" || causal || stride > 1, "store_from=held needs stride > 1 so some held-out windows are left unscored");
         if let Some(a) = opt.get("whiten").map(|a| a.parse::<f64>().unwrap_or_else(|_| panic!("whiten=<alpha>, got {a}"))).filter(|&a| a > 0.0) {
-            fit_whitener(&dev, &cfg, &train, tap, a);
+            fit_whitener(&dev, &cfg, &train, tap, a, size("whiten_rank", &cfg.d.to_string()));
         }
         let mut gpu = KnnStore::new(cfg.d, 16384);
         let (mut n_train, mut n_held) = (0, 0);
@@ -1499,7 +1503,7 @@ mod tests {
         let d = 4;
         // A symmetric positive-definite covariance with correlated, unequal directions.
         let cov: Vec<f64> = vec![4.0, 1.0, 0.5, 0.0, 1.0, 3.0, 0.2, 0.1, 0.5, 0.2, 1.0, 0.3, 0.0, 0.1, 0.3, 0.5];
-        let (w, _) = whitening_matrix(&cov, d, 1.0);
+        let (w, _) = whitening_matrix(&cov, d, 1.0, d);
         let mul = |a: &[f64], b: &[f64]| -> Vec<f64> { (0..d * d).map(|ij| (0..d).map(|k| a[ij / d * d + k] * b[k * d + ij % d]).sum()).collect() };
         let w: Vec<f64> = w.iter().map(|&x| x as f64).collect();
         let m = mul(&mul(&w, &cov), &w);
@@ -1512,7 +1516,7 @@ mod tests {
                 }
             }
         }
-        let (w0, _) = whitening_matrix(&cov, d, 0.0);
+        let (w0, _) = whitening_matrix(&cov, d, 0.0, d);
         for i in 0..d {
             for j in 0..d {
                 assert!((w0[i * d + j] - (i == j) as u8 as f32).abs() < 1e-5);

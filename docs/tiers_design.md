@@ -1249,3 +1249,13 @@ text; model, lexicon, words and whitener stay on novels22). At the same key budg
 the contiguous novels22 memory: no gain. At a fixed budget, 2.2x more text (sampled) buys nothing over full coverage of the
 smaller text. The key budget is VRAM (16 GB eGPU; 14.9M f16 keys of 256 floats = 7.6 GB, 38M keys for all of novels40 would be
 19 GB), so more text can only help through smaller keys (fewer dims by PCA of the whitened keys, or int8), not tried.
+
+**Dropout 0.2 at seq 128 (stopped).** Held-out at the same steps, dropout 0.1 / 0.2: 300k 1.1505 / 1.1677; 500k 1.1317 / 1.1606;
+744k 1.1229 / 1.1459. The gap (0.017, 0.029, 0.023) was not closing, so the run was stopped at 73% (no checkpoint kept). The
+train/held-out gap is not what limits the model at this schedule; more dropout only slows learning.
+
+**Key compression (`whiten_rank`).** Keeping only the top-r eigen-directions of the whitened keys (half 0, store 50000, base 0.9941):
+rank 128 **0.9990** (memory gain -0.0306 -> -0.0257; r 64/32 not run, they only get worse). Halving the key width would allow twice
+the keys in the same VRAM, which is worth about -0.0039 (store 50000 -> 100000), so compression loses about 0.001 net. The keys
+carry their information across the whole spectrum; PCA truncation is not the way to a bigger memory. (int8 keys, 4x smaller
+than f16 by half again, are untried.)
