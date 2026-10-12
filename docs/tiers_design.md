@@ -1257,5 +1257,4 @@ train/held-out gap is not what limits the model at this schedule; more dropout o
 **Key compression (`whiten_rank`).** Keeping only the top-r eigen-directions of the whitened keys (half 0, store 50000, base 0.9941):
 rank 128 **0.9990** (memory gain -0.0306 -> -0.0257; r 64/32 not run, they only get worse). Halving the key width would allow twice
 the keys in the same VRAM, which is worth about -0.0039 (store 50000 -> 100000), so compression loses about 0.001 net. The keys
-carry their information across the whole spectrum; PCA truncation is not the way to a bigger memory. (int8 keys, 4x smaller
-than f16 by half again, are untried.)
+carry their information across the whole spectrum; PCA truncation is not the way to a bigger memory. (int8 keys, half the size of f16, are untried.)
