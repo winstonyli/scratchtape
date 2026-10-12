@@ -1235,3 +1235,7 @@ is 12.8M f16 keys = 6.5 GB of the 16 GB eGPU, near the practical limit for a sec
 
 Full pass with store 100000 (`scripts/tier_full_32m_novels22_s128_store100k.sh`): model alone 1.0722, stack **1.0352** (-0.0370
 from the memory; 1.0392 at store 50000).
+
+The memory is capped by the training text: novels22 holds 116,733 windows of 128 bytes (14.9M keys, 7.6 GB f16). The whole of it
+on half 0 gives 0.9893 (store 100000: 0.9902; `s128_storemax`), so the size lever is spent (-0.0009 more, no full pass run;
+the full-pass number stays 1.0352). More memory now means more text, not a larger `store`.
