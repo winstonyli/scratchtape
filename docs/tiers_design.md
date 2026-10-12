@@ -1305,3 +1305,10 @@ holds only ~117k windows (14.9M keys). With IVF (2048 cells x 8 probes, f16) the
 store 50000 / 100000 / 200000 (= all 117k windows): CE 1.0744 / **1.0714** / **1.0705**, tier prepare 11.1 / 8.8 / 8.0 s (the
 build grows: k-means + reorder 30 / 65 / 78 s). So `store=0`-style "everything" is -0.0040 vs 50000 for free; int8 only matters
 for a larger corpus. The simulation code was removed; `scripts/ivf_eval.sh` takes `STORE=`.
+
+**Full store on the held-out halves.** `store=200000` (all ~117k windows, 14.9M keys), IVF 2048 cells x 8 probes, `batch=128`, seq-128 model,
+dynamic evaluation: half 0 CE **0.9893** (store 50000 exact: 0.9941, -0.0048), half 1 CE **1.0810** (1.0860, -0.0050); recall of
+the exact top-128 0.990 / 0.997; whole eval 158 s / 159 s (tier prepare 126 / 127 s) against 555 s for the exact store-50000 run.
+IVF knob scan at the full store (`part=0/32`, tier prepare, CE, recall): 1024x8 10.6 s, 1.0707, 0.991; **2048x4 9.6 s, 1.0704, 0.973**;
+2048x8 ~8-11 s, 1.0705, 0.990; 2048x16 11.2 s, 1.0705, 0.995; 4096x8 10.4 s, 1.0708, 0.989. CE is flat across all of them (recall
+0.97 is enough), so the knobs are not worth tuning further; 2048x8 stays the default. Long evals: `store=200000 ivf=2048:8 batch=128`.
