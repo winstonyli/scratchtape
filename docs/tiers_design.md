@@ -1209,7 +1209,7 @@ protocol, 1.1478). `scripts/tier_full_32m_novels22_s128.sh`, `warm=96`, no wrap 
 | dynamic evaluation, SGD 0.05, 4-window steps (512 bytes) | 1.0722 | **1.0392** |
 
 New best **1.0392** (1.0575 at seq 64: -0.0183, -1.7%). Context length and dynamic evaluation compose: dynamic evaluation takes
--0.0467 off the model and -0.0207 off the stack (seq 64: -0.0424 and -0.0168 at the same 256-byte step, from 1.1478/1.0821).
+-0.0467 off the model and -0.0207 off the stack (seq 64, 256-byte steps: -0.0424 off the model, 1.1478 -> 1.1054).
 Caveat: the memory used `store=50000` windows of 128 bytes (6.4M keys) against 4.5M keys at seq 64, a small advantage not
 separated here; the tiers were tuned at seq 64 and not re-tuned for seq 128 (one-at-a-time tuning, as above, is next).
 Larger steps again won at the longer window (4 windows beat 2), so 8 is untried.
