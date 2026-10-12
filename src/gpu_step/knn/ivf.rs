@@ -83,6 +83,18 @@ fn k_argmin(dist: &[f32], cnorm: &[f32], out: &mut [f32], ld: u32, nc: u32, len:
     }
 }
 
+/// Gathers query columns into the matmuls' second operands: for pair i, column pdst[i] (+ c * pstride[i] for component c) of `dst`
+/// is query pq[i] of `src` (f16 [., d]).
+#[cube(launch)]
+fn k_gather_q(src: &[f16], dst: &mut [f16], pq: &[u32], pdst: &[u32], pstride: &[u32], n: u32, d: u32) {
+    let i = ABSOLUTE_POS as u32;
+    if i < n {
+        for c in 0..d {
+            dst[(pdst[i as usize] + c * pstride[i as usize]) as usize] = src[(pq[i as usize] * d + c) as usize];
+        }
+    }
+}
+
 /// Pass 1 of the scan: thread t = (part t / nq, query t % nq) keeps the `TR` nearest of every `SAMP`-th row of its part of
 /// query gi's row ranges (laid out as in `k_scan`), ascending, at thr_d[t * TR].
 #[allow(clippy::too_many_arguments)]
@@ -210,7 +222,7 @@ fn k_scan(
 impl KnnStore {
     /// Nearest centroid of each of the `len` rows of the device key tile `keys` (`dist` is a [tile, c.qp] scratch buffer).
     fn nearest_centroid(&self, keys: &Handle, len: usize, c: &Cent, dist: &Handle) -> Vec<u32> {
-        self.dots(keys, 0, len, &c.qh, dist, self.tile * c.qp, 0, c.nlist, c.qp);
+        self.dots(keys, 0, len, &c.qh, 0, dist, self.tile * c.qp, 0, c.nlist, c.qp);
         let out = client().empty(len * 4);
         crate::gpu_step::count_launch();
         k_argmin::launch(client(), cubes(len), CubeDim::new_1d(EW_DIM), buf(dist, self.tile * c.qp), buf(&c.norm, c.nlist), buf(&out, len), c.qp as u32, c.nlist as u32, len as u32);
@@ -340,6 +352,7 @@ impl KnnStore {
         let (d, nl) = (self.d, ivf.nlist);
         assert!(queries.len() == rows * d && nprobe >= 1 && nprobe <= nl);
         let rq: Vec<f16> = queries.iter().map(|&x| f16::from_f32(x)).collect();
+        let rq_dev = client().create_from_slice(f16::as_bytes(&rq));
         // Each query's nprobe nearest cells, nearest first.
         let t0 = std::time::Instant::now();
         let nl16 = nl.next_multiple_of(16);
@@ -348,7 +361,7 @@ impl KnnStore {
             let q = QBLOCK.min(rows - q0);
             let (qh, qp) = transposed_f16(&rq[q0 * d..(q0 + q) * d], d);
             let dist = client().empty(nl16 * qp * 4);
-            self.dots(&ivf.keys, 0, nl, &qh, &dist, nl16 * qp, 0, q, qp);
+            self.dots(&ivf.keys, 0, nl, &qh, 0, &dist, nl16 * qp, 0, q, qp);
             let dd = read(&dist);
             for i in 0..q {
                 let mut sc: Vec<(f32, u32)> = (0..nl).map(|c| (ivf.norm[c] - 2.0 * dd[c * qp + i], c as u32)).collect();
@@ -372,7 +385,7 @@ impl KnnStore {
         let mut sorted = Vec::with_capacity(rows * KMAX);
         for g0 in (0..rows).step_by(group) {
             let g1 = (g0 + group).min(rows);
-            self.scan_group(ivf, &rq, &order[g0..g1], &sorted_probes[g0 * nprobe..g1 * nprobe], nprobe, &ws, true, &mut stage, &mut sorted);
+            self.scan_group(ivf, &rq, &rq_dev, &order[g0..g1], &sorted_probes[g0 * nprobe..g1 * nprobe], nprobe, &ws, true, &mut stage, &mut sorted);
         }
         let mut out = vec![(f32::INFINITY, 0u16); rows * KMAX];
         for (pos, &q) in order.iter().enumerate() {
@@ -394,7 +407,7 @@ impl KnnStore {
     /// One group, queries `qs` (indices into `rq`) with their cells `probes` (nprobe each, nearest first); appends their lists
     /// to `out`, in the order of `qs`.
     #[allow(clippy::too_many_arguments)]
-    fn scan_group(&self, ivf: &Ivf, rq: &[f16], qs: &[u32], probes: &[u32], nprobe: usize, ws: &Handle, thresholds: bool, stage: &mut [std::time::Duration; 3], out: &mut Vec<(f32, u16)>) {
+    fn scan_group(&self, ivf: &Ivf, rq: &[f16], rq_dev: &Handle, qs: &[u32], probes: &[u32], nprobe: usize, ws: &Handle, thresholds: bool, stage: &mut [std::time::Duration; 3], out: &mut Vec<(f32, u16)>) {
         let (d, nq) = (self.d, qs.len());
         // The queries probing each cell, in order, and each (query, probe)'s column among them.
         let mut cell_q: Vec<Vec<u32>> = vec![vec![]; ivf.nlist];
@@ -419,22 +432,39 @@ impl KnnStore {
         if used > WS_FLOATS {
             assert!(nq > 1, "one query's cells need {used} workspace floats");
             let mid = nq / 2;
-            self.scan_group(ivf, rq, &qs[..mid], &probes[..mid * nprobe], nprobe, ws, thresholds, stage, out);
-            self.scan_group(ivf, rq, &qs[mid..], &probes[mid * nprobe..], nprobe, ws, thresholds, stage, out);
+            self.scan_group(ivf, rq, rq_dev, &qs[..mid], &probes[..mid * nprobe], nprobe, ws, thresholds, stage, out);
+            self.scan_group(ivf, rq, rq_dev, &qs[mid..], &probes[mid * nprobe..], nprobe, ws, thresholds, stage, out);
             return;
         }
         let timing = std::env::var_os("KNN_TIMING").is_some();
         let t0 = std::time::Instant::now();
-        let mut gathered: Vec<f16> = Vec::with_capacity(nq * d);
+        // The queries of each active cell as one [d, qp] operand each, gathered on the device into one buffer.
+        let (mut q_at, mut cell_at, mut total) = (vec![0usize; ivf.nlist], vec![], 0usize);
+        let (mut pq, mut pdst, mut pstride) = (vec![], vec![], vec![]);
         for (c, cq) in cell_q.iter().enumerate().filter(|(_, cq)| !cq.is_empty()) {
-            gathered.clear();
-            for &gi in cq {
-                gathered.extend_from_slice(&rq[qs[gi as usize] as usize * d..(qs[gi as usize] as usize + 1) * d]);
+            let qp = cq.len().next_multiple_of(16);
+            q_at[c] = total;
+            cell_at.push(c);
+            for (j, &gi) in cq.iter().enumerate() {
+                pq.push(qs[gi as usize]);
+                pdst.push((total + j) as u32);
+                pstride.push(qp as u32);
             }
-            let (qh, qp) = transposed_f16(&gathered, d);
+            total += d * qp;
+        }
+        let qall = client().create_from_slice(f16::as_bytes(&vec![f16::ZERO; total]));
+        let up = |v: &[u32]| client().create_from_slice(u32::as_bytes(v));
+        let np = pq.len();
+        let (pq, pdst, pstride) = (up(&pq), up(&pdst), up(&pstride));
+        crate::gpu_step::count_launch();
+        #[rustfmt::skip]
+        k_gather_q::launch(client(), cubes(np), CubeDim::new_1d(EW_DIM), buf(rq_dev, rq.len()), buf(&qall, total), buf(&pq, np), buf(&pdst, np), buf(&pstride, np), np as u32, d as u32);
+        for &c in &cell_at {
+            let cq = &cell_q[c];
+            let qp = cq.len().next_multiple_of(16);
             for (piece, &off) in ivf.cells[c].iter().zip(&region[c]) {
                 let (base, rows16) = piece.rows();
-                self.dots(&self.tiles[piece.tile].keys, base, rows16, &qh, ws, WS_FLOATS, off, cq.len(), qp);
+                self.dots(&self.tiles[piece.tile].keys, base, rows16, &qall, q_at[c], ws, WS_FLOATS, off, cq.len(), qp);
             }
         }
         if timing {
@@ -458,7 +488,6 @@ impl KnnStore {
             q_off.push(v_len.len() as u32);
         }
         let nv = v_len.len();
-        let up = |v: &[u32]| client().create_from_slice(u32::as_bytes(v));
         let (q_off, v_base, v_stride, v_g0, v_len) = (up(&q_off), up(&v_base), up(&v_stride), up(&v_g0), up(&v_len));
         // Pass 1: each query's threshold from a sample of its rows.
         let thr_q: Vec<f32> = if thresholds {
@@ -498,7 +527,7 @@ impl KnnStore {
                 // A threshold left fewer than KMAX keys: this group again without thresholds.
                 out.truncate(first);
                 stage[2] += t0.elapsed();
-                return self.scan_group(ivf, rq, qs, probes, nprobe, ws, false, stage, out);
+                return self.scan_group(ivf, rq, rq_dev, qs, probes, nprobe, ws, false, stage, out);
             }
             out.extend(c.iter().map(|&(dd, v)| ((dd + qn).max(0.0), v as u16)));
         }

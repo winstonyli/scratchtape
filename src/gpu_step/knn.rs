@@ -219,14 +219,14 @@ impl KnnStore {
 
     /// dist[j, i] = key_j . query_i for the `len` keys in `keys`, as [rows, qp] (qp = q unless f16-padded). With f16, the keys
     /// start at row `a_row0` (a multiple of 16), and the result starts at element `out_off` of `dist`, a buffer of `dist_len` floats.
-    fn dots(&self, keys: &Handle, a_row0: usize, len: usize, qh: &Handle, dist: &Handle, dist_len: usize, out_off: usize, q: usize, qp: usize) {
+    fn dots(&self, keys: &Handle, a_row0: usize, len: usize, qh: &Handle, qh_off: usize, dist: &Handle, dist_len: usize, out_off: usize, q: usize, qp: usize) {
         if self.f16 {
             let rows = len.next_multiple_of(16);
             let plane = client().properties().hardware.plane_size_max;
             #[rustfmt::skip]
-            k_dots_cmma::launch(client(), CubeCount::Static((qp / 16) as u32, (rows / 16) as u32, 1), CubeDim::new_1d(plane), buf(keys, rows * self.d), buf(qh, self.d * qp), buf(dist, dist_len), self.d as u32, qp as u32, a_row0 as u32, out_off as u32);
+            k_dots_cmma::launch(client(), CubeCount::Static((qp / 16) as u32, (rows / 16) as u32, 1), CubeDim::new_1d(plane), buf(keys, rows * self.d), buf(qh, qh_off + self.d * qp), buf(dist, dist_len), self.d as u32, qp as u32, a_row0 as u32, out_off as u32, qh_off as u32);
         } else {
-            assert!(a_row0 == 0 && out_off == 0);
+            assert!(a_row0 == 0 && out_off == 0 && qh_off == 0);
             let (a, b, o) = (MatRef::new(keys), MatRef { trans: true, ..MatRef::new(qh) }, MatRef::new(dist));
             matmul(a, b, o, 1, len, self.d, q, Epilogue::default());
         }
@@ -285,7 +285,7 @@ impl KnnStore {
         let mut gbase = 0usize;
         for (sk, sn, len) in &sample {
             let t0 = std::time::Instant::now();
-            self.dots(sk, 0, *len, &qh, &dist, self.tile * qp, 0, q, qp);
+            self.dots(sk, 0, *len, &qh, 0, &dist, self.tile * qp, 0, q, qp);
             if timing {
                 read(&hi);
                 stage[1] += t0.elapsed();
@@ -331,7 +331,7 @@ impl KnnStore {
                 continue;
             }
             let t0 = std::time::Instant::now();
-            self.dots(&t.keys, 0, t.len, &qh, &dist, self.tile * qp, 0, q, qp);
+            self.dots(&t.keys, 0, t.len, &qh, 0, &dist, self.tile * qp, 0, q, qp);
             if timing {
                 read(&hi);
                 t_mm += t0.elapsed();
@@ -414,16 +414,16 @@ pub(super) fn f16_config() -> cubecl::features::MmaConfig {
 }
 
 /// out[M, N] (f32) = a[M, K] @ b[K, N] (f16, row-major) on matrix cores: one plane per cube computes one 16x16 tile
-/// (the spike's `k_matmul_cmma`). M, N, K are multiples of 16; the rows computed start at row `a_row0` of `a`, and `out` is written from element `out_off`.
+/// (the spike's `k_matmul_cmma`). M, N, K are multiples of 16; the rows computed start at row `a_row0` of `a`, `b` is read from element `b_off0`, and `out` is written from element `out_off`.
 #[cube(launch)]
-fn k_dots_cmma(a: &[f16], b: &[f16], out: &mut [f32], #[comptime] k: u32, n: u32, a_row0: u32, out_off: u32) {
+fn k_dots_cmma(a: &[f16], b: &[f16], out: &mut [f32], #[comptime] k: u32, n: u32, a_row0: u32, out_off: u32, b_off0: u32) {
     let row0 = CUBE_POS_Y * 16;
     let col0 = CUBE_POS_X * 16;
     let c = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0);
     #[unroll]
     for kk in 0..k / 16 {
         let a_off = ((a_row0 + row0) * k + kk * 16) as usize;
-        let b_off = (kk * 16 * n + col0) as usize;
+        let b_off = (b_off0 + kk * 16 * n + col0) as usize;
         let at = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &a[a_off..a.len()], k);
         let bt = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &b[b_off..b.len()], n);
         cmma::execute(&at, &bt, &c, &c);
