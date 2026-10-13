@@ -542,7 +542,7 @@ impl KnnStore {
         let (q_off, v_base, v_stride, v_g0, v_len) = (up(&q_off), up(&v_base), up(&v_stride), up(&v_g0), up(&v_len));
         // Pass 1: each query's threshold from a sample of its rows.
         let thr_q: Vec<f32> = if thresholds {
-            let thr_d = upload_f32(&vec![f32::INFINITY; PARTS * nq * THRESH_RANK]);
+            let thr_d = filled(PARTS * nq * THRESH_RANK, f32::INFINITY);
             crate::gpu_step::count_launch();
             #[rustfmt::skip]
             k_sample::launch(client(), cubes(PARTS * nq), CubeDim::new_1d(EW_DIM), buf(ws, WS_FLOATS), buf(&ivf.norms, ivf.n), buf(&thr_d, PARTS * nq * THRESH_RANK), buf(&q_off, nq + 1), buf(&v_base, nv), buf(&v_stride, nv), buf(&v_g0, nv), buf(&v_len, nv), nq as u32, PARTS as u32);
@@ -553,7 +553,7 @@ impl KnnStore {
         };
         let t_s = t0.elapsed();
         let thr_buf = upload_f32(&thr_q);
-        let (best_d, best_v) = (upload_f32(&vec![f32::INFINITY; PARTS * nq * KMAX]), upload_f32(&vec![0.0f32; PARTS * nq * KMAX]));
+        let (best_d, best_v) = (filled(PARTS * nq * KMAX, f32::INFINITY), filled(PARTS * nq * KMAX, 0.0));
         crate::gpu_step::count_launch();
         #[rustfmt::skip]
         k_scan::launch(client(), cubes(PARTS * nq), CubeDim::new_1d(EW_DIM), buf(ws, WS_FLOATS), buf(&ivf.norms, ivf.n), buf(&ivf.vals, ivf.n), buf(&best_d, PARTS * nq * KMAX), buf(&best_v, PARTS * nq * KMAX), buf(&thr_buf, nq), buf(&q_off, nq + 1), buf(&v_base, nv), buf(&v_stride, nv), buf(&v_g0, nv), buf(&v_len, nv), nq as u32, PARTS as u32);

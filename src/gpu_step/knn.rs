@@ -6,7 +6,7 @@
 //! The matmul writes the tile's distances transposed ([keys, queries]) so the
 //! top-k kernel, one thread per query, reads them coalesced.
 use super::matmul::{Epilogue, MatRef, matmul};
-use super::{EW_DIM, buf, client, cubes, read, upload_f32};
+use super::{EW_DIM, buf, client, cubes, k_fill, read, upload_f32};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 use half::f16;
@@ -70,6 +70,13 @@ pub struct KnnStore {
     kbits: u32,
     /// Set by `build_ivf`: the first keys are clustered for `search_ivf`.
     ivf: Option<ivf::Ivf>,
+}
+
+/// A device buffer of `len` copies of `v`, filled on the device (no host vector crossing the link).
+pub(super) fn filled(len: usize, v: f32) -> Handle {
+    let h = client().empty(len * 4);
+    k_fill::launch(client(), cubes(len), CubeDim::new_1d(EW_DIM), buf(&h, len), v, len as u32);
+    h
 }
 
 impl KnnStore {
@@ -336,8 +343,8 @@ impl KnnStore {
         } else {
             (upload_f32(block), block)
         };
-        let best_d = upload_f32(&vec![f32::INFINITY; parts * q * KMAX]);
-        let best_v = upload_f32(&vec![0.0f32; parts * q * KMAX]);
+        let best_d = filled(parts * q * KMAX, f32::INFINITY);
+        let best_v = filled(parts * q * KMAX, 0.0);
         let dist = client().empty(self.tile * qp * 4);
         let lo = client().create_from_slice(u32::as_bytes(&ranges.iter().map(|r| r.0).collect::<Vec<_>>()));
         let hi = client().create_from_slice(u32::as_bytes(&ranges.iter().map(|r| r.1).collect::<Vec<_>>()));
@@ -350,7 +357,7 @@ impl KnnStore {
         let t_start = std::time::Instant::now();
         let mut stage = [std::time::Duration::ZERO; 3];
         // Pass 1: each query's threshold from the sample.
-        let thr_d = upload_f32(&vec![f32::INFINITY; parts * q * THRESH_RANK]);
+        let thr_d = filled(parts * q * THRESH_RANK, f32::INFINITY);
         let sample = if thresholds { self.sample_chunks() } else { vec![] };
         if timing {
             read(&hi);
