@@ -18,6 +18,10 @@ const SAMP: u32 = 32;
 /// Lloyd iterations on the key sample.
 const KMEANS_ITERS: usize = 10;
 const ARGMIN_DIM: u32 = 256;
+/// Most rows dequantised into the scratch at once by `scan_group` (128 MB of f16 at d = 256).
+const SCRATCH_ROWS: usize = 262144;
+/// Cubes per row of a grouped matmul launch (a launch dimension is limited to 65535).
+const GROUP_GX: u32 = 8192;
 
 pub(super) struct Ivf {
     /// Centroids as a device key tile (f16, rounded as the keys are) and their squared norms.
@@ -240,6 +244,50 @@ fn k_scan(
                 }
             }
         }
+    }
+}
+
+/// Grouped matmul over cell pieces: piece p of `p0..p1` (descriptors `desc[4p..]`: first scratch row of its keys, its padded query
+/// count `qp`, element offset of its queries in `b`, element offset of its output in `out`) owns cubes `cube_start[p]..cube_start[p + 1]`,
+/// one 16x16 tile of its [rows, qp] output each, as `k_dots_cmma`. The launch has `count` cubes starting at `cube_start[p0]`.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch)]
+fn k_dots_group(a: &[f16], b: &[f16], out: &mut [f32], desc: &[u32], cube_start: &[u32], #[comptime] k: u32, p0: u32, p1: u32, count: u32) {
+    let lin = CUBE_POS_Y * GROUP_GX + CUBE_POS_X;
+    if lin < count {
+        let id = cube_start[p0 as usize] + lin;
+        let mut lo = p0;
+        let mut hi = p1;
+        for _ in 0..24u32 {
+            if hi - lo > 1 {
+                let mid = (lo + hi) / 2;
+                if cube_start[mid as usize] <= id {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+        }
+        let a_row = desc[(lo * 4) as usize];
+        let n = desc[(lo * 4 + 1) as usize];
+        let b_off0 = desc[(lo * 4 + 2) as usize];
+        let out_off = desc[(lo * 4 + 3) as usize];
+        let loc = id - cube_start[lo as usize];
+        let nct = n / 16;
+        let row0 = (loc / nct) * 16;
+        let col0 = (loc % nct) * 16;
+        let c = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0);
+        #[unroll]
+        for kk in 0..k / 16 {
+            let a_off = ((a_row + row0) * k + kk * 16) as usize;
+            let b_off = (b_off0 + kk * 16 * n + col0) as usize;
+            let at = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &a[a_off..a.len()], k);
+            let bt = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &b[b_off..b.len()], n);
+            cmma::execute(&at, &bt, &c, &c);
+        }
+        let o_off = (out_off + row0 * n + col0) as usize;
+        let len = out.len();
+        cmma::store(&mut out[o_off..len], &c, n, cmma::MatrixLayout::RowMajor);
     }
 }
 
@@ -518,14 +566,39 @@ impl KnnStore {
         crate::gpu_step::count_launch();
         #[rustfmt::skip]
         k_gather_q::launch(client(), cubes(np), CubeDim::new_1d(EW_DIM), buf(rq_dev, rq.len()), buf(&qall, total), buf(&pq, np), buf(&pdst, np), buf(&pstride, np), np as u32, d as u32);
+        // Every piece's matmul, in storage order, in chunks whose keys fit the scratch: one dequant of the chunk's row span (the
+        // cells are stored in order, so the span is nearly all active cells) and one grouped matmul launch per chunk.
+        let mut items: Vec<(usize, usize, usize, usize, usize, usize)> = vec![];
         for &c in &cell_at {
-            let cq = &cell_q[c];
-            let qp = cq.len().next_multiple_of(16);
+            let qp = cell_q[c].len().next_multiple_of(16);
             for (piece, &off) in ivf.cells[c].iter().zip(&region[c]) {
                 let (base, rows16) = piece.rows();
-                let (kh, r0) = self.rows_f16(&self.tiles[piece.tile], base, rows16);
-                self.dots(&kh, r0, rows16, &qall, q_at[c], ws, WS_FLOATS, off, cq.len(), qp);
+                items.push((piece.tile, base, rows16, q_at[c], off, qp));
             }
+        }
+        items.sort_unstable_by_key(|it| (it.0, it.1));
+        let (mut desc, mut cube_start, mut chunks) = (vec![], vec![0u32], vec![]);
+        let mut p0 = 0;
+        while p0 < items.len() {
+            let (tile, start) = (items[p0].0, items[p0].1);
+            let (mut end, mut p1) = (start, p0);
+            while p1 < items.len() && items[p1].0 == tile && (p1 == p0 || end.max(items[p1].1 + items[p1].2) - start <= SCRATCH_ROWS) {
+                let (_, base, rows16, b_off, off, qp) = items[p1];
+                end = end.max(base + rows16);
+                desc.extend([(base - start) as u32, qp as u32, b_off as u32, off as u32]);
+                cube_start.push(cube_start[p1] + (rows16 / 16 * (qp / 16)) as u32);
+                p1 += 1;
+            }
+            chunks.push((tile, start, end - start, p0, p1));
+            p0 = p1;
+        }
+        let (desc, cube_start_dev) = (up(&desc), up(&cube_start));
+        for &(tile, start, rows, p0, p1) in &chunks {
+            let (kh, _) = self.rows_f16(&self.tiles[tile], start, rows);
+            let count = (cube_start[p1] - cube_start[p0]) as usize;
+            crate::gpu_step::count_launch();
+            #[rustfmt::skip]
+            k_dots_group::launch(client(), CubeCount::Static(GROUP_GX.min(count as u32), (count as u32).div_ceil(GROUP_GX), 1), CubeDim::new_1d(client().properties().hardware.plane_size_max), buf(&kh, rows * d), buf(&qall, total), buf(ws, WS_FLOATS), buf(&desc, items.len() * 4), buf(&cube_start_dev, items.len() + 1), d as u32, p0 as u32, p1 as u32, count as u32);
         }
         if timing {
             read(&ivf.vals);
