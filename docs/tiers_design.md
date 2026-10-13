@@ -1323,3 +1323,9 @@ half 0, dynamic evaluation: 36.7M keys (9.4 GB on the device), CE **0.9841**, ag
 0.9941 for store 50000 exact, so the extra 18 books now give -0.0052 (the fixed-budget test found nothing, because it
 sampled the same number of windows). Recall of the exact top-128 0.992; the eval took 189 s (tier prepare 160 s); the build took
 140 s of k-means and assignment + 59 s of reorder, with ~14 GB of host RAM at peak. More text keeps helping at about -0.005 per 2.5x.
+
+**Run in progress: seq-128 retrain at 64M windows** (started 2026-10-12 17:01; `scripts/train_64m_novels22_seq128.sh`, log
+`runs/nov22_s128_k1_d0.1_64m_f16.log`, resumable by rerunning the script, fused_models_check pid 64388, Normal priority: GPU-bound,
+~4.9 ms/step, 2.05M steps, ETA ~2.8 h, i.e. ~19:50). Checkpoint `runs/nov22_s128_k1_d0.1_64m_f16_m0.ckpt`. When done, evaluate
+with the long-eval recipe (`store=200000 ivf=2048:8 batch=128`, or novels40 + `int8=1`) against the 32M model's 0.9893 / 0.9841
+(half 0) and 1.0810 (half 1), and the model alone (1.0246 on half 0 at 32M). Do not overlap GPU jobs while it runs.
