@@ -470,7 +470,8 @@ impl KnnStore {
         let t_read = t0.elapsed();
         if timing {
             eprintln!(
-                "knn timing: {q} queries x {} keys{}: matmul+thresholds {:.0} ms (thresholds alone {:.0}), top-k {:.0} ms, readback {:.0} ms, total {:.0} ms",
+                "knn timing: {q} queries, mean range {} keys, window {win_lo}..{win_hi}, {} keys{}: matmul+thresholds {:.0} ms (thresholds alone {:.0}), top-k {:.0} ms, readback {:.0} ms, total {:.0} ms",
+                ranges.iter().map(|r| (r.1 - r.0) as f64).sum::<f64>() / ranges.len().max(1) as f64,
                 self.len(),
                 if thresholds { "" } else { " (no thresholds)" },
                 t_mm.as_secs_f64() * 1e3,
