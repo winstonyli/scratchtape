@@ -1117,7 +1117,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
-            | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" => {
+            | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" | "int8" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -1197,6 +1197,9 @@ fn main() {
             fit_whitener(&dev, &cfg, &train, tap, a, size("whiten_rank", &cfg.d.to_string()));
         }
         let mut gpu = KnnStore::new(cfg.d, 16384);
+        if opt.get("int8").is_some_and(|v| v != "0") {
+            gpu.set_int8();
+        }
         let (mut n_train, mut n_held) = (0, 0);
         let build = std::time::Instant::now();
         let mut t_fwd = std::time::Duration::ZERO;

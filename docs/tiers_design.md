@@ -1312,3 +1312,14 @@ the exact top-128 0.990 / 0.997; whole eval 158 s / 159 s (tier prepare 126 / 12
 IVF knob scan at the full store (`part=0/32`, tier prepare, CE, recall): 1024x8 10.6 s, 1.0707, 0.991; **2048x4 9.6 s, 1.0704, 0.973**;
 2048x8 ~8-11 s, 1.0705, 0.990; 2048x16 11.2 s, 1.0705, 0.995; 4096x8 10.4 s, 1.0708, 0.989. CE is flat across all of them (recall
 0.97 is enough), so the knobs are not worth tuning further; 2048x8 stays the default. Long evals: `store=200000 ivf=2048:8 batch=128`.
+
+**int8 keys, implemented, and the whole of novels40 in the memory (correction to the two entries above).** The int8 note above called
+int8 moot because it only considered novels22; the earlier `memory_corpus=novels40` entry, however, was stuck on a VRAM budget
+(38M f16 keys = 19 GB). `KnnStore::set_int8` (`tier_eval int8=1`) now stores each tile as int8 with one scale per key (half the
+memory; `k_dequant` expands the rows a matmul needs into an f16 scratch; norms are those of the dequantised f16 values; the
+IVF reorder moves bytes). `part=0/32`, store 200000, IVF 2048x8: CE **1.0705**, identical to f16, 10.0 s tier prepare, recall 0.990.
+Unit test `int8_keys_search_like_f16_keys`. Then `memory_corpus=novels40 store=1000000 ivf=4096:8 batch=128 int8=1`, seq-128 model,
+half 0, dynamic evaluation: 36.7M keys (9.4 GB on the device), CE **0.9841**, against 0.9893 for novels22's 14.9M keys and
+0.9941 for store 50000 exact, so the extra 18 books now give -0.0052 (the fixed-budget test found nothing, because it
+sampled the same number of windows). Recall of the exact top-128 0.992; the eval took 189 s (tier prepare 160 s); the build took
+140 s of k-means and assignment + 59 s of reorder, with ~14 GB of host RAM at peak. More text keeps helping at about -0.005 per 2.5x.

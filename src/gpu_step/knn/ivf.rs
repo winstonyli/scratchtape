@@ -221,8 +221,8 @@ fn k_scan(
 
 impl KnnStore {
     /// Nearest centroid of each of the `len` rows of the device key tile `keys` (`dist` is a [tile, c.qp] scratch buffer).
-    fn nearest_centroid(&self, keys: &Handle, len: usize, c: &Cent, dist: &Handle) -> Vec<u32> {
-        self.dots(keys, 0, len, &c.qh, 0, dist, self.tile * c.qp, 0, c.nlist, c.qp);
+    fn nearest_centroid(&self, keys: &Handle, a_row0: usize, len: usize, c: &Cent, dist: &Handle) -> Vec<u32> {
+        self.dots(keys, a_row0, len, &c.qh, 0, dist, self.tile * c.qp, 0, c.nlist, c.qp);
         let out = client().empty(len * 4);
         crate::gpu_step::count_launch();
         k_argmin::launch(client(), cubes(len), CubeDim::new_1d(EW_DIM), buf(dist, self.tile * c.qp), buf(&c.norm, c.nlist), buf(&out, len), c.qp as u32, c.nlist as u32, len as u32);
@@ -247,7 +247,7 @@ impl KnnStore {
             let (mut sum, mut count) = (vec![0f32; nlist * d], vec![0usize; nlist]);
             for block in self.sample_keys.chunks(self.tile * d) {
                 let (kh, _) = self.upload_keys(block);
-                for (j, &a) in self.nearest_centroid(&kh, block.len() / d, &c, &dist).iter().enumerate() {
+                for (j, &a) in self.nearest_centroid(&kh, 0, block.len() / d, &c, &dist).iter().enumerate() {
                     count[a as usize] += 1;
                     sum[a as usize * d..][..d].iter_mut().zip(&block[j * d..(j + 1) * d]).for_each(|(s, x)| *s += x);
                 }
@@ -277,7 +277,8 @@ impl KnnStore {
         let c = Cent::new(&cent, d);
         let mut cell: Vec<u32> = Vec::with_capacity(n);
         for t in &self.tiles {
-            cell.extend(self.nearest_centroid(&t.keys, t.len, &c, &dist));
+            let (kh, r0) = self.rows_f16(t, 0, t.len.next_multiple_of(16));
+            cell.extend(self.nearest_centroid(&kh, r0, t.len, &c, &dist));
         }
         let t_assign = t0.elapsed();
         let mut start = vec![0usize; nlist + 1];
@@ -296,22 +297,32 @@ impl KnnStore {
             })
             .collect();
         // Reorder through the host, then replace the tiles.
-        let (mut keys, mut vals) = (vec![f16::ZERO; n * d], vec![0u16; n]);
+        // (int8 keys move as bytes with their scales; f16 keys as halves, re-uploaded as f32.)
+        let esize = if self.int8 { 1 } else { 2 };
+        let (mut keys, mut scales, mut vals) = (vec![0u8; n * d * esize], vec![0f32; if self.int8 { n } else { 0 }], vec![0u16; n]);
         let mut i = 0;
         for t in &self.tiles {
             let bytes = client().read_one(t.keys.clone()).unwrap();
-            let k = f16::from_bytes(&bytes);
             let v = read(&t.vals);
+            let sc = t.scales.as_ref().map(read);
             for j in 0..t.len {
-                keys[dest[i + j] * d..(dest[i + j] + 1) * d].copy_from_slice(&k[j * d..(j + 1) * d]);
-                vals[dest[i + j]] = v[j] as u16;
+                let to = dest[i + j];
+                keys[to * d * esize..(to + 1) * d * esize].copy_from_slice(&bytes[j * d * esize..(j + 1) * d * esize]);
+                if let Some(sc) = &sc {
+                    scales[to] = sc[j];
+                }
+                vals[to] = v[j] as u16;
             }
             i += t.len;
         }
         self.tiles.clear();
-        for (kb, vb) in keys.chunks(self.tile * d).zip(vals.chunks(self.tile)) {
-            let kf: Vec<f32> = kb.iter().map(|x| x.to_f32()).collect();
-            let tile = self.tile_of(&kf, vb);
+        for (ci, (kb, vb)) in keys.chunks(self.tile * d * esize).zip(vals.chunks(self.tile)).enumerate() {
+            let tile = if self.int8 {
+                self.tile_of_int8(kb, &scales[ci * self.tile..][..vb.len()], vb)
+            } else {
+                let kf: Vec<f32> = f16::from_bytes(kb).iter().map(|x| x.to_f32()).collect();
+                self.tile_of(&kf, vb)
+            };
             self.tiles.push(tile);
         }
         let cent_rounded: Vec<f32> = cent.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
@@ -325,7 +336,7 @@ impl KnnStore {
             t_assign.as_secs_f64(),
             (t0.elapsed() - t_assign).as_secs_f64()
         );
-        let norms: Vec<f32> = keys.chunks_exact(d).map(|k| k.iter().map(|x| x.to_f32() * x.to_f32()).sum()).collect();
+        let norms: Vec<f32> = self.tiles.iter().flat_map(|t| read(&t.norms)).collect();
         let cells = (0..nlist).map(|a| self.pieces(start[a], start[a + 1])).collect();
         let vals_f: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
         self.ivf = Some(Ivf { keys: cent_keys, norm: c.norm_host, nlist, n, norms: upload_f32(&norms), vals: upload_f32(&vals_f), cells });
@@ -464,7 +475,8 @@ impl KnnStore {
             let qp = cq.len().next_multiple_of(16);
             for (piece, &off) in ivf.cells[c].iter().zip(&region[c]) {
                 let (base, rows16) = piece.rows();
-                self.dots(&self.tiles[piece.tile].keys, base, rows16, &qall, q_at[c], ws, WS_FLOATS, off, cq.len(), qp);
+                let (kh, r0) = self.rows_f16(&self.tiles[piece.tile], base, rows16);
+                self.dots(&kh, r0, rows16, &qall, q_at[c], ws, WS_FLOATS, off, cq.len(), qp);
             }
         }
         if timing {
@@ -587,5 +599,38 @@ mod tests {
         let hits: usize = (0..rows).map(|r| (0..KMAX).filter(|&j| some[r * KMAX + j].0 <= exact[r * KMAX + KMAX - 1].0 * (1.0 + 2e-3)).count()).sum();
         let recall = hits as f64 / (rows * KMAX) as f64;
         assert!(recall > 0.8, "recall {recall} with 2 of {nlist} cells");
+    }
+
+    /// int8 keys: the same search to within the rounding, and probing every cell equals the exact int8 search.
+    #[test]
+    fn int8_keys_search_like_f16_keys() {
+        let (d, n, rows, nlist) = (32, 12_000, 100, 4);
+        let mut rng = Rng::new(5);
+        let keys: Vec<f32> = (0..n * d).map(|_| rng.next_gaussian()).collect();
+        let vals: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let queries: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
+        let mut f = KnnStore::with_precision(d, 4096, true);
+        f.add(&keys, &vals);
+        f.finish();
+        let mut q = KnnStore::with_precision(d, 4096, true);
+        q.set_int8();
+        q.add(&keys, &vals);
+        q.finish();
+        let (a, b) = (f.search(&queries, rows), q.search(&queries, rows));
+        for r in 0..rows {
+            for j in [0, 10, KMAX - 1] {
+                let (x, y) = (a[r * KMAX + j].0, b[r * KMAX + j].0);
+                assert!((x - y).abs() < 0.05 * (1.0 + x), "query {r} rank {j}: f16 {x} vs int8 {y}");
+            }
+        }
+        q.build_ivf(nlist);
+        let all = q.search_ivf(&queries, rows, nlist);
+        let c = q.search(&queries, rows);
+        for r in 0..rows {
+            for j in 0..KMAX {
+                let (x, y) = (c[r * KMAX + j].0, all[r * KMAX + j].0);
+                assert!((x - y).abs() < 2e-3 * (1.0 + x), "query {r} rank {j}: int8 exact {x} vs all-cell ivf {y}");
+            }
+        }
     }
 }

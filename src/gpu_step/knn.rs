@@ -40,7 +40,9 @@ const THRESH_RANK: usize = 32;
 const TR: u32 = THRESH_RANK as u32;
 
 struct Tile {
+    /// f16 [rows padded to 16, d]; with `scales`, int8 instead (4 per u32), the row's value times its scale.
     keys: Handle,
+    scales: Option<Handle>,
     norms: Handle,
     vals: Handle,
     len: usize,
@@ -63,6 +65,8 @@ pub struct KnnStore {
     pub flush_time: [std::time::Duration; 2],
     /// Device copy of `sample_keys` as (keys, norms, len) chunks, with the sample count it was built from.
     sample_dev: RefCell<(usize, Vec<(Handle, Handle, usize)>)>,
+    /// Keys stored as int8 with one scale per key (half the memory of f16; `set_int8`).
+    int8: bool,
     /// Set by `build_ivf`: the first keys are clustered for `search_ivf`.
     ivf: Option<ivf::Ivf>,
 }
@@ -90,7 +94,15 @@ impl KnnStore {
             flush_time: [std::time::Duration::ZERO; 2],
             sample_dev: RefCell::new((0, vec![])),
             ivf: None,
+            int8: false,
         }
+    }
+
+    /// Stores keys added from now on as int8 with one scale per key: half the device memory of f16 for a rounding error
+    /// of about 0.4% of a key's largest component. Call before the first `add`.
+    pub fn set_int8(&mut self) {
+        assert!(self.f16 && self.len() == 0, "int8 keys need the f16 matrix cores and an empty store");
+        self.int8 = true;
     }
 
     /// Appends keys (row-major [n, d]) and their values; full tiles are uploaded as they fill.
@@ -138,8 +150,40 @@ impl KnnStore {
     /// Device tile for `keys` (row-major [vals.len(), d]) and their values.
     fn tile_of(&self, keys: &[f32], vals: &[u16]) -> Tile {
         let vals_f: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
+        if self.int8 {
+            let d = self.d;
+            let (mut q, mut scales) = (Vec::with_capacity(keys.len()), Vec::with_capacity(vals.len()));
+            for k in keys.chunks_exact(d) {
+                let scale = k.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-30) / 127.0;
+                q.extend(k.iter().map(|&x| (x / scale).round() as i8 as u8));
+                scales.push(scale);
+            }
+            return self.tile_of_int8(&q, &scales, vals);
+        }
         let (key_h, norms) = self.upload_keys(keys);
-        Tile { keys: key_h, norms: upload_f32(&norms), vals: upload_f32(&vals_f), len: vals.len() }
+        Tile { keys: key_h, scales: None, norms: upload_f32(&norms), vals: upload_f32(&vals_f), len: vals.len() }
+    }
+
+    /// An int8 tile from quantised rows `q` ([rows, d] bytes) and their scales; norms are those of the f16 values the matmul sees.
+    fn tile_of_int8(&self, q: &[u8], scales: &[f32], vals: &[u16]) -> Tile {
+        let (d, rows) = (self.d, vals.len());
+        let rp = rows.next_multiple_of(16);
+        let norms: Vec<f32> = q.chunks_exact(d).zip(scales).map(|(k, &s)| k.iter().map(|&b| f16::from_f32(b as i8 as f32 * s).to_f32().powi(2)).sum()).collect();
+        let (mut qp, mut sp) = (q.to_vec(), scales.to_vec());
+        qp.resize(rp * d, 0);
+        sp.resize(rp, 0.0);
+        let vals_f: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
+        Tile { keys: client().create_from_slice(&qp), scales: Some(upload_f32(&sp)), norms: upload_f32(&norms), vals: upload_f32(&vals_f), len: rows }
+    }
+
+    /// Rows row0..row0 + rows (multiples of 16) of tile `t` as f16 for the matmul: (handle, first row in it).
+    fn rows_f16(&self, t: &Tile, row0: usize, rows: usize) -> (Handle, usize) {
+        let Some(scales) = &t.scales else { return (t.keys.clone(), row0) };
+        let (d4, total) = (self.d / 4, rows * self.d / 4);
+        let out = client().empty(rows * self.d * 2);
+        crate::gpu_step::count_launch();
+        k_dequant::launch(client(), cubes(total), CubeDim::new_1d(EW_DIM), buf(&t.keys, t.len.next_multiple_of(16) * self.d / 4), buf(scales, t.len.next_multiple_of(16)), buf(&out, rows * self.d), row0 as u32, d4 as u32, total as u32);
+        (out, 0)
     }
 
     /// Device copy of `keys` (row-major [n, d]) in the store's precision, and the norms of what was stored. The f16 copy
@@ -332,7 +376,8 @@ impl KnnStore {
                 continue;
             }
             let t0 = std::time::Instant::now();
-            self.dots(&t.keys, 0, t.len, &qh, 0, &dist, self.tile * qp, 0, q, qp);
+            let (kh, r0) = self.rows_f16(t, 0, t.len.next_multiple_of(16));
+            self.dots(&kh, r0, t.len, &qh, 0, &dist, self.tile * qp, 0, q, qp);
             if timing {
                 read(&hi);
                 t_mm += t0.elapsed();
@@ -480,6 +525,23 @@ fn k_thresh(d: &[f32], norms: &[f32], best: &mut [f32], lo: &[u32], hi: &[u32], 
                     best[(base + p) as usize] = dist;
                 }
             }
+        }
+    }
+}
+
+/// Rows row0.. of an int8 tile (4 values per u32 word) times their scales, as f16.
+#[cube(launch)]
+fn k_dequant(q: &[u32], scale: &[f32], out: &mut [f16], row0: u32, d4: u32, total: u32) {
+    let i = ABSOLUTE_POS as u32;
+    if i < total {
+        let w = q[(row0 * d4 + i) as usize];
+        let s = scale[(row0 + i / d4) as usize];
+        for b in 0..4u32 {
+            let mut v = f32::cast_from((w >> (8 * b)) & 255);
+            if v > 127.0 {
+                v -= 256.0;
+            }
+            out[(i * 4 + b) as usize] = f16::cast_from(v * s);
         }
     }
 }
