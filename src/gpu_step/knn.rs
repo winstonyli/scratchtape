@@ -39,6 +39,11 @@ const SAMPLE_STRIDE: usize = 61;
 const SS: u32 = SAMPLE_STRIDE as u32;
 const THRESH_RANK: usize = 32;
 const TR: u32 = THRESH_RANK as u32;
+/// Which of a masked search's sample keys (nearest first) sets its threshold. A query's 256 nearest hold ~256 / SAMPLE_STRIDE = 4.2
+/// sample keys on average (Poisson), so rank 20 fails (fewer than `KMAX` keys under it, the block is searched again) about 2e-8 of
+/// the time in theory (measured: 8 of ~250k queries in half 1, each retried at rank 32) while passing ~1200 keys, against ~2000 at rank
+/// 32. A miss retries at `THRESH_RANK`, then without thresholds, which loses the device on ranges of tens of thousands of keys.
+const TAIL_RANK: usize = 20;
 
 struct Tile {
     /// f16 [rows padded to 16, d]; with `scales`, `kbits`-bit integers instead (packed, low bits first), times the row's scale.
@@ -319,7 +324,8 @@ impl KnnStore {
             let block = &queries[q0 * self.d..(q0 + q) * self.d];
             let rg = &ranges[q0..q0 + q];
             let parts = forced.unwrap_or((THREADS / q).clamp(8, 32));
-            let found = self.search_block(block, q, rg, always, parts, true, from_key, tail.as_ref()).unwrap_or_else(|| self.search_block(block, q, rg, always, parts, false, from_key, tail.as_ref()).unwrap());
+            // Tightest threshold first; a miss (some query had fewer than KMAX keys under it) retries at the next looser rank.
+            let found = [Some(TAIL_RANK), Some(THRESH_RANK), None].into_iter().find_map(|rank| self.search_block(block, q, rg, always, parts, rank, from_key, tail.as_ref())).unwrap();
             out.extend(found);
         }
         if std::env::var_os("KNN_WALL").is_some() {
@@ -360,9 +366,9 @@ impl KnnStore {
         dev.1.clone()
     }
 
-    /// One block of `q` queries. With `thresholds`, returns None when some query's threshold left fewer than `KMAX` keys.
+    /// One block of `q` queries. With a threshold `rank`, returns None when some query's threshold left fewer than `KMAX` keys.
     #[allow(clippy::too_many_arguments)]
-    fn search_block(&self, block: &[f32], q: usize, ranges: &[(u32, u32)], always: u32, parts: usize, thresholds: bool, from_key: usize, tail: Option<&Tile>) -> Option<Vec<(f32, u16)>> {
+    fn search_block(&self, block: &[f32], q: usize, ranges: &[(u32, u32)], always: u32, parts: usize, rank: Option<usize>, from_key: usize, tail: Option<&Tile>) -> Option<Vec<(f32, u16)>> {
         // Queries as the matmul wants them: f32 [q, d], or (f16) rounded, transposed to [d, qp] and padded to a multiple of 16.
         let qp = if self.f16 { q.next_multiple_of(16) } else { q };
         let rounded: Vec<f32>;
@@ -379,6 +385,7 @@ impl KnnStore {
         let lo = client().create_from_slice(u32::as_bytes(&ranges.iter().map(|r| r.0).collect::<Vec<_>>()));
         let hi = client().create_from_slice(u32::as_bytes(&ranges.iter().map(|r| r.1).collect::<Vec<_>>()));
         // KNN_TIMING=1: sync between stages (a read of a small buffer waits for the queue) and report their wall time.
+        let thresholds = rank.is_some();
         let timing = std::env::var_os("KNN_TIMING").is_some();
         let (mut t_mm, mut t_topk) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         if timing {
@@ -420,7 +427,7 @@ impl KnnStore {
         let t0 = std::time::Instant::now();
         let thr = if thresholds { read(&thr_d) } else { vec![] };
         // The kernel's starting threshold per query (infinity: none).
-        let thr_q: Vec<f32> = (0..q).map(|r| if thresholds { widen(rank_of_parts(&thr, r, q, parts)) } else { f32::INFINITY }).collect();
+        let thr_q: Vec<f32> = (0..q).map(|r| if thresholds { widen(rank_of_parts(&thr, r, q, parts, rank.unwrap())) } else { f32::INFINITY }).collect();
         let thr_buf = upload_f32(&thr_q);
         stage[2] = t0.elapsed();
         let t_pass1 = t_start.elapsed();
@@ -488,7 +495,7 @@ impl KnnStore {
             let c: Vec<(f32, f32)> = (0..KMAX).map(|j| (bd[r * KMAX + j], bv[r * KMAX + j])).collect();
             if thr_q[r].is_finite() && c[KMAX - 1].0.is_infinite() {
                 if timing {
-                    eprintln!("knn: query {r} had fewer than {KMAX} keys under its threshold {}", thr_q[r]);
+                    eprintln!("knn: query {r} had fewer than {KMAX} keys under its rank-{rank:?} threshold {}", thr_q[r]);
                 }
                 return None;
             }
@@ -548,10 +555,10 @@ fn k_dots_cmma(a: &[f16], b: &[f16], out: &mut [f32], #[comptime] k: u32, n: u32
     cmma::store(&mut out[o_off..len], &c, n, cmma::MatrixLayout::RowMajor);
 }
 
-/// The `THRESH_RANK`-th smallest of query r's per-part lists in `thr` (`parts` lists of `THRESH_RANK`, thread order).
-fn rank_of_parts(thr: &[f32], r: usize, q: usize, parts: usize) -> f32 {
+/// The `rank`-th smallest of query r's per-part lists in `thr` (`parts` lists of `THRESH_RANK`, thread order).
+fn rank_of_parts(thr: &[f32], r: usize, q: usize, parts: usize, rank: usize) -> f32 {
     let mut c: Vec<f32> = (0..parts).flat_map(|p| thr[(p * q + r) * THRESH_RANK..][..THRESH_RANK].iter().copied()).collect();
-    *c.select_nth_unstable_by(THRESH_RANK - 1, |a, b| a.partial_cmp(b).unwrap()).1
+    *c.select_nth_unstable_by(rank - 1, |a, b| a.partial_cmp(b).unwrap()).1
 }
 
 /// Pass 1: the `THRESH_RANK` nearest sample keys of each (query, part) thread (ascending, in `best`, `TR` per thread;

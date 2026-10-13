@@ -102,7 +102,7 @@ evaluation, lexicon + word bigram + online kNN memory; held-out CE, nats/byte, h
 1.0165 / 1.1146, full stack **0.9793 / 1.0729**. The memory holds 36.7M keys of 40 novels as 4-bit integers (one scale per
 key, 4.7 GB on the device) and is searched approximately (IVF: 4096 cells, 8 probes, recall of the exact top-128 0.99).
 Building it takes ~145 s (whitening on the device) and is cached on disk (`memcache=<dir>`, 14 s to reload); a scored
-held-out half takes ~60 s. The tiers never alter the adaptation, so their searches are batched.
+held-out half takes ~52 s. The tiers never alter the adaptation, so their searches are batched.
 
 ## Quick start
 

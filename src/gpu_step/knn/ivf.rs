@@ -122,6 +122,44 @@ fn k_gather_q(src: &[f16], dst: &mut [f16], pq: &[u32], pdst: &[u32], pstride: &
     }
 }
 
+/// Most cells one query probes.
+const PROBE_MAX: u32 = 16;
+
+/// Query i's `nprobe` nearest cells, nearest first, as f32 ids at out[i * nprobe..]: dist is the [nl16, qp] centroid dot products
+/// (cell c, query i at c * qp + i), cnorm the squared centroid norms.
+#[cube(launch)]
+fn k_probe(dist: &[f32], cnorm: &[f32], out: &mut [f32], q: u32, qp: u32, nl: u32, nprobe: u32) {
+    let i = ABSOLUTE_POS as u32;
+    if i < q {
+        let mut bd = Array::<f32>::new(PROBE_MAX as usize);
+        let mut bi = Array::<u32>::new(PROBE_MAX as usize);
+        for k in 0..PROBE_MAX {
+            bd[k as usize] = 3.0e38f32;
+            bi[k as usize] = 0u32;
+        }
+        for c in 0..nl {
+            let dd = cnorm[c as usize] - 2.0 * dist[(c * qp + i) as usize];
+            if dd < bd[(nprobe - 1) as usize] {
+                let mut p = nprobe - 1;
+                for _s in 0..PROBE_MAX {
+                    if p > 0 {
+                        if bd[(p - 1) as usize] > dd {
+                            bd[p as usize] = bd[(p - 1) as usize];
+                            bi[p as usize] = bi[(p - 1) as usize];
+                            p -= 1;
+                        }
+                    }
+                }
+                bd[p as usize] = dd;
+                bi[p as usize] = c;
+            }
+        }
+        for k in 0..nprobe {
+            out[(i * nprobe + k) as usize] = f32::cast_from(bi[k as usize]);
+        }
+    }
+}
+
 /// Pass 1 of the scan: thread t = (part t / nq, query t % nq) keeps the `TR` nearest of every `SAMP`-th row of its part of
 /// query gi's row ranges (laid out as in `k_scan`), ascending, at thr_d[t * TR].
 #[allow(clippy::too_many_arguments)]
@@ -467,46 +505,26 @@ impl KnnStore {
     pub fn search_ivf(&self, queries: &[f32], rows: usize, nprobe: usize) -> Vec<(f32, u16)> {
         let ivf = self.ivf.as_ref().expect("search_ivf needs build_ivf");
         let (d, nl) = (self.d, ivf.nlist);
-        assert!(queries.len() == rows * d && nprobe >= 1 && nprobe <= nl);
+        assert!(queries.len() == rows * d && nprobe >= 1 && nprobe <= nl && nprobe <= PROBE_MAX as usize);
         let rq: Vec<f16> = queries.iter().map(|&x| f16::from_f32(x)).collect();
         let rq_dev = client().create_from_slice(f16::as_bytes(&rq));
         // Each query's nprobe nearest cells, nearest first.
         let t0 = std::time::Instant::now();
         let nl16 = nl.next_multiple_of(16);
         let mut probes = vec![0u32; rows * nprobe];
-        // A block's distances to the centroids, [nl16, qp], and its padded width.
-        let fetch = |q0: usize| {
+        let cnorm = upload_f32(&ivf.norm);
+        for q0 in (0..rows).step_by(QBLOCK) {
             let q = QBLOCK.min(rows - q0);
             let (qh, qp) = transposed_f16(&rq[q0 * d..(q0 + q) * d], d);
             let dist = self.scratch(S_CENT, nl16 * qp * 4);
             self.dots(&ivf.keys, 0, nl, &qh, 0, &dist, nl16 * qp, 0, q, qp);
-            (read(&dist), qp)
-        };
-        let starts: Vec<usize> = (0..rows).step_by(QBLOCK).collect();
-        let mut cur = Some(fetch(0));
-        for (bi, &q0) in starts.iter().enumerate() {
-            let q = QBLOCK.min(rows - q0);
-            let (dd, qp) = cur.take().unwrap();
-            // Queries are independent: a few threads (the CPU is shared) each take a slice of the block, while this thread
-            // fetches the next block's distances from the device.
-            let per = q.div_ceil(8).max(1);
-            let (dd, norm) = (&dd, &ivf.norm);
-            std::thread::scope(|sc| {
-                for (b, out) in probes[q0 * nprobe..(q0 + q) * nprobe].chunks_mut(per * nprobe).enumerate() {
-                    sc.spawn(move || {
-                        let mut scored: Vec<(f32, u32)> = Vec::with_capacity(nl);
-                        for (r, o) in out.chunks_mut(nprobe).enumerate() {
-                            let i = b * per + r;
-                            scored.clear();
-                            scored.extend((0..nl).map(|c| (norm[c] - 2.0 * dd[c * qp + i], c as u32)));
-                            scored.select_nth_unstable_by(nprobe - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
-                            scored[..nprobe].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                            o.iter_mut().zip(&scored).for_each(|(o, &(_, c))| *o = c);
-                        }
-                    });
-                }
-                cur = starts.get(bi + 1).map(|&n0| fetch(n0));
-            });
+            let out = client().empty(q * nprobe * 4);
+            crate::gpu_step::count_launch();
+            #[rustfmt::skip]
+            k_probe::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(&dist, nl16 * qp), buf(&cnorm, nl), buf(&out, q * nprobe), q as u32, qp as u32, nl as u32, nprobe as u32);
+            for (o, &c) in probes[q0 * nprobe..(q0 + q) * nprobe].iter_mut().zip(&read(&out)) {
+                *o = c as u32;
+            }
         }
         let t_probe = t0.elapsed();
         // Queries per group so that a group's matmul outputs fit the workspace (cells average n / nl rows).
@@ -671,7 +689,7 @@ impl KnnStore {
             #[rustfmt::skip]
             k_sample::launch(client(), cubes(PARTS * nq), CubeDim::new_1d(EW_DIM), buf(ws, WS_FLOATS), buf(&ivf.norms, ivf.n), buf(&thr_d, PARTS * nq * THRESH_RANK), buf(&q_off, nq + 1), buf(&v_base, nv), buf(&v_stride, nv), buf(&v_g0, nv), buf(&v_len, nv), nq as u32, PARTS as u32);
             let thr = read(&thr_d);
-            (0..nq).map(|gi| widen(rank_of_parts(&thr, gi, nq, PARTS))).collect()
+            (0..nq).map(|gi| widen(rank_of_parts(&thr, gi, nq, PARTS, THRESH_RANK))).collect()
         } else {
             vec![f32::INFINITY; nq]
         };
