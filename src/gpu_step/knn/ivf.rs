@@ -17,6 +17,7 @@ const WS_FLOATS: usize = 64 << 20;
 const SAMP: u32 = 32;
 /// Lloyd iterations on the key sample.
 const KMEANS_ITERS: usize = 10;
+const ARGMIN_DIM: u32 = 256;
 
 pub(super) struct Ivf {
     /// Centroids as a device key tile (f16, rounded as the keys are) and their squared norms.
@@ -65,21 +66,44 @@ impl Cent {
     }
 }
 
-/// out[j] = the index (as f32) of the centroid i minimising cnorm[i] - 2 dist[j, i], for j < len.
+/// out[j] = the index (as f32) of the centroid i minimising cnorm[i] - 2 dist[j, i], for j < len. One cube of `ARGMIN_DIM` threads per
+/// row j: the threads read the row's columns together (coalesced; a thread per row strides `ld` floats between neighbours, 14x slower)
+/// and reduce through shared memory; ties go to the lowest index.
 #[cube(launch)]
-fn k_argmin(dist: &[f32], cnorm: &[f32], out: &mut [f32], ld: u32, nc: u32, len: u32) {
-    let j = ABSOLUTE_POS as u32;
-    if j < len {
-        let mut best = 1.0e30f32;
-        let mut bi = 0u32;
-        for i in 0..nc {
+fn k_argmin(dist: &[f32], cnorm: &[f32], out: &mut [f32], ld: u32, nc: u32) {
+    let j = CUBE_POS_X;
+    let t = UNIT_POS;
+    let mut best = 1.0e30f32;
+    let mut bi = 0u32;
+    for s in 0..(nc + ARGMIN_DIM - 1) / ARGMIN_DIM {
+        let i = s * ARGMIN_DIM + t;
+        if i < nc {
             let sc = cnorm[i as usize] - 2.0 * dist[(j * ld + i) as usize];
             if sc < best {
                 best = sc;
                 bi = i;
             }
         }
-        out[j as usize] = f32::cast_from(bi);
+    }
+    let mut score = Shared::<[f32]>::new_slice(ARGMIN_DIM as usize);
+    let mut index = Shared::<[u32]>::new_slice(ARGMIN_DIM as usize);
+    score[t as usize] = best;
+    index[t as usize] = bi;
+    sync_cube();
+    #[unroll]
+    for r in 0..8u32 {
+        let half = ARGMIN_DIM >> (r + 1);
+        if t < half {
+            let (o, m) = (score[(t + half) as usize], score[t as usize]);
+            if o < m || (o == m && index[(t + half) as usize] < index[t as usize]) {
+                score[t as usize] = o;
+                index[t as usize] = index[(t + half) as usize];
+            }
+        }
+        sync_cube();
+    }
+    if t == 0 {
+        out[j as usize] = f32::cast_from(index[0usize]);
     }
 }
 
@@ -225,7 +249,7 @@ impl KnnStore {
         self.dots(keys, a_row0, len, &c.qh, 0, dist, self.tile * c.qp, 0, c.nlist, c.qp);
         let out = client().empty(len * 4);
         crate::gpu_step::count_launch();
-        k_argmin::launch(client(), cubes(len), CubeDim::new_1d(EW_DIM), buf(dist, self.tile * c.qp), buf(&c.norm, c.nlist), buf(&out, len), c.qp as u32, c.nlist as u32, len as u32);
+        k_argmin::launch(client(), CubeCount::Static(len as u32, 1, 1), CubeDim::new_1d(ARGMIN_DIM), buf(dist, self.tile * c.qp), buf(&c.norm, c.nlist), buf(&out, len), c.qp as u32, c.nlist as u32);
         read(&out).iter().map(|&x| x as u32).collect()
     }
 
@@ -663,5 +687,28 @@ mod tests {
         assert_eq!(extra, 7);
         assert_eq!(a.search(&queries, rows), b.search(&queries, rows));
         assert_eq!(a.search_ivf(&queries, rows, 2), b.search_ivf(&queries, rows, 2));
+    }
+
+    /// The device's nearest centroid of each key equals a CPU argmin over the same f16-rounded values (cell counts that are not a
+    /// multiple of the reduction width, and duplicate centroids, whose tie must go to the lowest index).
+    #[test]
+    fn nearest_centroid_matches_cpu_argmin() {
+        let (d, rows, nlist) = (32usize, 300usize, 700usize);
+        let mut rng = Rng::new(9);
+        let keys: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
+        let mut cent: Vec<f32> = (0..nlist * d).map(|_| rng.next_gaussian()).collect();
+        let dup = cent[3 * d..4 * d].to_vec();
+        cent[650 * d..651 * d].copy_from_slice(&dup);
+        let store = KnnStore::new(d, 1024);
+        let (kh, _) = store.upload_keys(&keys);
+        let c = Cent::new(&cent, d);
+        let dist = client().empty(1024 * c.qp * 4);
+        let got = store.nearest_centroid(&kh, 0, rows, &c, &dist);
+        let r = |x: f32| f16::from_f32(x).to_f32();
+        for (j, &g) in got.iter().enumerate() {
+            let score = |i: usize| c.norm_host[i] - 2.0 * (0..d).map(|k| r(keys[j * d + k]) * r(cent[i * d + k])).sum::<f32>();
+            let best = (0..nlist).map(score).fold(f32::MAX, f32::min);
+            assert!(score(g as usize) <= best + 1e-3 * (1.0 + best.abs()), "row {j}: picked {g} with {} vs best {best}", score(g as usize));
+        }
     }
 }

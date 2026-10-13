@@ -1352,3 +1352,11 @@ each key's norm with it instead of recomputing from the packed bytes (`tile_of_q
 host copy + norms 49 -> 23 s, IVF reorder 56 -> 20 s, memory build 605 -> **277 s** with whitening on the device (forward + readback 75 s, k-means +
 assignment 151 s); CE 0.9793 and recall 0.9913 unchanged. What is left of a cold build is k-means + assignment (151 s, matmul-bound: ~77 TFLOP at ~1.5 TFLOPS)
 and forward + readback (75 s).
+
+**Survey result: the matmul was not the bottleneck; `k_argmin` was (2026-10-13).** Timing the pieces in isolation (16384 keys x 256 x 1024 queries): the current `k_dots_cmma`
+runs at 11-12 TFLOPS (not the ~1.5 inferred end to end), and the shared-memory tiled training `matmul` at 17-19 TFLOPS (1.5-1.7x). The assignment step per 16384-key tile
+against 4096 centroids cost dots 3.1 ms, but `k_argmin` **43 ms** (one thread per row, neighbours `ld` floats apart: uncoalesced), i.e. ~100 s of the 151 s
+"k-means + assignment". `k_argmin` is now one 256-thread cube per row reducing through shared memory (0.9 ms; test `nearest_centroid_matches_cpu_argmin`).
+novels40 4-bit half 0, cold: k-means + assignment 151 -> **28.7 s**, memory build 277 -> **145 s** (605 s before the memcache/whitening/host-copy work), CE 0.9793 and
+recall 0.9913 unchanged. A faster matmul kernel for `dots` would now save only a few seconds of the remaining 29 s (parked: not worth a new f16-input tiled kernel).
+Remaining cold build: forward + readback 69 s, IVF 55 s (k-means + assignment 29 s, reorder 19 s), host copy + norms 21 s.
