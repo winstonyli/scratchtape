@@ -74,6 +74,8 @@ pub struct KnnStore {
     kbits: u32,
     /// Set by `build_ivf`: the first keys are clustered for `search_ivf`.
     ivf: Option<ivf::Ivf>,
+    /// Most key rows `search_ivf` dequantises at once (a test lowers it to force several chunks).
+    chunk_rows: usize,
 }
 
 /// Scratch slots of `KnnStore::scratch`.
@@ -129,6 +131,7 @@ impl KnnStore {
             scratch: RefCell::new(vec![(0, None); S_COUNT]),
             ivf: None,
             kbits: 0,
+            chunk_rows: ivf::SCRATCH_ROWS,
         }
     }
 

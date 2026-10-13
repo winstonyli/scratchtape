@@ -19,7 +19,7 @@ const SAMP: u32 = 32;
 const KMEANS_ITERS: usize = 10;
 const ARGMIN_DIM: u32 = 256;
 /// Most rows dequantised into the scratch at once by `scan_group` (128 MB of f16 at d = 256).
-const SCRATCH_ROWS: usize = 262144;
+pub(super) const SCRATCH_ROWS: usize = 262144;
 /// Cubes per row of a grouped matmul launch (a launch dimension is limited to 65535).
 const GROUP_GX: u32 = 8192;
 
@@ -582,7 +582,7 @@ impl KnnStore {
         while p0 < items.len() {
             let (tile, start) = (items[p0].0, items[p0].1);
             let (mut end, mut p1) = (start, p0);
-            while p1 < items.len() && items[p1].0 == tile && (p1 == p0 || end.max(items[p1].1 + items[p1].2) - start <= SCRATCH_ROWS) {
+            while p1 < items.len() && items[p1].0 == tile && (p1 == p0 || end.max(items[p1].1 + items[p1].2) - start <= self.chunk_rows) {
                 let (_, base, rows16, b_off, off, qp) = items[p1];
                 end = end.max(base + rows16);
                 desc.extend([(base - start) as u32, qp as u32, b_off as u32, off as u32]);
@@ -756,6 +756,9 @@ mod tests {
                 assert!((x - y).abs() < 2e-3 * (1.0 + x), "query {r} rank {j}: {bits}-bit exact {x} vs all-cell ivf {y}");
             }
         }
+        // Several chunks per group (a few hundred rows each) answer the same as one.
+        q.chunk_rows = 256;
+        assert_eq!(q.search_ivf(&queries, rows, nlist), all);
     }
 
     /// A saved and reloaded store (4-bit keys, IVF built) answers exactly as the original, and a different key string misses.
