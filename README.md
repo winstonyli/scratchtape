@@ -99,7 +99,7 @@ are chosen by what they say about the tiers and how they connect.
 
 Current best stack (2026-10-12, `docs/tiers_design.md`; seq-128 byte model trained on 64M windows, dynamic
 evaluation, lexicon + word bigram + online kNN memory; held-out CE, nats/byte, halves 0 / 1): model alone
-1.0165 / 1.1146, full stack **0.9792 / 1.0728**. The memory holds 36.7M keys of 18 extra novels as int8 (one scale per key) and
+1.0165 / 1.1146, full stack **0.9792 / 1.0728**. The memory holds 36.7M keys of 40 novels as int8 (one scale per key) and
 is searched approximately (IVF: 4096 cells, 8 probes, recall of the exact top-128 0.99), so the whole held-out half takes
 ~3 min instead of ~9 for an exact 6.4M-key search. The tiers never alter the adaptation, so their searches are batched.
 

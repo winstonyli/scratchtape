@@ -297,9 +297,9 @@ impl KnnStore {
             })
             .collect();
         // Reorder through the host, then replace the tiles.
-        // (int8 keys move as bytes with their scales; f16 keys as halves, re-uploaded as f32.)
-        let esize = if self.int8 { 1 } else { 2 };
-        let (mut keys, mut scales, mut vals) = (vec![0u8; n * d * esize], vec![0f32; if self.int8 { n } else { 0 }], vec![0u16; n]);
+        // (Quantised keys move as packed bytes with their scales; f16 keys as halves, re-uploaded as f32.)
+        let kb = if self.kbits > 0 { self.key_bytes() } else { 2 * d };
+        let (mut keys, mut scales, mut vals) = (vec![0u8; n * kb], vec![0f32; if self.kbits > 0 { n } else { 0 }], vec![0u16; n]);
         let mut i = 0;
         for t in &self.tiles {
             let bytes = client().read_one(t.keys.clone()).unwrap();
@@ -307,7 +307,7 @@ impl KnnStore {
             let sc = t.scales.as_ref().map(read);
             for j in 0..t.len {
                 let to = dest[i + j];
-                keys[to * d * esize..(to + 1) * d * esize].copy_from_slice(&bytes[j * d * esize..(j + 1) * d * esize]);
+                keys[to * kb..(to + 1) * kb].copy_from_slice(&bytes[j * kb..(j + 1) * kb]);
                 if let Some(sc) = &sc {
                     scales[to] = sc[j];
                 }
@@ -316,9 +316,9 @@ impl KnnStore {
             i += t.len;
         }
         self.tiles.clear();
-        for (ci, (kb, vb)) in keys.chunks(self.tile * d * esize).zip(vals.chunks(self.tile)).enumerate() {
-            let tile = if self.int8 {
-                self.tile_of_int8(kb, &scales[ci * self.tile..][..vb.len()], vb)
+        for (ci, (kb, vb)) in keys.chunks(self.tile * kb).zip(vals.chunks(self.tile)).enumerate() {
+            let tile = if self.kbits > 0 {
+                self.tile_of_quant(kb, &scales[ci * self.tile..][..vb.len()], vb)
             } else {
                 let kf: Vec<f32> = f16::from_bytes(kb).iter().map(|x| x.to_f32()).collect();
                 self.tile_of(&kf, vb)
@@ -601,9 +601,15 @@ mod tests {
         assert!(recall > 0.8, "recall {recall} with 2 of {nlist} cells");
     }
 
-    /// int8 keys: the same search to within the rounding, and probing every cell equals the exact int8 search.
+    /// Quantised keys (8 and 4 bits): the same search to within the rounding, and probing every cell equals the exact quantised search.
     #[test]
-    fn int8_keys_search_like_f16_keys() {
+    fn quantised_keys_search_like_f16_keys() {
+        for (bits, tol) in [(8u32, 0.05f32), (4, 0.4)] {
+            quantised_case(bits, tol);
+        }
+    }
+
+    fn quantised_case(bits: u32, tol: f32) {
         let (d, n, rows, nlist) = (32, 12_000, 100, 4);
         let mut rng = Rng::new(5);
         let keys: Vec<f32> = (0..n * d).map(|_| rng.next_gaussian()).collect();
@@ -613,14 +619,14 @@ mod tests {
         f.add(&keys, &vals);
         f.finish();
         let mut q = KnnStore::with_precision(d, 4096, true);
-        q.set_int8();
+        q.set_key_bits(bits);
         q.add(&keys, &vals);
         q.finish();
         let (a, b) = (f.search(&queries, rows), q.search(&queries, rows));
         for r in 0..rows {
             for j in [0, 10, KMAX - 1] {
                 let (x, y) = (a[r * KMAX + j].0, b[r * KMAX + j].0);
-                assert!((x - y).abs() < 0.05 * (1.0 + x), "query {r} rank {j}: f16 {x} vs int8 {y}");
+                assert!((x - y).abs() < tol * (1.0 + x), "query {r} rank {j}: f16 {x} vs {bits}-bit {y}");
             }
         }
         q.build_ivf(nlist);
@@ -629,7 +635,7 @@ mod tests {
         for r in 0..rows {
             for j in 0..KMAX {
                 let (x, y) = (c[r * KMAX + j].0, all[r * KMAX + j].0);
-                assert!((x - y).abs() < 2e-3 * (1.0 + x), "query {r} rank {j}: int8 exact {x} vs all-cell ivf {y}");
+                assert!((x - y).abs() < 2e-3 * (1.0 + x), "query {r} rank {j}: {bits}-bit exact {x} vs all-cell ivf {y}");
             }
         }
     }

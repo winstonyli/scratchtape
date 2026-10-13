@@ -1330,3 +1330,10 @@ Evals (`scripts/`-style: seq 128, dynamic evaluation 4 x 0.05, `batch=128`, full
 -0.0045); stack with the novels40 memory (`int8=1 ivf=4096:8`) **0.9792 / 1.0728** (32M half 0: 0.9841, -0.0049). Recall of the exact
 top-128 0.987-0.999. Against the store-50000 exact stack this work started from (0.9941 / 1.0860) the best stack is now -0.0149 /
 -0.0132, with an eval of ~3 min instead of ~9. Doubling the training windows is worth about -0.005 on the stack (-0.008 on the model alone).
+
+**4-bit keys.** `set_key_bits(bits)` generalises the int8 storage to 8 or 4 bits (two values per byte, one scale per key; `tier_eval
+keybits=8|4` replaces `int8=1`; test `quantised_keys_search_like_f16_keys`). The 64M-window model, half 0, `novels40` memory (36.7M keys),
+IVF 4096x8: **CE 0.9793 at 4 bits against 0.9792 at 8 bits** (f16 would be 18.8 GB; 8 bits 9.4 GB; 4 bits **4.7 GB**), recall 0.991, eval
+195 s. Keys cost nothing down to 4 bits, so the same VRAM now holds ~4x the f16 key count (~150M keys, ~1.2M windows, ~150 MB of
+text); the corpus, not the device, is again the limit: more text means more books (a download, not yet done), and the k-means
+build and its ~7 GB of host RAM per 37M keys would need checking at that size.
