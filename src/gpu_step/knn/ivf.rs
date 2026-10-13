@@ -634,7 +634,7 @@ impl KnnStore {
             p0 = p1;
         }
         if timing {
-            read(&ivf.vals);
+            read(&cube_start_dev);
             stage[0] += t0.elapsed();
         }
         // Per query, its pieces in probe order: workspace position of its column, row stride, first store row, rows.
