@@ -1346,3 +1346,9 @@ scalar code) plus the raw f32 readback: `forward()` now whitens on the device (`
 `apply_whitener` is deleted) and reads back whitened rows only. Cold build 370 s -> **129 s** (forward + readback 309 -> 74 s; host copy + norms 49-54 s
 unchanged); short-eval CE identical (1.0745 both). Quantising on the device before readback (to save the 4x readback) is not done: the
 remaining 74 s is mostly forward compute, and the host copy + norms (49 s) is the next largest phase.
+
+**Host-side build costs (2026-10-13).** Quantising and norming keys is per-row independent, so `tile_of` now spreads it over 8 threads, and the IVF reorder carries
+each key's norm with it instead of recomputing from the packed bytes (`tile_of_quant` takes norms; `unpack` deleted). novels40 4-bit, half 0, cold:
+host copy + norms 49 -> 23 s, IVF reorder 56 -> 20 s, memory build 605 -> **277 s** with whitening on the device (forward + readback 75 s, k-means +
+assignment 151 s); CE 0.9793 and recall 0.9913 unchanged. What is left of a cold build is k-means + assignment (151 s, matmul-bound: ~77 TFLOP at ~1.5 TFLOPS)
+and forward + readback (75 s).

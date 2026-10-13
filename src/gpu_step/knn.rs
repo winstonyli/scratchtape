@@ -111,19 +111,6 @@ impl KnnStore {
         self.d * self.kbits as usize / 8
     }
 
-    /// The signed values of a quantised key's packed bytes.
-    fn unpack<'a>(&self, row: &'a [u8]) -> impl Iterator<Item = i32> + 'a {
-        let four = self.kbits == 4;
-        (0..row.len() * if four { 2 } else { 1 }).map(move |j| {
-            if four {
-                let nib = (row[j / 2] >> (4 * (j % 2))) & 15;
-                nib as i32 - if nib > 7 { 16 } else { 0 }
-            } else {
-                row[j] as i8 as i32
-            }
-        })
-    }
-
     /// Appends keys (row-major [n, d]) and their values; full tiles are uploaded as they fill.
     pub fn add(&mut self, keys: &[f32], vals: &[u8]) {
         self.add_tagged(keys, vals, 0);
@@ -170,36 +157,47 @@ impl KnnStore {
     fn tile_of(&self, keys: &[f32], vals: &[u16]) -> Tile {
         let vals_f: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
         if self.kbits > 0 {
-            let d = self.d;
+            let (d, kb, rows, bits) = (self.d, self.key_bytes(), vals.len(), self.kbits);
             let levels = ((1 << (self.kbits - 1)) - 1) as f32;
-            let (mut q, mut scales) = (Vec::with_capacity(keys.len()), Vec::with_capacity(vals.len()));
-            for k in keys.chunks_exact(d) {
-                let scale = k.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-30) / levels;
-                let v = k.iter().map(|&x| (x / scale).round() as i32);
-                if self.kbits == 8 {
-                    q.extend(v.map(|x| x as i8 as u8));
-                } else {
-                    let v: Vec<i32> = v.collect();
-                    q.extend(v.chunks(2).map(|p| (p[0] & 15) as u8 | ((p[1] & 15) as u8) << 4));
+            let (mut q, mut scales, mut norms) = (vec![0u8; rows * kb], vec![0f32; rows], vec![0f32; rows]);
+            // Rows are independent: split them over a few threads (the CPU is shared, so not all cores).
+            let per = rows.div_ceil(8).max(1);
+            std::thread::scope(|sc| {
+                for (((kc, qc), scc), nc) in keys.chunks(per * d).zip(q.chunks_mut(per * kb)).zip(scales.chunks_mut(per)).zip(norms.chunks_mut(per)) {
+                    sc.spawn(move || {
+                        let mut v = vec![0i32; d];
+                        for (r, k) in kc.chunks_exact(d).enumerate() {
+                            let scale = k.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-30) / levels;
+                            for (o, &x) in v.iter_mut().zip(k) {
+                                *o = (x / scale).round() as i32;
+                            }
+                            let row = &mut qc[r * kb..(r + 1) * kb];
+                            if bits == 8 {
+                                row.iter_mut().zip(&v).for_each(|(b, &x)| *b = x as i8 as u8);
+                            } else {
+                                row.iter_mut().zip(v.chunks(2)).for_each(|(b, p)| *b = (p[0] & 15) as u8 | ((p[1] & 15) as u8) << 4);
+                            }
+                            scc[r] = scale;
+                            nc[r] = v.iter().map(|&x| f16::from_f32(x as f32 * scale).to_f32().powi(2)).sum();
+                        }
+                    });
                 }
-                scales.push(scale);
-            }
-            return self.tile_of_quant(&q, &scales, vals);
+            });
+            return self.tile_of_quant(&q, &scales, &norms, vals);
         }
         let (key_h, norms) = self.upload_keys(keys);
         Tile { keys: key_h, scales: None, norms: upload_f32(&norms), vals: upload_f32(&vals_f), len: vals.len() }
     }
 
-    /// A quantised tile from packed rows `q` ([rows, key_bytes] bytes) and their scales; norms are those of the f16 values the matmul sees.
-    fn tile_of_quant(&self, q: &[u8], scales: &[f32], vals: &[u16]) -> Tile {
+    /// A quantised tile from packed rows `q` ([rows, key_bytes] bytes), their scales and norms (those of the f16 values the matmul sees).
+    fn tile_of_quant(&self, q: &[u8], scales: &[f32], norms: &[f32], vals: &[u16]) -> Tile {
         let (kb, rows) = (self.key_bytes(), vals.len());
         let rp = rows.next_multiple_of(16);
-        let norms: Vec<f32> = q.chunks_exact(kb).zip(scales).map(|(k, &s)| self.unpack(k).map(|b| f16::from_f32(b as f32 * s).to_f32().powi(2)).sum()).collect();
         let (mut qp, mut sp) = (q.to_vec(), scales.to_vec());
         qp.resize(rp * kb, 0);
         sp.resize(rp, 0.0);
         let vals_f: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
-        Tile { keys: client().create_from_slice(&qp), scales: Some(upload_f32(&sp)), norms: upload_f32(&norms), vals: upload_f32(&vals_f), len: rows }
+        Tile { keys: client().create_from_slice(&qp), scales: Some(upload_f32(&sp)), norms: upload_f32(norms), vals: upload_f32(&vals_f), len: rows }
     }
 
     /// Rows row0..row0 + rows (multiples of 16) of tile `t` as f16 for the matmul: (handle, first row in it).

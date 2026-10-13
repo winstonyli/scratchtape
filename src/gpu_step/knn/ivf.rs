@@ -299,17 +299,19 @@ impl KnnStore {
         // Reorder through the host, then replace the tiles.
         // (Quantised keys move as packed bytes with their scales; f16 keys as halves, re-uploaded as f32.)
         let kb = if self.kbits > 0 { self.key_bytes() } else { 2 * d };
-        let (mut keys, mut scales, mut vals) = (vec![0u8; n * kb], vec![0f32; if self.kbits > 0 { n } else { 0 }], vec![0u16; n]);
+        let (mut keys, mut scales, mut norms, mut vals) = (vec![0u8; n * kb], vec![0f32; if self.kbits > 0 { n } else { 0 }], vec![0f32; if self.kbits > 0 { n } else { 0 }], vec![0u16; n]);
         let mut i = 0;
         for t in &self.tiles {
             let bytes = client().read_one(t.keys.clone()).unwrap();
             let v = read(&t.vals);
             let sc = t.scales.as_ref().map(read);
+            let nm = if sc.is_some() { read(&t.norms) } else { vec![] };
             for j in 0..t.len {
                 let to = dest[i + j];
                 keys[to * kb..(to + 1) * kb].copy_from_slice(&bytes[j * kb..(j + 1) * kb]);
                 if let Some(sc) = &sc {
                     scales[to] = sc[j];
+                    norms[to] = nm[j];
                 }
                 vals[to] = v[j] as u16;
             }
@@ -318,7 +320,7 @@ impl KnnStore {
         self.tiles.clear();
         for (ci, (kb, vb)) in keys.chunks(self.tile * kb).zip(vals.chunks(self.tile)).enumerate() {
             let tile = if self.kbits > 0 {
-                self.tile_of_quant(kb, &scales[ci * self.tile..][..vb.len()], vb)
+                self.tile_of_quant(kb, &scales[ci * self.tile..][..vb.len()], &norms[ci * self.tile..][..vb.len()], vb)
             } else {
                 let kf: Vec<f32> = f16::from_bytes(kb).iter().map(|x| x.to_f32()).collect();
                 self.tile_of(&kf, vb)
