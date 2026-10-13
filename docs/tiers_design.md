@@ -1369,3 +1369,7 @@ change). What did help: (1) the tail (in-document) search ran the whole 600k-key
 keys inside the query ranges count; chunks outside the window `[min lo, max hi)` are now skipped like the tiles (block 360 -> 145 ms, ~16 s of the eval);
 (2) the per-query top-`nprobe` cell selection runs on 8 threads (~4 s). Of the 171 s eval, ~82 s is `search_ivf` (5 s per 16384 queries, GPU side: per-cell dequant
 + small matmuls + scan; not yet split without syncs), ~65 s other `search` calls (23 s of that is the `ivf_check` exact searches, a recall measurement; the rest the tail search).
+
+**Parked: quantise on the device before the readback (2026-10-13).** Device->host reads run at ~2.5 GB/s, so the 37.6 GB of f32 keys of a 37M-key build cost ~15 s of the 69 s
+"forward + hidden readback"; quantising first would save ~13 s of a cold build that the memory cache now makes a one-off. The rest is forward compute. Not worth a device-side
+`add` API; revisit only if cold builds of much larger memories become routine.
