@@ -20,23 +20,23 @@ const KMEANS_ITERS: usize = 10;
 
 pub(super) struct Ivf {
     /// Centroids as a device key tile (f16, rounded as the keys are) and their squared norms.
-    keys: Handle,
-    norm: Vec<f32>,
-    nlist: usize,
+    pub(super) keys: Handle,
+    pub(super) norm: Vec<f32>,
+    pub(super) nlist: usize,
     /// Clustered rows (the first `n` of the store), and their squared norms and values for the scan kernel.
-    n: usize,
-    norms: Handle,
-    vals: Handle,
+    pub(super) n: usize,
+    pub(super) norms: Handle,
+    pub(super) vals: Handle,
     /// Each cell as pieces of device tiles.
-    cells: Vec<Vec<Piece>>,
+    pub(super) cells: Vec<Vec<Piece>>,
 }
 
 /// Rows a..b of device tile `tile`, which are store rows g0..g0 + (b - a).
-struct Piece {
-    tile: usize,
-    a: usize,
-    b: usize,
-    g0: usize,
+pub(super) struct Piece {
+    pub(super) tile: usize,
+    pub(super) a: usize,
+    pub(super) b: usize,
+    pub(super) g0: usize,
 }
 
 impl Piece {
@@ -638,5 +638,28 @@ mod tests {
                 assert!((x - y).abs() < 2e-3 * (1.0 + x), "query {r} rank {j}: {bits}-bit exact {x} vs all-cell ivf {y}");
             }
         }
+    }
+
+    /// A saved and reloaded store (4-bit keys, IVF built) answers exactly as the original, and a different key string misses.
+    #[test]
+    fn saved_store_reloads_identically() {
+        let (d, n, rows, nlist) = (32, 20_000, 64, 4);
+        let mut rng = Rng::new(9);
+        let keys: Vec<f32> = (0..n * d).map(|_| rng.next_gaussian()).collect();
+        let vals: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let queries: Vec<f32> = (0..rows * d).map(|_| rng.next_gaussian()).collect();
+        let mut a = KnnStore::with_precision(d, 4096, true);
+        a.set_key_bits(4);
+        a.add(&keys, &vals);
+        a.finish();
+        a.build_ivf(nlist);
+        let path = std::env::temp_dir().join(format!("knn_cache_test_{}.mem", std::process::id()));
+        a.save(&path, "key one", 7).unwrap();
+        assert!(KnnStore::load(&path, "key two").unwrap().is_none());
+        let (b, extra) = KnnStore::load(&path, "key one").unwrap().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(extra, 7);
+        assert_eq!(a.search(&queries, rows), b.search(&queries, rows));
+        assert_eq!(a.search_ivf(&queries, rows, 2), b.search_ivf(&queries, rows, 2));
     }
 }

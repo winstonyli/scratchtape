@@ -1117,7 +1117,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
-            | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" | "keybits" => {
+            | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" | "keybits" | "memcache" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -1196,11 +1196,36 @@ fn main() {
         if let Some(a) = opt.get("whiten").map(|a| a.parse::<f64>().unwrap_or_else(|_| panic!("whiten=<alpha>, got {a}"))).filter(|&a| a > 0.0) {
             fit_whitener(&dev, &cfg, &train, tap, a, size("whiten_rank", &cfg.d.to_string()));
         }
-        let mut gpu = KnnStore::new(cfg.d, 16384);
-        if let Some(bits) = opt.get("keybits") {
-            gpu.set_key_bits(bits.parse().unwrap_or_else(|_| panic!("keybits=8|4, got {bits}")));
-        }
+        // `memcache=<dir>` (with `ivf`): the built memory is saved there once and reloaded by later runs with the same model and build options.
+        let cache = opt.get("memcache").zip(opt.get("ivf")).map(|(dir, ivf)| {
+            let meta = std::fs::metadata(ckpt).unwrap_or_else(|e| panic!("{ckpt}: {e}"));
+            let secs = meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+            let mut key = format!("v1 {ckpt} {} {secs} cells={}", meta.len(), ivf.split(':').next().unwrap_or(""));
+            for k in ["corpus", "memory_corpus", "seq", "warm", "stride", "offset", "whiten", "whiten_rank", "tap", "store", "store_from", "keybits", "memory", "d_model", "heads", "d_ff", "blocks"] {
+                key += &format!(" {k}={}", opt.get(k).map_or("", |v| v.as_str()));
+            }
+            let hash = key.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+            std::fs::create_dir_all(dir).expect("memcache dir");
+            (std::path::Path::new(dir).join(format!("{hash:016x}.mem")), key)
+        });
+        let t_cache = std::time::Instant::now();
+        let cached = cache.as_ref().and_then(|(path, key)| KnnStore::load(path, key).unwrap_or_else(|e| panic!("memcache {}: {e}", path.display())));
+        let hit = cached.is_some();
         let (mut n_train, mut n_held) = (0, 0);
+        let mut gpu = match cached {
+            Some((g, nt)) => {
+                n_train = nt as usize;
+                println!("memory loaded from {} in {:.1}s", cache.as_ref().unwrap().0.display(), t_cache.elapsed().as_secs_f64());
+                g
+            }
+            None => {
+                let mut g = KnnStore::new(cfg.d, 16384);
+                if let Some(bits) = opt.get("keybits") {
+                    g.set_key_bits(bits.parse().unwrap_or_else(|_| panic!("keybits=8|4, got {bits}")));
+                }
+                g
+            }
+        };
         let build = std::time::Instant::now();
         let mut t_fwd = std::time::Duration::ZERO;
         let mut load = |data: &[usize], starts: &[usize], doc: bool| {
@@ -1213,13 +1238,13 @@ fn main() {
                 if doc { gpu.add_doc(&f.hidden, &vals) } else { gpu.add(&f.hidden, &vals) }
             }
         };
-        if from != "held" && want > 0 {
+        if !hit && from != "held" && want > 0 {
             let total = (memory_train.len() - 1) / seq_len();
             let starts: Vec<usize> = (0..want.min(total)).map(|i| i * total / want.min(total) * seq_len()).collect();
             load(memory_train, &starts, false);
             n_train = starts.len();
         }
-        if from != "train" {
+        if !hit && from != "train" {
             let windows = (held_out.len() - 1) / seq_len();
             let unscored: Vec<usize> = (0..windows).filter(|i| causal || (i % stride != offset && i * spart_n / windows == spart_i)).map(|i| i * seq_len()).collect();
             let starts: Vec<usize> = if causal { unscored } else { (0..want.min(unscored.len())).map(|i| unscored[i * unscored.len() / want.min(unscored.len())]).collect() };
@@ -1230,9 +1255,16 @@ fn main() {
         let nprobe = opt.get("ivf").map(|v| {
             let (cells, probes) = v.split_once(':').unwrap_or_else(|| panic!("ivf=<cells>:<probes>, got {v}"));
             assert!(online && from == "train", "ivf needs memory=online and store_from=train");
-            gpu.build_ivf(cells.parse().unwrap());
+            if !hit {
+                gpu.build_ivf(cells.parse().unwrap());
+            }
             probes.parse::<usize>().unwrap()
         });
+        if let (false, Some((path, key))) = (hit, &cache) {
+            let t0 = std::time::Instant::now();
+            gpu.save(path, key, n_train as u64).unwrap_or_else(|e| panic!("memcache {}: {e}", path.display()));
+            println!("memory saved to {} in {:.1}s", path.display(), t0.elapsed().as_secs_f64());
+        }
         println!(
             "memory build: {:.1}s = forward + hidden readback {:.1}s, host copy + norms {:.1}s, upload {:.1}s, other {:.1}s",
             build.elapsed().as_secs_f64(),

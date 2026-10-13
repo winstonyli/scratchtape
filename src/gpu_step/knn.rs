@@ -12,6 +12,7 @@ use cubecl::server::Handle;
 use half::f16;
 use std::cell::RefCell;
 
+mod cache;
 mod ivf;
 
 /// Added to a value to mark an in-document key (`KnnStore::add_doc`).
