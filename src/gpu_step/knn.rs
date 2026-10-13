@@ -257,7 +257,7 @@ impl KnnStore {
 
     /// The `KMAX` nearest among keys j with lo_r <= j < hi_r for `ranges[r] = (lo_r, hi_r)`, where every `lo_r >= from_key`:
     /// only the tiles reaching `from_key` or beyond are scanned (the in-document keys of an online memory are its last
-    /// ones); the sample-threshold pass still runs, and is needed: without thresholds the tail top-k lost the device.
+    /// ones); the sample-threshold pass still runs over the sample keys in that window, and is needed: without thresholds the tail top-k lost the device.
     pub fn search_tail(&self, queries: &[f32], rows: usize, ranges: &[(u32, u32)], from_key: usize) -> Vec<(f32, u16)> {
         assert!(ranges.iter().all(|r| r.0 as usize >= from_key));
         self.search_from(queries, rows, Some((ranges, 0)), from_key)
@@ -275,6 +275,7 @@ impl KnnStore {
         // uploading each addition as its own tile made every search launch for thousands of tiny tiles).
         let tail = (!self.pending_vals.is_empty()).then(|| self.tile_of(&self.pending_keys, &self.pending_vals));
         let forced: Option<usize> = std::env::var("KNN_PARTS").ok().and_then(|v| v.parse().ok());
+        let wall = std::time::Instant::now();
         let mut out = Vec::with_capacity(rows * KMAX);
         for q0 in (0..rows).step_by(QBLOCK) {
             let q = QBLOCK.min(rows - q0);
@@ -283,6 +284,9 @@ impl KnnStore {
             let parts = forced.unwrap_or((THREADS / q).clamp(8, 32));
             let found = self.search_block(block, q, rg, always, parts, true, from_key, tail.as_ref()).unwrap_or_else(|| self.search_block(block, q, rg, always, parts, false, from_key, tail.as_ref()).unwrap());
             out.extend(found);
+        }
+        if std::env::var_os("KNN_WALL").is_some() {
+            eprintln!("WALL search {rows} queries from {from_key} {:.0} ms", wall.elapsed().as_secs_f64() * 1e3);
         }
         out
     }
@@ -352,8 +356,19 @@ impl KnnStore {
             read(&hi);
             stage[0] = t_start.elapsed();
         }
+        // Without always-included keys, no query reads outside [min lo, max hi): skip the sample chunks and the tiles beyond that window
+        // (`k_thresh` ignores sample keys outside a query's range anyway, so the thresholds are the same).
+        let (win_lo, win_hi) = if always == 0 {
+            (ranges.iter().map(|r| r.0 as usize).min().unwrap_or(0).max(from_key), ranges.iter().map(|r| r.1 as usize).max().unwrap_or(0))
+        } else {
+            (from_key, usize::MAX)
+        };
         let mut gbase = 0usize;
         for (sk, sn, len) in &sample {
+            if (gbase + len - 1) * SAMPLE_STRIDE < win_lo || gbase * SAMPLE_STRIDE >= win_hi {
+                gbase += len;
+                continue;
+            }
             let t0 = std::time::Instant::now();
             self.dots(sk, 0, *len, &qh, 0, &dist, self.tile * qp, 0, q, qp);
             if timing {
@@ -385,12 +400,6 @@ impl KnnStore {
         }
         // `KNN_SLICE` overrides the keys per top-k launch (experiments).
         let slice: usize = std::env::var("KNN_SLICE").ok().and_then(|v| v.parse().ok()).unwrap_or(SLICE);
-        // Without always-included keys, no query reads outside [min lo, max hi): skip the tiles beyond that window.
-        let (win_lo, win_hi) = if always == 0 {
-            (ranges.iter().map(|r| r.0 as usize).min().unwrap_or(0).max(from_key), ranges.iter().map(|r| r.1 as usize).max().unwrap_or(0))
-        } else {
-            (from_key, usize::MAX)
-        };
         let mut base = 0usize;
         for t in self.tiles.iter().chain(tail) {
             if base >= win_hi {

@@ -400,14 +400,24 @@ impl KnnStore {
             let dist = client().empty(nl16 * qp * 4);
             self.dots(&ivf.keys, 0, nl, &qh, 0, &dist, nl16 * qp, 0, q, qp);
             let dd = read(&dist);
-            for i in 0..q {
-                let mut sc: Vec<(f32, u32)> = (0..nl).map(|c| (ivf.norm[c] - 2.0 * dd[c * qp + i], c as u32)).collect();
-                sc.select_nth_unstable_by(nprobe - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
-                sc[..nprobe].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                for (k, &(_, c)) in sc[..nprobe].iter().enumerate() {
-                    probes[(q0 + i) * nprobe + k] = c;
+            // Queries are independent: a few threads (the CPU is shared) each take a slice of the block.
+            let per = q.div_ceil(8).max(1);
+            let (dd, norm) = (&dd, &ivf.norm);
+            std::thread::scope(|sc| {
+                for (b, out) in probes[q0 * nprobe..(q0 + q) * nprobe].chunks_mut(per * nprobe).enumerate() {
+                    sc.spawn(move || {
+                        let mut scored: Vec<(f32, u32)> = Vec::with_capacity(nl);
+                        for (r, o) in out.chunks_mut(nprobe).enumerate() {
+                            let i = b * per + r;
+                            scored.clear();
+                            scored.extend((0..nl).map(|c| (norm[c] - 2.0 * dd[c * qp + i], c as u32)));
+                            scored.select_nth_unstable_by(nprobe - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
+                            scored[..nprobe].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                            o.iter_mut().zip(&scored).for_each(|(o, &(_, c))| *o = c);
+                        }
+                    });
                 }
-            }
+            });
         }
         let t_probe = t0.elapsed();
         // Queries per group so that a group's matmul outputs fit the workspace (cells average n / nl rows).
@@ -427,6 +437,9 @@ impl KnnStore {
         let mut out = vec![(f32::INFINITY, 0u16); rows * KMAX];
         for (pos, &q) in order.iter().enumerate() {
             out[q as usize * KMAX..(q as usize + 1) * KMAX].copy_from_slice(&sorted[pos * KMAX..(pos + 1) * KMAX]);
+        }
+        if std::env::var_os("KNN_WALL").is_some() {
+            eprintln!("WALL ivf {rows} queries {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
         if std::env::var_os("KNN_TIMING").is_some() {
             eprintln!(

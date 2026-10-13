@@ -1360,3 +1360,12 @@ against 4096 centroids cost dots 3.1 ms, but `k_argmin` **43 ms** (one thread pe
 novels40 4-bit half 0, cold: k-means + assignment 151 -> **28.7 s**, memory build 277 -> **145 s** (605 s before the memcache/whitening/host-copy work), CE 0.9793 and
 recall 0.9913 unchanged. A faster matmul kernel for `dots` would now save only a few seconds of the remaining 29 s (parked: not worth a new f16-input tiled kernel).
 Remaining cold build: forward + readback 69 s, IVF 55 s (k-means + assignment 29 s, reorder 19 s), host copy + norms 21 s.
+
+**Eval-side timing (2026-10-13; novels40 4-bit half 0 from the memory cache, scored eval 185 s -> 171 s, CE 0.9793 / recall unchanged).** `KNN_TIMING=1` syncs between
+stages, so it overstates launch-bound work: with it, the IVF matmul stage looked 100x off the FLOP count (5.5 s per 16384 queries; one dequant + one tiny matmul per
+probed cell and piece), and a 4x larger workspace (groups of 2990 queries) cut that stage to 2.3 s, yet the unsynced eval did not move (85.6 -> 83.5 s in IVF calls);
+the constants stay at `WS_FLOATS` 64M / `GROUP_MAX` 2048. `KNN_WALL=1` prints unsynced wall time per `search_ivf` / `search_from` call (use that, not the stage timers, to judge a
+change). What did help: (1) the tail (in-document) search ran the whole 600k-key threshold sample matmul for every 2048-query block (210 ms of 360) although only sample
+keys inside the query ranges count; chunks outside the window `[min lo, max hi)` are now skipped like the tiles (block 360 -> 145 ms, ~16 s of the eval);
+(2) the per-query top-`nprobe` cell selection runs on 8 threads (~4 s). Of the 171 s eval, ~82 s is `search_ivf` (5 s per 16384 queries, GPU side: per-cell dequant
++ small matmuls + scan; not yet split without syncs), ~65 s other `search` calls (23 s of that is the `ivf_check` exact searches, a recall measurement; the rest the tail search).
