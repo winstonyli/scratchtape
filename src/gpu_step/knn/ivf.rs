@@ -398,7 +398,7 @@ impl KnnStore {
         let fetch = |q0: usize| {
             let q = QBLOCK.min(rows - q0);
             let (qh, qp) = transposed_f16(&rq[q0 * d..(q0 + q) * d], d);
-            let dist = client().empty(nl16 * qp * 4);
+            let dist = self.scratch(S_CENT, nl16 * qp * 4);
             self.dots(&ivf.keys, 0, nl, &qh, 0, &dist, nl16 * qp, 0, q, qp);
             (read(&dist), qp)
         };
@@ -432,7 +432,7 @@ impl KnnStore {
         // Queries per group so that a group's matmul outputs fit the workspace (cells average n / nl rows).
         let per_query = nprobe * (ivf.n / nl + 16) * 5 / 4;
         let group = (WS_FLOATS / per_query).clamp(16, GROUP_MAX);
-        let ws = client().empty(WS_FLOATS * 4);
+        let ws = self.scratch(S_WS, WS_FLOATS * 4);
         let mut stage = [std::time::Duration::ZERO; 3];
         // Queries sorted by their nearest cell, so that a group probes few distinct cells (each matmul is then wide).
         let mut order: Vec<u32> = (0..rows as u32).collect();
@@ -551,7 +551,7 @@ impl KnnStore {
         let (q_off, v_base, v_stride, v_g0, v_len) = (up(&q_off), up(&v_base), up(&v_stride), up(&v_g0), up(&v_len));
         // Pass 1: each query's threshold from a sample of its rows.
         let thr_q: Vec<f32> = if thresholds {
-            let thr_d = filled(PARTS * nq * THRESH_RANK, f32::INFINITY);
+            let thr_d = self.filled(S_THR, PARTS * nq * THRESH_RANK, f32::INFINITY);
             crate::gpu_step::count_launch();
             #[rustfmt::skip]
             k_sample::launch(client(), cubes(PARTS * nq), CubeDim::new_1d(EW_DIM), buf(ws, WS_FLOATS), buf(&ivf.norms, ivf.n), buf(&thr_d, PARTS * nq * THRESH_RANK), buf(&q_off, nq + 1), buf(&v_base, nv), buf(&v_stride, nv), buf(&v_g0, nv), buf(&v_len, nv), nq as u32, PARTS as u32);
@@ -562,7 +562,7 @@ impl KnnStore {
         };
         let t_s = t0.elapsed();
         let thr_buf = upload_f32(&thr_q);
-        let (best_d, best_v) = (filled(PARTS * nq * KMAX, f32::INFINITY), filled(PARTS * nq * KMAX, 0.0));
+        let (best_d, best_v) = (self.filled(S_BEST_D, PARTS * nq * KMAX, f32::INFINITY), self.filled(S_BEST_V, PARTS * nq * KMAX, 0.0));
         crate::gpu_step::count_launch();
         #[rustfmt::skip]
         k_scan::launch(client(), cubes(PARTS * nq), CubeDim::new_1d(EW_DIM), buf(ws, WS_FLOATS), buf(&ivf.norms, ivf.n), buf(&ivf.vals, ivf.n), buf(&best_d, PARTS * nq * KMAX), buf(&best_v, PARTS * nq * KMAX), buf(&thr_buf, nq), buf(&q_off, nq + 1), buf(&v_base, nv), buf(&v_stride, nv), buf(&v_g0, nv), buf(&v_len, nv), nq as u32, PARTS as u32);

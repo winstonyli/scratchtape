@@ -66,23 +66,45 @@ pub struct KnnStore {
     pub flush_time: [std::time::Duration; 2],
     /// Device copy of `sample_keys` as (keys, norms, len) chunks, with the sample count it was built from.
     sample_dev: RefCell<(usize, Vec<(Handle, Handle, usize)>)>,
-    /// Bytes and handle of the f16 buffer `rows_f16` dequantises into, grown on demand (a fresh buffer per call made `empty` the
-    /// main thread's biggest cost in an IVF search: each call waits for the device thread).
-    deq_scratch: RefCell<(usize, Option<Handle>)>,
+    /// Device scratch buffers by slot (`S_*`), grown on demand: a fresh buffer per call made `empty` the main thread's biggest
+    /// cost in an IVF search, since each call waits for the device thread. The queue is in order, so a slot's next user overwrites
+    /// it only after the work already enqueued has read it; callers finish with a slot's contents before asking again.
+    scratch: RefCell<Vec<(usize, Option<Handle>)>>,
     /// 0: keys stored as f16. 8 or 4: as integers of that many bits with one scale per key (`set_key_bits`).
     kbits: u32,
     /// Set by `build_ivf`: the first keys are clustered for `search_ivf`.
     ivf: Option<ivf::Ivf>,
 }
 
-/// A device buffer of `len` copies of `v`, filled on the device (no host vector crossing the link).
-pub(super) fn filled(len: usize, v: f32) -> Handle {
-    let h = client().empty(len * 4);
-    k_fill::launch(client(), cubes(len), CubeDim::new_1d(EW_DIM), buf(&h, len), v, len as u32);
-    h
-}
+/// Scratch slots of `KnnStore::scratch`.
+pub(super) const S_DEQ: usize = 0;
+pub(super) const S_DIST: usize = 1;
+pub(super) const S_BEST_D: usize = 2;
+pub(super) const S_BEST_V: usize = 3;
+pub(super) const S_THR: usize = 4;
+pub(super) const S_CENT: usize = 5;
+pub(super) const S_WS: usize = 6;
+pub(super) const S_COUNT: usize = 7;
 
 impl KnnStore {
+    /// Scratch slot `slot` with room for `bytes` (contents undefined).
+    pub(super) fn scratch(&self, slot: usize, bytes: usize) -> Handle {
+        let mut sc = self.scratch.borrow_mut();
+        if sc[slot].0 < bytes {
+            // Slots that are read back whole keep their exact size; the dequantised rows vary per call, so they get headroom.
+            let size = if slot == S_DEQ { bytes + bytes / 4 } else { bytes };
+            sc[slot] = (size, Some(client().empty(size)));
+        }
+        sc[slot].1.clone().unwrap()
+    }
+
+    /// Scratch slot `slot` holding `len` copies of `v`, filled on the device (no host vector crossing the link).
+    pub(super) fn filled(&self, slot: usize, len: usize, v: f32) -> Handle {
+        let h = self.scratch(slot, len * 4);
+        k_fill::launch(client(), cubes(len), CubeDim::new_1d(EW_DIM), buf(&h, len), v, len as u32);
+        h
+    }
+
     pub fn new(d: usize, tile: usize) -> Self {
         // f16 matrix cores unless `KNN_F32` is set, or the shapes or the device do not allow them.
         let f16 = std::env::var_os("KNN_F32").is_none() && d % 16 == 0 && tile % 16 == 0 && client().features().matmul.cmma.contains(&f16_config());
@@ -104,7 +126,7 @@ impl KnnStore {
             f16,
             flush_time: [std::time::Duration::ZERO; 2],
             sample_dev: RefCell::new((0, vec![])),
-            deq_scratch: RefCell::new((0, None)),
+            scratch: RefCell::new(vec![(0, None); S_COUNT]),
             ivf: None,
             kbits: 0,
         }
@@ -219,11 +241,7 @@ impl KnnStore {
         let dw = self.key_bytes() / 4;
         let total = rows * dw;
         let need = rows * self.d * 2;
-        let mut sc = self.deq_scratch.borrow_mut();
-        if sc.0 < need {
-            *sc = (need + need / 4, Some(client().empty(need + need / 4)));
-        }
-        let out = sc.1.clone().unwrap();
+        let out = self.scratch(S_DEQ, need);
         crate::gpu_step::count_launch();
         k_dequant::launch(client(), cubes(total), CubeDim::new_1d(EW_DIM), buf(&t.keys, t.len.next_multiple_of(16) * dw), buf(scales, t.len.next_multiple_of(16)), buf(&out, rows * self.d), row0 as u32, dw as u32, self.kbits, total as u32);
         (out, 0)
@@ -354,9 +372,9 @@ impl KnnStore {
         } else {
             (upload_f32(block), block)
         };
-        let best_d = filled(parts * q * KMAX, f32::INFINITY);
-        let best_v = filled(parts * q * KMAX, 0.0);
-        let dist = client().empty(self.tile * qp * 4);
+        let best_d = self.filled(S_BEST_D, parts * q * KMAX, f32::INFINITY);
+        let best_v = self.filled(S_BEST_V, parts * q * KMAX, 0.0);
+        let dist = self.scratch(S_DIST, self.tile * qp * 4);
         let lo = client().create_from_slice(u32::as_bytes(&ranges.iter().map(|r| r.0).collect::<Vec<_>>()));
         let hi = client().create_from_slice(u32::as_bytes(&ranges.iter().map(|r| r.1).collect::<Vec<_>>()));
         // KNN_TIMING=1: sync between stages (a read of a small buffer waits for the queue) and report their wall time.
@@ -368,7 +386,7 @@ impl KnnStore {
         let t_start = std::time::Instant::now();
         let mut stage = [std::time::Duration::ZERO; 3];
         // Pass 1: each query's threshold from the sample.
-        let thr_d = filled(parts * q * THRESH_RANK, f32::INFINITY);
+        let thr_d = self.filled(S_THR, parts * q * THRESH_RANK, f32::INFINITY);
         let sample = if thresholds { self.sample_chunks() } else { vec![] };
         if timing {
             read(&hi);
