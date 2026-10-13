@@ -66,6 +66,9 @@ pub struct KnnStore {
     pub flush_time: [std::time::Duration; 2],
     /// Device copy of `sample_keys` as (keys, norms, len) chunks, with the sample count it was built from.
     sample_dev: RefCell<(usize, Vec<(Handle, Handle, usize)>)>,
+    /// Bytes and handle of the f16 buffer `rows_f16` dequantises into, grown on demand (a fresh buffer per call made `empty` the
+    /// main thread's biggest cost in an IVF search: each call waits for the device thread).
+    deq_scratch: RefCell<(usize, Option<Handle>)>,
     /// 0: keys stored as f16. 8 or 4: as integers of that many bits with one scale per key (`set_key_bits`).
     kbits: u32,
     /// Set by `build_ivf`: the first keys are clustered for `search_ivf`.
@@ -101,6 +104,7 @@ impl KnnStore {
             f16,
             flush_time: [std::time::Duration::ZERO; 2],
             sample_dev: RefCell::new((0, vec![])),
+            deq_scratch: RefCell::new((0, None)),
             ivf: None,
             kbits: 0,
         }
@@ -207,12 +211,19 @@ impl KnnStore {
         Tile { keys: client().create_from_slice(&qp), scales: Some(upload_f32(&sp)), norms: upload_f32(norms), vals: upload_f32(&vals_f), len: rows }
     }
 
-    /// Rows row0..row0 + rows (multiples of 16) of tile `t` as f16 for the matmul: (handle, first row in it).
+    /// Rows row0..row0 + rows (multiples of 16) of tile `t` as f16 for the matmul: (handle, first row in it). A quantised tile is
+    /// dequantised into a scratch buffer shared by all calls: the queue is in order, so the next call overwrites it only after the
+    /// matmuls already enqueued have read it, and callers use the result before asking again.
     fn rows_f16(&self, t: &Tile, row0: usize, rows: usize) -> (Handle, usize) {
         let Some(scales) = &t.scales else { return (t.keys.clone(), row0) };
         let dw = self.key_bytes() / 4;
         let total = rows * dw;
-        let out = client().empty(rows * self.d * 2);
+        let need = rows * self.d * 2;
+        let mut sc = self.deq_scratch.borrow_mut();
+        if sc.0 < need {
+            *sc = (need + need / 4, Some(client().empty(need + need / 4)));
+        }
+        let out = sc.1.clone().unwrap();
         crate::gpu_step::count_launch();
         k_dequant::launch(client(), cubes(total), CubeDim::new_1d(EW_DIM), buf(&t.keys, t.len.next_multiple_of(16) * dw), buf(scales, t.len.next_multiple_of(16)), buf(&out, rows * self.d), row0 as u32, dw as u32, self.kbits, total as u32);
         (out, 0)
