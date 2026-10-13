@@ -7,11 +7,11 @@
 use super::*;
 
 /// Threads per query in the scan; each keeps its own top list (lists are merged on the host at the end).
-const PARTS: usize = 16;
+const PARTS: usize = 8;
 /// Most queries in one group.
-const GROUP_MAX: usize = 2048;
+const GROUP_MAX: usize = 8192;
 /// Floats in the distance workspace shared by a group's matmuls.
-const WS_FLOATS: usize = 64 << 20;
+const WS_FLOATS: usize = 256 << 20;
 /// Every `SAMP`-th row of a query's cells is sampled to bound its `KMAX`-th neighbour: the `THRESH_RANK`-th nearest sampled
 /// row is about the `THRESH_RANK * SAMP`-th nearest row, 4x the 256 needed, and keys beyond it are never inserted.
 const SAMP: u32 = 32;

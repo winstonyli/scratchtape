@@ -1387,3 +1387,9 @@ the GPU: the sample pass ~0.5 s, the scan kernel and list merge ~3 s per call (a
 padding each cell's queries to 16 and are split twice to ~187, so the scan launches only ~3000 threads and a call makes ~85 groups. A 4x workspace (`WS_FLOATS` 256M floats, `GROUP_MAX` 8192; groups of ~700, 25 groups per two calls)
 cut a short-eval IVF call 5.9 -> 4.1 s (eval 20.7 -> 19.1 s) but the full half-0 eval moved only 136.0 -> 136.7 s (noise), so the 64M / 2048 constants stay (512M floats = 2 GB fails: over the device buffer limit).
 Left for later if the eval needs to be faster: a scan kernel with more threads per query (the parts count is capped by the host merge no longer, `k_merge_parts` handles up to 64), or fusing the per-cell dequant into the matmul.
+
+**Scan tuning: bigger groups, fewer parts (2026-10-13; half 0, novels40 4-bit, from the cache, no `ivf_check`).** With the device-side list merge, the scan's group size and part count were re-swept
+together. `WS_FLOATS` 256M floats / `GROUP_MAX` 8192 (groups of ~700 queries instead of ~187 after the workspace splits; 1 GB of device memory; 512M floats = 2 GB fails the device buffer limit)
+and `PARTS` 8 (lists per query; fewer parts mean a cheaper merge, less readback and less list initialisation, while the larger groups already supply the threads). Scored eval
+(`PARTS`: eval s / `search_ivf` s over 16 calls): 16 with the old 64M workspace 136 / 82; 16 with 256M 128.5 / 62.9; 32 159.5 / 95.5; **8 117.1 / 53.9**; 4 125.9 / 64.1; 2 166.5 / 100.9. CE 0.9793 throughout.
+The earlier "larger workspace is within noise" note (one full run, 136.0 -> 136.7 s) was the old 16 parts with a host-side merge still in the way; with the current code it is worth ~8 s.
