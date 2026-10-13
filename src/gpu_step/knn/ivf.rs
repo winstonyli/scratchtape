@@ -113,11 +113,12 @@ fn k_argmin(dist: &[f32], cnorm: &[f32], out: &mut [f32], ld: u32, nc: u32) {
 /// is query pq[i] of `src` (f16 [., d]).
 #[cube(launch)]
 fn k_gather_q(src: &[f16], dst: &mut [f16], pq: &[u32], pdst: &[u32], pstride: &[u32], n: u32, d: u32) {
-    let i = ABSOLUTE_POS as u32;
-    if i < n {
-        for c in 0..d {
-            dst[(pdst[i as usize] + c * pstride[i as usize]) as usize] = src[(pq[i as usize] * d + c) as usize];
-        }
+    // One thread per (pair, component): neighbouring threads read neighbouring components of one query.
+    let e = ABSOLUTE_POS as u32;
+    if e < n * d {
+        let i = e / d;
+        let c = e % d;
+        dst[(pdst[i as usize] + c * pstride[i as usize]) as usize] = src[(pq[i as usize] * d + c) as usize];
     }
 }
 
@@ -590,13 +591,20 @@ impl KnnStore {
             }
             total += d * qp;
         }
-        let qall = client().create_from_slice(f16::as_bytes(&vec![f16::ZERO; total]));
+        let t_a = t0.elapsed();
+        let qall = self.filled(S_QALL, total / 2, 0.0); // zero f16 pairs (total is even: d * qp)
         let up = |v: &[u32]| client().create_from_slice(u32::as_bytes(v));
         let np = pq.len();
         let (pq, pdst, pstride) = (up(&pq), up(&pdst), up(&pstride));
+        assert!(np * d <= 65535 * EW_DIM as usize, "gather of {np} pairs exceeds one dispatch");
         crate::gpu_step::count_launch();
         #[rustfmt::skip]
-        k_gather_q::launch(client(), cubes(np), CubeDim::new_1d(EW_DIM), buf(rq_dev, rq.len()), buf(&qall, total), buf(&pq, np), buf(&pdst, np), buf(&pstride, np), np as u32, d as u32);
+        k_gather_q::launch(client(), cubes(np * d), CubeDim::new_1d(EW_DIM), buf(rq_dev, rq.len()), buf(&qall, total), buf(&pq, np), buf(&pdst, np), buf(&pstride, np), np as u32, d as u32);
+        let t_b = t0.elapsed();
+        if timing {
+            read(&pstride);
+        }
+        let t_c = t0.elapsed();
         // Every piece's matmul, one grouped launch per tile (pieces are sorted by tile; a piece never spans two).
         let mut items: Vec<(usize, usize, usize, usize, usize, usize)> = vec![];
         for &c in &cell_at {
@@ -613,6 +621,7 @@ impl KnnStore {
             cube_start.push(cube_start.last().unwrap() + (it.2 / 16 * (it.5 / 16)) as u32);
         }
         let (desc_dev, cube_start_dev) = (up(&desc), up(&cube_start));
+        let t_d = t0.elapsed();
         let dummy = client().create_from_slice(&[0u8; 4]);
         let (plane, quant) = (client().properties().hardware.plane_size_max, self.kbits > 0);
         let mut p0 = 0;
@@ -635,6 +644,7 @@ impl KnnStore {
         }
         if timing {
             read(&cube_start_dev);
+            eprintln!("  mm: gather queries {:.0} ms, qall+uploads {:.0}, gather kernel {:.0}, items {:.0}, launches+kernels {:.0}", t_a.as_secs_f64() * 1e3, (t_b - t_a).as_secs_f64() * 1e3, (t_c - t_b).as_secs_f64() * 1e3, (t_d - t_c).as_secs_f64() * 1e3, (t0.elapsed() - t_d).as_secs_f64() * 1e3);
             stage[0] += t0.elapsed();
         }
         // Per query, its pieces in probe order: workspace position of its column, row stride, first store row, rows.

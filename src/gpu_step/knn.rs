@@ -84,15 +84,16 @@ pub(super) const S_BEST_V: usize = 3;
 pub(super) const S_THR: usize = 4;
 pub(super) const S_CENT: usize = 5;
 pub(super) const S_WS: usize = 6;
-pub(super) const S_COUNT: usize = 7;
+pub(super) const S_QALL: usize = 7;
+pub(super) const S_COUNT: usize = 8;
 
 impl KnnStore {
     /// Scratch slot `slot` with room for `bytes` (contents undefined).
     pub(super) fn scratch(&self, slot: usize, bytes: usize) -> Handle {
         let mut sc = self.scratch.borrow_mut();
         if sc[slot].0 < bytes {
-            // Slots that are read back whole keep their exact size; the dequantised rows vary per call, so they get headroom.
-            let size = if slot == S_DEQ { bytes + bytes / 4 } else { bytes };
+            // Slots that are read back whole keep their exact size; the dequantised rows and the gathered queries vary per call, so they get headroom.
+            let size = if slot == S_DEQ || slot == S_QALL { bytes + bytes / 4 } else { bytes };
             sc[slot] = (size, Some(client().empty(size)));
         }
         sc[slot].1.clone().unwrap()
