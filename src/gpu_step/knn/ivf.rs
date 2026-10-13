@@ -276,6 +276,7 @@ fn k_dots_group(keys: &[f16], q: &[u32], scale: &[f32], b: &[f16], out: &mut [f3
         let out_off = desc[(lo * 4 + 3) as usize];
         let loc = id - cube_start[lo as usize];
         let nct = n / 16;
+        let rows16 = (cube_start[(lo + 1) as usize] - cube_start[lo as usize]) / nct * 16;
         let row0 = (loc / nct) * 16;
         let col0 = (loc % nct) * 16;
         let c = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0);
@@ -286,7 +287,7 @@ fn k_dots_group(keys: &[f16], q: &[u32], scale: &[f32], b: &[f16], out: &mut [f3
         let half = 1u32 << (bits - 1);
         for kk in 0..k / 16 {
             let b_off = (b_off0 + kk * 16 * n + col0) as usize;
-            let bt = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &b[b_off..b.len()], n);
+            let qt = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &b[b_off..b.len()], n);
             if quant {
                 for j in 0..4u32 {
                     let t = UNIT_POS_X + j * CUBE_DIM_X;
@@ -306,18 +307,18 @@ fn k_dots_group(keys: &[f16], q: &[u32], scale: &[f32], b: &[f16], out: &mut [f3
                     }
                 }
                 sync_cube();
-                let at = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &sh[0..256], 16);
-                cmma::execute(&at, &bt, &c, &c);
+                let kt = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &sh[0..256], 16);
+                cmma::execute(&qt, &kt, &c, &c);
                 sync_cube();
             } else {
                 let a_off = ((a_row + row0) * k + kk * 16) as usize;
-                let at = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &keys[a_off..keys.len()], k);
-                cmma::execute(&at, &bt, &c, &c);
+                let kt = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &keys[a_off..keys.len()], k);
+                cmma::execute(&qt, &kt, &c, &c);
             }
         }
-        let o_off = (out_off + row0 * n + col0) as usize;
+        let o_off = (out_off + col0 * rows16 + row0) as usize;
         let len = out.len();
-        cmma::store(&mut out[o_off..len], &c, n, cmma::MatrixLayout::RowMajor);
+        cmma::store(&mut out[o_off..len], &c, rows16, cmma::MatrixLayout::RowMajor);
     }
 }
 
@@ -642,10 +643,9 @@ impl KnnStore {
         for gi in 0..nq {
             for k in 0..nprobe {
                 let c = probes[gi * nprobe + k] as usize;
-                let qp = cell_q[c].len().next_multiple_of(16);
                 for (piece, &off) in ivf.cells[c].iter().zip(&region[c]) {
-                    v_base.push((off + (piece.a - piece.rows().0) * qp + col[gi * nprobe + k]) as u32);
-                    v_stride.push(qp as u32);
+                    v_base.push((off + col[gi * nprobe + k] * piece.rows().1 + (piece.a - piece.rows().0)) as u32);
+                    v_stride.push(1);
                     v_g0.push(piece.g0 as u32);
                     v_len.push((piece.b - piece.a) as u32);
                 }
