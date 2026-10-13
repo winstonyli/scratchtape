@@ -1404,3 +1404,6 @@ Split after the fills (same run, `KNN_WALL=1`, wall per call): 16 `search_ivf` c
 
 ### Inside `search_ivf` (2026-10-13)
 Unsynced host laps (temporary, removed), half-0 eval from cache, 16384-query calls, early calls (calls 6+ drifted 20-30% slower, likely contention): of ~2.7 s per call, probe selection (centroid matmul + readback + CPU top-8) 0.5 s (18%), matmul enqueue loop 1.1 s (40%; it blocks on a full queue, so it is mostly GPU dequant + cmma time), scan + list merge wait 0.9 s (32%), sample pass 0.1 s, gather prep 0.08 s, host vector build and fills ~0. Candidates: overlap the CPU probe selection of the next call with the GPU work of this one (up to ~0.5 s x 16 = 8 s), shave the dequant (parked fused kernel, <= 10-15 s total).
+
+### Probe selection overlapped (2026-10-13)
+In `search_ivf`, the CPU top-`nprobe` selection of centroid block b now runs on its 8 threads while the main thread fetches block b+1's centroid distances (matmul + readback). `search_ivf` calls (16): 56.8 s -> 44.8 s (early calls 2.35-2.55 s vs 2.7-3.0 s before); scored half-0 eval 108.6 s -> 87.1 s, CE 0.9793 unchanged. The eval gain is larger than the ivf gain (forward was also 4.5 s faster that run), so about 12 s is this change and the rest is run-to-run variation; CPU/GPU contention was not checked for either run (no leases).

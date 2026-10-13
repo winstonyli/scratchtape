@@ -394,13 +394,21 @@ impl KnnStore {
         let t0 = std::time::Instant::now();
         let nl16 = nl.next_multiple_of(16);
         let mut probes = vec![0u32; rows * nprobe];
-        for q0 in (0..rows).step_by(QBLOCK) {
+        // A block's distances to the centroids, [nl16, qp], and its padded width.
+        let fetch = |q0: usize| {
             let q = QBLOCK.min(rows - q0);
             let (qh, qp) = transposed_f16(&rq[q0 * d..(q0 + q) * d], d);
             let dist = client().empty(nl16 * qp * 4);
             self.dots(&ivf.keys, 0, nl, &qh, 0, &dist, nl16 * qp, 0, q, qp);
-            let dd = read(&dist);
-            // Queries are independent: a few threads (the CPU is shared) each take a slice of the block.
+            (read(&dist), qp)
+        };
+        let starts: Vec<usize> = (0..rows).step_by(QBLOCK).collect();
+        let mut cur = Some(fetch(0));
+        for (bi, &q0) in starts.iter().enumerate() {
+            let q = QBLOCK.min(rows - q0);
+            let (dd, qp) = cur.take().unwrap();
+            // Queries are independent: a few threads (the CPU is shared) each take a slice of the block, while this thread
+            // fetches the next block's distances from the device.
             let per = q.div_ceil(8).max(1);
             let (dd, norm) = (&dd, &ivf.norm);
             std::thread::scope(|sc| {
@@ -417,6 +425,7 @@ impl KnnStore {
                         }
                     });
                 }
+                cur = starts.get(bi + 1).map(|&n0| fetch(n0));
             });
         }
         let t_probe = t0.elapsed();
