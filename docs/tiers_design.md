@@ -1399,3 +1399,5 @@ Half-0 eval from cache, `KNN_WALL=1` plus a temporary queue flush before each ta
 
 ### Device-side fills (2026-10-13)
 The suspect in the entry above was right: `best_d`, `best_v`, `thr_d` (parts*q*KMAX floats each, per block) were built on the host and uploaded over USB4. `knn::filled(len, v)` (empty buffer + `k_fill`) replaces all five such uploads in `search_block` and `search_ivf`. Tail search per 16384-query call 2.6-2.9 s -> 0.9-1.2 s; scored half-0 eval 137.3 s -> 108.6 s (tier prepare 110 -> 77 s), CE 0.9793 unchanged (CPU ~18% at start; shared GPU not checked by counter, no leases). The ivf-path fills shrank too but were not timed separately.
+
+Split after the fills (same run, `KNN_WALL=1`, wall per call): 16 `search_ivf` calls 56.8 s (3.2-3.5 s each), 16 tail `search_from` calls 18.3 s, together 75 s of the 77 s tier prepare. The IVF scan is now ~76% of it; the tail is 24%.
