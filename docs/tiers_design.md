@@ -1381,3 +1381,9 @@ the lists on the device (one thread per query, shared by `search_block` and `sca
 two calls; 32 parts is still not better, so `PARTS` stays 16. Together with the earlier changes, the scored half-0 eval (novels40 4-bit, memory from the cache, no `ivf_check`) is **136 s**
 (185 s at the start of this round), CE 0.9793. `ivf_check` (recall against two exact searches over 300 queries, ~23 s) is opt-in: leave it out of routine runs.
 Remaining per 16384-query call (~4.5 s): probe selection (270 MB read + select), per-group host index building and uploads, the sample-threshold pass; not yet split.
+
+**Split of a `search_ivf` call, unsynced (2026-10-13; ~5.9 s per 16384 queries).** Probes 0.5 s; per group the host enqueues the dequant + matmul launches (~1.5 s per call in total), then waits for
+the GPU: the sample pass ~0.5 s, the scan kernel and list merge ~3 s per call (about 54% of the call). Groups are small: a nominal 747 queries exceed the workspace after
+padding each cell's queries to 16 and are split twice to ~187, so the scan launches only ~3000 threads and a call makes ~85 groups. A 4x workspace (`WS_FLOATS` 256M floats, `GROUP_MAX` 8192; groups of ~700, 25 groups per two calls)
+cut a short-eval IVF call 5.9 -> 4.1 s (eval 20.7 -> 19.1 s) but the full half-0 eval moved only 136.0 -> 136.7 s (noise), so the 64M / 2048 constants stay (512M floats = 2 GB fails: over the device buffer limit).
+Left for later if the eval needs to be faster: a scan kernel with more threads per query (the parts count is capped by the host merge no longer, `k_merge_parts` handles up to 64), or fusing the per-cell dequant into the matmul.
