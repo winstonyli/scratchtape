@@ -1373,3 +1373,11 @@ keys inside the query ranges count; chunks outside the window `[min lo, max hi)`
 **Parked: quantise on the device before the readback (2026-10-13).** Device->host reads run at ~2.5 GB/s, so the 37.6 GB of f32 keys of a 37M-key build cost ~15 s of the 69 s
 "forward + hidden readback"; quantising first would save ~13 s of a cold build that the memory cache now makes a one-off. The rest is forward compute. Not worth a device-side
 `add` API; revisit only if cold builds of much larger memories become routine.
+
+**Where the IVF eval time goes, and the device-side list merge (2026-10-13).** Skipping the dequant, the matmuls and the scan (temporary flags, short eval, unsynced wall) cut a `search_ivf`
+call only from ~5.3 to ~4.5 s: the GPU stages are not the bottleneck, the host side is (reading back `PARTS` top-256 lists per query, 2.1 GB per 16384 queries at 2.5 GB/s, then a
+`select_nth` merge per query). `PARTS` trades the two: the scan is thread-bound (2 / 4 / 8 / 16 / 32 / 64 parts: 51 / 27 / 16 / 10.7 / 12.2 / 21.9 s per two calls). `k_merge_parts` now merges
+the lists on the device (one thread per query, shared by `search_block` and `scan_group`), so only 256 entries per query come back: IVF calls 10.7 -> 9.4 s, other searches 8.1 -> 6.7 s per
+two calls; 32 parts is still not better, so `PARTS` stays 16. Together with the earlier changes, the scored half-0 eval (novels40 4-bit, memory from the cache, no `ivf_check`) is **136 s**
+(185 s at the start of this round), CE 0.9793. `ivf_check` (recall against two exact searches over 300 queries, ~23 s) is opt-in: leave it out of routine runs.
+Remaining per 16384-query call (~4.5 s): probe selection (270 MB read + select), per-group host index building and uploads, the sample-threshold pass; not yet split.

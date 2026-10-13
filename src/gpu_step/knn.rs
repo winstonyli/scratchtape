@@ -430,7 +430,7 @@ impl KnnStore {
             base += t.len;
         }
         let t0 = std::time::Instant::now();
-        let (bd, bv) = (read(&best_d), read(&best_v));
+        let (bd, bv) = merged_lists(&best_d, &best_v, q, parts);
         let t_read = t0.elapsed();
         if timing {
             eprintln!(
@@ -447,10 +447,7 @@ impl KnnStore {
         let mut out = Vec::with_capacity(q * KMAX);
         for r in 0..q {
             let qn: f32 = block[r * self.d..(r + 1) * self.d].iter().map(|x| x * x).sum();
-            let mut c: Vec<(f32, f32)> = (0..parts).flat_map(|p| (0..KMAX).map(move |j| (p * q + r) * KMAX + j)).map(|i| (bd[i], bv[i])).collect();
-            c.select_nth_unstable_by(KMAX - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
-            c.truncate(KMAX);
-            c.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let c: Vec<(f32, f32)> = (0..KMAX).map(|j| (bd[r * KMAX + j], bv[r * KMAX + j])).collect();
             if thr_q[r].is_finite() && c[KMAX - 1].0.is_infinite() {
                 if timing {
                     eprintln!("knn: query {r} had fewer than {KMAX} keys under its threshold {}", thr_q[r]);
@@ -581,6 +578,57 @@ fn k_dequant(q: &[u32], scale: &[f32], out: &mut [f16], row0: u32, dw: u32, bits
             out[(i * per + b) as usize] = f16::cast_from(v * s);
         }
     }
+}
+
+/// Most parts `k_merge_parts` merges.
+const MERGE_PARTS_MAX: usize = 64;
+
+/// Each query's `KM` nearest from its `parts` ascending lists (`best_*`, list p of query i at (p * q + i) * KM): out_*[i * KM ..], ascending,
+/// infinity-padded. One thread per query; this keeps the host from reading back and sorting `parts` lists per query.
+#[cube(launch)]
+fn k_merge_parts(best_d: &[f32], best_v: &[f32], out_d: &mut [f32], out_v: &mut [f32], q: u32, parts: u32) {
+    let i = ABSOLUTE_POS as u32;
+    if i < q {
+        let mut head = Array::<u32>::new(MERGE_PARTS_MAX);
+        for p in 0..parts {
+            head[p as usize] = 0u32;
+        }
+        for k in 0..KM {
+            let mut bd = 3.0e38f32;
+            let mut bp = 0u32;
+            let mut found = 0u32;
+            for p in 0..parts {
+                let h = head[p as usize];
+                if h < KM {
+                    let dd = best_d[((p * q + i) * KM + h) as usize];
+                    if dd < bd {
+                        bd = dd;
+                        bp = p;
+                        found = 1u32;
+                    }
+                }
+            }
+            let h = head[bp as usize];
+            if found == 1u32 {
+                out_d[(i * KM + k) as usize] = bd;
+            } else {
+                out_d[(i * KM + k) as usize] = f32::INFINITY;
+            }
+            out_v[(i * KM + k) as usize] = best_v[((bp * q + i) * KM + h) as usize];
+            if found == 1u32 {
+                head[bp as usize] = h + 1;
+            }
+        }
+    }
+}
+
+/// Reads back the merged lists of `q` queries: ([q * KMAX] distances, [q * KMAX] values), ascending per query.
+fn merged_lists(best_d: &Handle, best_v: &Handle, q: usize, parts: usize) -> (Vec<f32>, Vec<f32>) {
+    assert!(parts <= MERGE_PARTS_MAX);
+    let (od, ov) = (client().empty(q * KMAX * 4), client().empty(q * KMAX * 4));
+    super::count_launch();
+    k_merge_parts::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(best_d, parts * q * KMAX), buf(best_v, parts * q * KMAX), buf(&od, q * KMAX), buf(&ov, q * KMAX), q as u32, parts as u32);
+    (read(&od), read(&ov))
 }
 
 /// Merges one tile into each query's running top list (`best_*`, ascending, `KM` per query). `d` is the

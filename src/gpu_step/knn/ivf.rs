@@ -560,7 +560,7 @@ impl KnnStore {
         let t_l = t0.elapsed();
         read(&thr_buf);
         let t_k = t0.elapsed();
-        let (bd, bv) = (read(&best_d), read(&best_v));
+        let (bd, bv) = merged_lists(&best_d, &best_v, nq, PARTS);
         if timing {
             eprintln!("  group: sample pass {:.0} ms, list upload + scan launch {:.0}, scan kernel {:.0}, readback {:.0}", t_s.as_secs_f64() * 1e3, (t_l - t_s).as_secs_f64() * 1e3, (t_k - t_l).as_secs_f64() * 1e3, (t0.elapsed() - t_k).as_secs_f64() * 1e3);
         }
@@ -570,10 +570,7 @@ impl KnnStore {
         for gi in 0..nq {
             let r = qs[gi] as usize;
             let qn: f32 = rq[r * d..(r + 1) * d].iter().map(|x| x.to_f32() * x.to_f32()).sum();
-            let mut c: Vec<(f32, f32)> = (0..PARTS).flat_map(|p| (0..KMAX).map(move |j| (p * nq + gi) * KMAX + j)).map(|i| (bd[i], bv[i])).collect();
-            c.select_nth_unstable_by(KMAX - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
-            c.truncate(KMAX);
-            c.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let c: Vec<(f32, f32)> = (0..KMAX).map(|j| (bd[gi * KMAX + j], bv[gi * KMAX + j])).collect();
             if thr_q[gi].is_finite() && c[KMAX - 1].0.is_infinite() {
                 // A threshold left fewer than KMAX keys: this group again without thresholds.
                 out.truncate(first);
