@@ -67,7 +67,8 @@
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::knn::{DOC, KMAX, KnnStore};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
-use scratchtape::gpu_step::{DeviceParams, read};
+use scratchtape::gpu_step::matmul::{Epilogue, MatRef, matmul_f32};
+use scratchtape::gpu_step::{DeviceParams, Handle, client, read, upload_f32};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -905,10 +906,11 @@ fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], t
     let mut dt = DeviceTape::new(dev);
     let (outs, logits, loss) = model_forward(&mut dt, cfg, &ids, &targets, starts.len());
     let (logits, row_loss) = if want_logits { (read(dt.value(logits)), read(dt.row_losses(loss))) } else { (vec![], vec![]) };
-    let mut hidden = if want_hidden { read(dt.value(outs[tap])) } else { vec![] };
-    if let (Some((mu, w)), true) = (WHITEN.get(), want_hidden) {
-        apply_whitener(&mut hidden, mu, w, cfg.d);
-    }
+    let hidden = match (WHITEN.get(), want_hidden) {
+        (Some((mu, w)), true) => read(&whiten_device(dt.value(outs[tap]), ids.len(), mu, w, cfg.d)),
+        (None, true) => read(dt.value(outs[tap])),
+        _ => vec![],
+    };
     Forward { ids, targets, logits, row_loss, hidden }
 }
 
@@ -979,24 +981,15 @@ impl Adapter {
 /// distances keep their scale), Sigma estimated from a sample of train positions. Set once before the memory is built.
 static WHITEN: std::sync::OnceLock<(Vec<f32>, Vec<f32>)> = std::sync::OnceLock::new();
 
-fn apply_whitener(hidden: &mut [f32], mu: &[f32], w: &[f32], d: usize) {
-    let rows = hidden.len() / d;
-    let per = rows.div_ceil(8).max(1);
-    std::thread::scope(|s| {
-        for block in hidden.chunks_mut(per * d) {
-            s.spawn(move || {
-                let mut x = vec![0f32; d];
-                for row in block.chunks_mut(d) {
-                    for j in 0..d {
-                        x[j] = row[j] - mu[j];
-                    }
-                    for (i, o) in row.iter_mut().enumerate() {
-                        *o = x.iter().zip(&w[i * d..(i + 1) * d]).map(|(a, b)| a * b).sum();
-                    }
-                }
-            });
-        }
-    });
+/// The tap hidden states `x` ([rows, d]) as (x - mu) W^T on the device, in f32 so it equals the host formula to rounding; only the
+/// whitened rows cross the link, with no host matmul.
+fn whiten_device(x: &Handle, rows: usize, mu: &[f32], w: &[f32], d: usize) -> Handle {
+    let c: Vec<f32> = w.chunks(d).map(|row| -row.iter().zip(mu).map(|(a, b)| a * b).sum::<f32>()).collect();
+    let (wd, cd) = (upload_f32(w), upload_f32(&c));
+    let out = client().empty(rows * d * 4);
+    let epi = Epilogue { bias: Some((&cd, 0)), ..Epilogue::default() };
+    matmul_f32(MatRef::new(x), MatRef { trans: true, ..MatRef::new(&wd) }, MatRef::new(&out), 1, rows, d, d, epi);
+    out
 }
 
 /// Cyclic Jacobi eigendecomposition of the symmetric d x d matrix `a`: (eigenvalues, V) with a = V diag(lam) V^T, V row-major.

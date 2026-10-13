@@ -1337,3 +1337,12 @@ IVF 4096x8: **CE 0.9793 at 4 bits against 0.9792 at 8 bits** (f16 would be 18.8 
 195 s. Keys cost nothing down to 4 bits, so the same VRAM now holds ~4x the f16 key count (~150M keys, ~1.2M windows, ~150 MB of
 text); the corpus, not the device, is again the limit: more text means more books (a download, not yet done), and the k-means
 build and its ~7 GB of host RAM per 37M keys would need checking at that size.
+
+**Memory cache and device-side whitening (2026-10-13).** `KnnStore::save/load` (`knn/cache.rs`; test `saved_store_reloads_identically`) write the built
+store (tiles, scales, norms, values, key sample, IVF index) to `memcache=<dir>/<hash>.mem` under a key string naming the checkpoint (path, length,
+mtime) and every build option; a mismatch rebuilds. novels40, 4-bit, 36.7M keys: build 605 s -> **14 s load** (5.76 GB file, 7.6 s to save), same CE
+(0.9793 half 0, 1.0729 half 1), recall 0.991 / 0.997. The cold build's forward + readback phase (309 s) was mostly the host whitener (2.4 TFLOP of
+scalar code) plus the raw f32 readback: `forward()` now whitens on the device (`whiten_device`, f32 matmul with bias -W mu; the host
+`apply_whitener` is deleted) and reads back whitened rows only. Cold build 370 s -> **129 s** (forward + readback 309 -> 74 s; host copy + norms 49-54 s
+unchanged); short-eval CE identical (1.0745 both). Quantising on the device before readback (to save the 4x readback) is not done: the
+remaining 74 s is mostly forward compute, and the host copy + norms (49 s) is the next largest phase.
