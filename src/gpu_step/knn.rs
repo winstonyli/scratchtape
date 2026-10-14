@@ -62,14 +62,14 @@ pub struct KnnStore {
     pending_keys: Vec<f32>,
     /// A key's byte, plus `DOC` for a key added with `add_doc`.
     pending_vals: Vec<u16>,
-    sample_keys: Vec<f32>,
     /// Keys and queries as f16 on the matrix cores (the default; `KNN_F32=1` selects the exact f32 path): about 2x faster matmul and half the key memory, but
     /// distances carry f16 rounding (~1e-3 relative); norms are taken from the rounded vectors so a distance is exactly
     /// the squared distance between the rounded vectors.
     f16: bool,
     /// Wall time spent in `flush` so far: [host copy + norms + upload, unused] (diagnostic).
     pub flush_time: [std::time::Duration; 2],
-    /// Device copy of `sample_keys` as (keys, norms, len) chunks, with the sample count it was built from.
+    /// The key sample (every `SAMPLE_STRIDE`-th key, from the first) of the uploaded tiles as (keys, norms, len) chunks of `tile` keys, with
+    /// the number of sample keys they hold; derived on the device from the tiles, so it never crosses the link.
     sample_dev: RefCell<(usize, Vec<(Handle, Handle, usize)>)>,
     /// Device scratch buffers by slot (`S_*`), grown on demand: a fresh buffer per call made `empty` the main thread's biggest
     /// cost in an IVF search, since each call waits for the device thread. The queue is in order, so a slot's next user overwrites
@@ -128,7 +128,6 @@ impl KnnStore {
             tiles: vec![],
             pending_keys: vec![],
             pending_vals: vec![],
-            sample_keys: vec![],
             f16,
             flush_time: [std::time::Duration::ZERO; 2],
             sample_dev: RefCell::new((0, vec![])),
@@ -162,11 +161,6 @@ impl KnnStore {
 
     fn add_tagged(&mut self, keys: &[f32], vals: &[u8], tag: u16) {
         assert_eq!(keys.len(), vals.len() * self.d);
-        // Sampled on arrival, not at upload: an online memory's in-document keys wait in the pending tile and must be sampled too.
-        let first = self.len();
-        for i in (first.next_multiple_of(SAMPLE_STRIDE) - first..vals.len()).step_by(SAMPLE_STRIDE) {
-            self.sample_keys.extend_from_slice(&keys[i * self.d..(i + 1) * self.d]);
-        }
         self.pending_keys.extend_from_slice(keys);
         self.pending_vals.extend(vals.iter().map(|&v| v as u16 + tag));
         while self.pending_vals.len() >= self.tile {
@@ -349,21 +343,55 @@ impl KnnStore {
         }
     }
 
-    /// Uploads the sample keys if more arrived since the last call: full chunks stay on the device (the sample only
-    /// grows at the end), so an online memory re-uploads just the last partial chunk.
+    /// The sample chunks (see `sample_dev`): tile chunks are gathered on the device from the uploaded tiles (full ones are kept
+    /// between calls; the partial last one is rebuilt when tiles were added), then one chunk for the pending keys from the host.
     fn sample_chunks(&self) -> Vec<(Handle, Handle, usize)> {
-        let n = self.sample_keys.len() / self.d;
+        let (up, rw) = (self.uploaded(), if self.f16 { self.d / 2 } else { self.d });
+        let n_up = up.div_ceil(SAMPLE_STRIDE);
         let mut dev = self.sample_dev.borrow_mut();
-        if dev.0 != n {
+        if dev.0 != n_up {
             let keep = dev.0 / self.tile;
             dev.1.truncate(keep);
-            for c in self.sample_keys[keep * self.tile * self.d..].chunks(self.tile * self.d) {
-                let (keys, norms) = self.upload_keys(c);
-                dev.1.push((keys, upload_f32(&norms), norms.len()));
+            for s0 in (dev.1.len() * self.tile..n_up).step_by(self.tile) {
+                let s1 = (s0 + self.tile).min(n_up);
+                let out = client().empty((s1 - s0).next_multiple_of(16) * rw * 4);
+                let out_n = client().empty((s1 - s0) * 4);
+                let mut g = 0usize;
+                for t in &self.tiles {
+                    // This tile holds sample keys lo..hi (key s is row s * SAMPLE_STRIDE of the store).
+                    let (lo, hi) = ((g.div_ceil(SAMPLE_STRIDE)).max(s0), ((g + t.len).div_ceil(SAMPLE_STRIDE)).min(s1));
+                    if lo < hi {
+                        let (src, _) = self.rows_f16(t, 0, t.len.next_multiple_of(16));
+                        let count = hi - lo;
+                        super::count_launch();
+                        #[rustfmt::skip]
+                        k_gather_rows::launch(client(), cubes(count * rw), CubeDim::new_1d(EW_DIM), buf(&src, t.len.next_multiple_of(16) * rw), buf(&t.norms, t.len), buf(&out, (s1 - s0).next_multiple_of(16) * rw), buf(&out_n, s1 - s0), (lo * SAMPLE_STRIDE - g) as u32, SS, (lo - s0) as u32, count as u32, rw as u32);
+                    }
+                    g += t.len;
+                }
+                dev.1.push((out, out_n, s1 - s0));
             }
-            dev.0 = n;
+            dev.0 = n_up;
         }
-        dev.1.clone()
+        let mut chunks = dev.1.clone();
+        let first = (SAMPLE_STRIDE - up % SAMPLE_STRIDE) % SAMPLE_STRIDE;
+        let rows: Vec<f32> = (first..self.pending_vals.len()).step_by(SAMPLE_STRIDE).flat_map(|r| self.pending_keys[r * self.d..(r + 1) * self.d].iter().copied()).collect();
+        if !rows.is_empty() {
+            let (keys, norms) = self.upload_keys(&rows);
+            chunks.push((keys, upload_f32(&norms), norms.len()));
+        }
+        chunks
+    }
+
+    /// The sample as f32 rows (f16 stores), read back from the device.
+    fn sample_host(&self) -> Vec<f32> {
+        assert!(self.f16);
+        let mut out = vec![];
+        for (keys, _, len) in self.sample_chunks() {
+            let bytes = client().read_one(keys).unwrap();
+            out.extend(f16::from_bytes(&bytes)[..len * self.d].iter().map(|x| x.to_f32()));
+        }
+        out
     }
 
     /// One block of `q` queries. With a threshold `rank`, returns None when some query's threshold left fewer than `KMAX` keys.
@@ -678,6 +706,21 @@ fn merged_lists(best_d: &Handle, best_v: &Handle, q: usize, parts: usize) -> (Ve
     (read(&od), read(&ov))
 }
 
+/// Copies `count` rows of `row_words` 32-bit words from `src` (every `stride`-th row from row `first`) to `out` from row `o0`, and
+/// their norms. Typeless, so it serves f16 and f32 keys.
+#[cube(launch)]
+fn k_gather_rows(src: &[u32], src_norms: &[f32], out: &mut [u32], out_norms: &mut [f32], first: u32, stride: u32, o0: u32, count: u32, row_words: u32) {
+    let t = ABSOLUTE_POS as u32;
+    if t < count * row_words {
+        let j = t / row_words;
+        let w = t % row_words;
+        out[((o0 + j) * row_words + w) as usize] = src[((first + j * stride) * row_words + w) as usize];
+        if w == 0 {
+            out_norms[(o0 + j) as usize] = src_norms[(first + j * stride) as usize];
+        }
+    }
+}
+
 /// Levels a sift-down can descend in a heap of `KM` entries.
 const HEAP_LEVELS: u32 = 7;
 
@@ -971,7 +1014,7 @@ mod tests {
         let mut store = KnnStore::with_precision(d, 16384, false);
         store.add(&keys, &vals);
         store.finish();
-        assert!(store.sample_keys.len() / d >= n / SAMPLE_STRIDE);
+        assert_eq!(store.sample_chunks().iter().map(|c| c.2).sum::<usize>(), n.div_ceil(SAMPLE_STRIDE));
         // Always-visible prefix 20000, then a per-query range; some ranges are narrow (fewer than 16 sample hits).
         let ranges: Vec<(u32, u32)> = (0..rows).map(|r| (30000 + (r as u32 * 331) % 9000, 30000 + (r as u32 * 331) % 9000 + [100, 700, 5000, 25000][r % 4])).collect();
         for (mask, always) in [(None, 0u32), (Some(&ranges[..]), 20000u32)] {

@@ -50,7 +50,7 @@ impl KnnStore {
             put_bytes(&mut w, f32::as_bytes(&read(&t.norms)))?;
             put_bytes(&mut w, f32::as_bytes(&read(&t.vals)))?;
         }
-        put_bytes(&mut w, f32::as_bytes(&self.sample_keys))?;
+        put_bytes(&mut w, &[])?; // the key sample (older files carry one; it is derived from the tiles now)
         match &self.ivf {
             None => put(&mut w, 0)?,
             Some(ivf) => {
@@ -113,7 +113,8 @@ impl KnnStore {
         });
         read_err?;
         assert_eq!(s.tiles.len(), ntiles);
-        s.sample_keys = f32::from_bytes(&get_bytes(&mut r)?).to_vec();
+        let skip = get(&mut r)? as i64;
+        r.seek_relative(skip)?;
         if get(&mut r)? == 1 {
             let (nlist, n) = (get(&mut r)? as usize, get(&mut r)? as usize);
             let keys = client().create_from_slice(&get_bytes(&mut r)?);

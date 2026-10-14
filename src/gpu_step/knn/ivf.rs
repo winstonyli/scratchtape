@@ -350,16 +350,17 @@ impl KnnStore {
     pub fn build_ivf(&mut self, nlist: usize) {
         assert!(self.f16 && self.ivf.is_none() && self.pending_vals.is_empty(), "build_ivf: f16 store, once, after finish");
         let (d, n) = (self.d, self.uploaded());
-        let ns = self.sample_keys.len() / d;
+        let sample = self.sample_host();
+        let ns = sample.len() / d;
         assert!(nlist <= self.tile && ns >= 8 * nlist, "build_ivf: {nlist} cells from {ns} sample keys");
         let t0 = std::time::Instant::now();
         let dist = client().empty(self.tile * nlist.next_multiple_of(16) * 4);
         // Lloyd's algorithm on the sample, starting from evenly spaced sample keys.
-        let mut cent: Vec<f32> = (0..nlist).flat_map(|c| self.sample_keys[(c * ns / nlist) * d..][..d].to_vec()).collect();
+        let mut cent: Vec<f32> = (0..nlist).flat_map(|c| sample[(c * ns / nlist) * d..][..d].to_vec()).collect();
         for it in 0..KMEANS_ITERS {
             let c = Cent::new(&cent, d);
             let (mut sum, mut count) = (vec![0f32; nlist * d], vec![0usize; nlist]);
-            for block in self.sample_keys.chunks(self.tile * d) {
+            for block in sample.chunks(self.tile * d) {
                 let (kh, _) = self.upload_keys(block);
                 for (j, &a) in self.nearest_centroid(&kh, 0, block.len() / d, &c, &dist).iter().enumerate() {
                     count[a as usize] += 1;
@@ -372,7 +373,7 @@ impl KnnStore {
                 } else {
                     // An empty cell restarts at another sample key.
                     let j = (a * 7919 + it * 104729) % ns;
-                    cent[a * d..(a + 1) * d].copy_from_slice(&self.sample_keys[j * d..(j + 1) * d]);
+                    cent[a * d..(a + 1) * d].copy_from_slice(&sample[j * d..(j + 1) * d]);
                 }
             }
         }
@@ -432,6 +433,7 @@ impl KnnStore {
             i += t.len;
         }
         self.tiles.clear();
+        *self.sample_dev.borrow_mut() = (0, vec![]); // the rows moved
         for (ci, (kb, vb)) in keys.chunks(self.tile * kb).zip(vals.chunks(self.tile)).enumerate() {
             let tile = if self.kbits > 0 {
                 self.tile_of_quant(kb, &scales[ci * self.tile..][..vb.len()], &norms[ci * self.tile..][..vb.len()], vb)
