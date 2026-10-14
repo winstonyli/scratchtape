@@ -1603,7 +1603,7 @@ Paired A/B on novels22, seq 128, the 64M recipe otherwise (dropout 0.1, wd 2e-4,
 | 4.10M (end) | 1.1502 | 1.1623 |
 
 The aux models led by 0.002 at 1M windows (inside the noise) and ended 0.012 worse; the two seeds of one condition agree within
-0.005. They also cost 17% more per step (10.3 vs 9.0 ms) and their train-probe CE was higher (1.077 vs 1.064 at 1.6M windows), so
+0.005. They also cost 17% more per step (10.3 vs 9.0 ms) and their train-probe CE was higher (1.077 vs 1.064, mean of the two seeds, at the end), so
 at 2M parameters the extra targets compete for the trunk's capacity rather than sharing it. Not tried: a smaller weight (0.05),
 the word-start head alone, or a later start (the heads switched on after most of training); a monotone loss in capacity makes
 those unlikely to reach the +0.005 bar. Idea 3 is closed at this size.
