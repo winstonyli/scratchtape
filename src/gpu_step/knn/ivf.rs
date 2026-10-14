@@ -228,11 +228,10 @@ fn k_scan(
         let p = t / nq;
         let base = t * KM;
         let thr_q = thr[gi as usize];
-        let mut worst = best_d[(base + KM - 1) as usize];
+        let mut worst = best_d[base as usize];
         if thr_q < worst {
             worst = thr_q;
         }
-        let mut cnt = 0u32;
         for v in q_off[gi as usize]..q_off[(gi + 1) as usize] {
             let len = v_len[v as usize];
             let chunk = (len + parts - 1) / parts;
@@ -245,35 +244,8 @@ fn k_scan(
                 if jj < len {
                     let dist = norms[(g0 + jj) as usize] - 2.0 * ws[(dbase + jj * stride) as usize];
                     if dist < worst {
-                        // As in `k_topk`: insert at the rank of `dist`, shifting the tail down.
-                        let mut lo_i = 0u32;
-                        let mut hi_i = lo_i + KM;
-                        for _it in 0..9 {
-                            if lo_i < hi_i {
-                                let mid = (lo_i + hi_i) / 2;
-                                if best_d[(base + mid) as usize] <= dist {
-                                    lo_i = mid + 1;
-                                } else {
-                                    hi_i = mid;
-                                }
-                            }
-                        }
-                        let pos = lo_i;
-                        let mut top = cnt;
-                        if top > KM - 1 {
-                            top = KM - 1;
-                        }
-                        if cnt < KM {
-                            cnt += 1;
-                        }
-                        for s in 0..top - pos {
-                            let i = top - s;
-                            best_d[(base + i) as usize] = best_d[(base + i - 1) as usize];
-                            best_v[(base + i) as usize] = best_v[(base + i - 1) as usize];
-                        }
-                        best_d[(base + pos) as usize] = dist;
-                        best_v[(base + pos) as usize] = vals[(g0 + jj) as usize];
-                        worst = best_d[(base + KM - 1) as usize];
+                        heap_replace(best_d, best_v, base, KM, dist, vals[(g0 + jj) as usize]);
+                        worst = best_d[base as usize];
                         if thr_q < worst {
                             worst = thr_q;
                         }

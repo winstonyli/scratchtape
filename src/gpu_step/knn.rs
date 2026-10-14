@@ -672,11 +672,66 @@ fn merged_lists(best_d: &Handle, best_v: &Handle, q: usize, parts: usize) -> (Ve
     assert!(parts <= MERGE_PARTS_MAX);
     let (od, ov) = (client().empty(q * KMAX * 4), client().empty(q * KMAX * 4));
     super::count_launch();
+    k_sort_lists::launch(client(), cubes(parts * q), CubeDim::new_1d(EW_DIM), buf(best_d, parts * q * KMAX), buf(best_v, parts * q * KMAX), (parts * q) as u32);
+    super::count_launch();
     k_merge_parts::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(best_d, parts * q * KMAX), buf(best_v, parts * q * KMAX), buf(&od, q * KMAX), buf(&ov, q * KMAX), q as u32, parts as u32);
     (read(&od), read(&ov))
 }
 
-/// Merges one tile into each query's running top list (`best_*`, ascending, `KM` per query). `d` is the
+/// Levels a sift-down can descend in a heap of `KM` entries.
+const HEAP_LEVELS: u32 = 7;
+
+/// Replaces the root of the max-heap of `size` entries at `base` (the worst kept key) by (dist, val) and sifts it down: ~7 levels
+/// of two reads and a write, where a sorted list shifted ~KM/2 entries per insertion.
+#[cube]
+fn heap_replace(best_d: &mut [f32], best_v: &mut [f32], base: u32, size: u32, dist: f32, val: f32) {
+    let mut i = 0u32;
+    let mut go = true;
+    for _l in 0..HEAP_LEVELS {
+        if go {
+            let l = 2 * i + 1;
+            if l < size {
+                let mut c = l;
+                if l + 1 < size {
+                    if best_d[(base + l + 1) as usize] > best_d[(base + l) as usize] {
+                        c = l + 1;
+                    }
+                }
+                let cd = best_d[(base + c) as usize];
+                if cd > dist {
+                    best_d[(base + i) as usize] = cd;
+                    best_v[(base + i) as usize] = best_v[(base + c) as usize];
+                    i = c;
+                } else {
+                    go = false;
+                }
+            } else {
+                go = false;
+            }
+        }
+    }
+    best_d[(base + i) as usize] = dist;
+    best_v[(base + i) as usize] = val;
+}
+
+/// Heapsort in place: each of the `lists` max-heaps of `KM` entries (list l at l * KM) becomes ascending. One thread per list.
+#[cube(launch)]
+fn k_sort_lists(best_d: &mut [f32], best_v: &mut [f32], lists: u32) {
+    let l = ABSOLUTE_POS as u32;
+    if l < lists {
+        let base = l * KM;
+        for s in 0..KM - 1 {
+            let n = KM - s;
+            let (top_d, top_v) = (best_d[base as usize], best_v[base as usize]);
+            let (last_d, last_v) = (best_d[(base + n - 1) as usize], best_v[(base + n - 1) as usize]);
+            best_d[(base + n - 1) as usize] = top_d;
+            best_v[(base + n - 1) as usize] = top_v;
+            heap_replace(best_d, best_v, base, n - 1, last_d, last_v);
+        }
+    }
+}
+
+/// Merges one tile into each query's running top list (`best_*`, a max-heap of `KM` entries per query, root = worst; `merged_lists` sorts them). `d` is the
 /// tile's transposed matmul output: d[j * q + qi] = q·key_j; this launch covers the tile's keys j0..j0 + len, whose
 /// store-wide indices start at gj0 (keys outside a query's allowed ranges count as infinitely far).
 #[allow(clippy::too_many_arguments)]
@@ -706,26 +761,11 @@ fn k_topk(
         let start = (t / q) * chunk;
         let base = t * KM;
         let thr_q = thr[qi as usize];
-        let mut worst = best_d[(base + KM - 1) as usize];
+        let mut worst = best_d[base as usize];
         if thr_q < worst {
             worst = thr_q;
         }
         let (lo_q, hi_q) = (lo[qi as usize], hi[qi as usize]);
-        // Live entries in the list (the rest is INF padding, which an insertion need not move): the first INF, by binary
-        // search, since the list is sorted and earlier slices or tiles may have filled part of it.
-        let mut c_lo = 0u32;
-        let mut c_hi = c_lo + KM;
-        for _it in 0..9 {
-            if c_lo < c_hi {
-                let mid = (c_lo + c_hi) / 2;
-                if best_d[(base + mid) as usize] < f32::INFINITY {
-                    c_lo = mid + 1;
-                } else {
-                    c_hi = mid;
-                }
-            }
-        }
-        let mut cnt = c_lo;
         for jl in 0..chunk {
             let jj = start + jl;
             if jj < len {
@@ -741,37 +781,8 @@ fn k_topk(
                     }
                 }
                 if dist < worst {
-                    // Insert at the rank of `dist` (the number of kept entries not above it, by binary search), shifting the
-                    // tail down.
-                    let mut lo_i = 0u32;
-                    let mut hi_i = lo_i + KM;
-                    for _it in 0..9 {
-                        if lo_i < hi_i {
-                            let mid = (lo_i + hi_i) / 2;
-                            if best_d[(base + mid) as usize] <= dist {
-                                lo_i = mid + 1;
-                            } else {
-                                hi_i = mid;
-                            }
-                        }
-                    }
-                    let p = lo_i;
-                    // Entries p..top move down one place (top = the last live entry; with a full list it falls off).
-                    let mut top = cnt;
-                    if top > KM - 1 {
-                        top = KM - 1;
-                    }
-                    if cnt < KM {
-                        cnt += 1;
-                    }
-                    for s in 0..top - p {
-                        let i = top - s;
-                        best_d[(base + i) as usize] = best_d[(base + i - 1) as usize];
-                        best_v[(base + i) as usize] = best_v[(base + i - 1) as usize];
-                    }
-                    best_d[(base + p) as usize] = dist;
-                    best_v[(base + p) as usize] = vals[j as usize];
-                    worst = best_d[(base + KM - 1) as usize];
+                    heap_replace(best_d, best_v, base, KM, dist, vals[j as usize]);
+                    worst = best_d[base as usize];
                     if thr_q < worst {
                         worst = thr_q;
                     }
