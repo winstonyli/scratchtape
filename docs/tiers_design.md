@@ -1065,7 +1065,7 @@ words, 42%; it does not use repeats of rare words in the book):
 4. Hashed previous-word / prefix embeddings as extra inputs (capacity as lookups); adds parameters.
 5. Train with the tiers in mind: distil the stack into the model, or train on the residual the tiers leave (the 32M novels22 model
    gained 0.0155 alone but 0.0023 in the stack, so the two overlap). Earlier mutual distillation (same-size teacher) hurt.
-6. Context-dependent tier gating (`gate_fit`, `words_gate_fit` exist; outcomes not re-read).
+6. Context-dependent tier gating: **killed** (2026-10-07/08: kNN weight gate +0.001, words weight gate +0.0004 held-out; weights are within ~0.001 of optimal; see "Verdict" under `gate_fit`).
 Also open: the recency prior for rare in-lexicon words (~0.005 est.; see "Recency of in-lexicon words").
 
 ### Dynamic evaluation, model alone (2026-10-10)
@@ -1607,3 +1607,38 @@ The aux models led by 0.002 at 1M windows (inside the noise) and ended 0.012 wor
 at 2M parameters the extra targets compete for the trunk's capacity rather than sharing it. Not tried: a smaller weight (0.05),
 the word-start head alone, or a later start (the heads switched on after most of training); a monotone loss in capacity makes
 those unlikely to reach the +0.005 bar. Idea 3 is closed at this size.
+
+### Where the stack gains, by position class (2026-10-14)
+
+`classes=1` on the current stack (novels150 2-bit memory, half 0; gain columns in 1e-3 nats of overall CE, total 41.1):
+
+| class | share of positions | model CE | gain |
+|---|---|---|---|
+| word start, lower (after non-letter -> lower) | 16.2% | 2.444 | 7.58 |
+| word start, upper | 2.0% | 2.922 | 1.32 |
+| inside a word (after letter -> lower) | 57.8% | 0.734 | 27.77 |
+| space after a letter | 14.1% | 0.299 | 2.38 |
+| punctuation after a letter | 3.1% | 2.148 | 1.88 |
+
+The tiers (lexicon, words, memory) remove 6.5% of the CE inside words but only 1.9% at word starts, which hold 45% of the model's CE.
+Dynamic evaluation (in the stack since 2026-10-11) and tier gating (killed) are therefore settled; what is left for training is
+whether capacity moved towards word starts helps the *stack*.
+
+### Word-start loss weighting: negative (2026-10-14)
+
+Spike of "train with the tiers in mind" (idea 5), in its simplest form; code reverted (per-row loss weights in the tape's cross-entropy,
+`ws_weight=<a>` in `fused_models_check`: weight a where the input byte is not a letter and the target is, rescaled to mean 1).
+Models of 4.1M windows (novels22, seq 128, 64M recipe otherwise; seed 1 of K=2), then the tier stack (lexicon 0.3, words 0.15, knn
+128, dynamic evaluation 4 windows SGD 0.05, memory from the model's own keys on novels22 train, 4-bit, 2048 cells, half 0):
+
+| word-start weight | model alone | stack | tiers' gain | word-start CE (model) |
+|---|---|---|---|---|
+| 1 | 1.0552 | **1.0110** | -0.0442 | 2.488 |
+| 2 | 1.0575 | 1.0121 | -0.0453 | 2.461 |
+| 4 | 1.0687 | 1.0160 | -0.0528 | |
+
+Weighting does move capacity (word-start CE falls 0.027 at weight 2) and the tiers recover part of the loss elsewhere (their gain
+rises with the weight), but the stack gets monotonically worse. Held-out CE is not improved by redistributing a 2M model's capacity
+towards the positions the tiers help least. One seed per cell on half 0; seed spread of the model alone is ~0.005 at the end of
+training, so weight 2 is a tie and weight 4 a loss. Ideas 3 and 5 (as tried) are closed; what remains of the list is 2 (in-model
+memory, large) and 4 (hashed previous-word inputs, adds parameters).
