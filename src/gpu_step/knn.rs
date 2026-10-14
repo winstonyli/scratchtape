@@ -17,8 +17,8 @@ mod ivf;
 
 /// Added to a value to mark an in-document key (`KnnStore::add_doc`).
 pub const DOC: u16 = 256;
-/// Neighbours kept per query.
-pub const KMAX: usize = 256;
+/// Neighbours kept per query (the best stack uses k = 128; k = 256 gained ~0.001 CE for a ~4% slower eval, so the lists are not kept longer).
+pub const KMAX: usize = 128;
 const KM: u32 = KMAX as u32;
 /// Queries per block (bounds the [tile, block] distance buffer).
 const QBLOCK: usize = 2048;
