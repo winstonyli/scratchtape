@@ -1100,6 +1100,8 @@ fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, a
 }
 
 fn main() {
+    let t_main = std::time::Instant::now();
+    let stamp = |what: &str| eprintln!("setup: {what} at {:.1}s", t_main.elapsed().as_secs_f64());
     let args: Vec<String> = std::env::args().skip(1).collect();
     assert!(!args.is_empty(), "usage: tier_eval <checkpoint> [key=value ...] (see the file header)");
     let ckpt = &args[0];
@@ -1158,6 +1160,7 @@ fn main() {
     let _lease = gpu_lease::hold(Kind::Shared, "scratchtape tier_eval", Duration::from_secs(4 * 3600));
     let mut dev = DeviceParams::upload(&flat);
 
+    stamp("corpus and checkpoint read");
     // Held-out words the train split has never shown: the ceiling on what a train-split lexicon can know.
     let mut train_words: std::collections::HashMap<Vec<u8>, u32> = std::collections::HashMap::new();
     for w in word_list(&train) {
@@ -1187,8 +1190,10 @@ fn main() {
         assert!(["train", "held", "both"].contains(&from.as_str()), "store_from is train, held or both");
         assert!(from == "train" || causal || stride > 1, "store_from=held needs stride > 1 so some held-out windows are left unscored");
         if let Some(a) = opt.get("whiten").map(|a| a.parse::<f64>().unwrap_or_else(|_| panic!("whiten=<alpha>, got {a}"))).filter(|&a| a > 0.0) {
+            stamp("before whitener");
             fit_whitener(&dev, &cfg, &train, tap, a, size("whiten_rank", &cfg.d.to_string()));
         }
+        stamp("after whitener");
         // `memcache=<dir>` (with `ivf`): the built memory is saved there once and reloaded by later runs with the same model and build options.
         let cache = opt.get("memcache").zip(opt.get("ivf")).map(|(dir, ivf)| {
             let meta = std::fs::metadata(ckpt).unwrap_or_else(|e| panic!("{ckpt}: {e}"));
@@ -1289,6 +1294,7 @@ fn main() {
         None
     };
 
+    stamp("memory ready");
     let dump_spec = opt.contains_key("dump").then(|| specs.len() - 1);
     let wdump_spec = opt.contains_key("wdump").then(|| specs.len() - 1);
     let mut tiers: Vec<Vec<Box<dyn Tier>>> = specs.iter().enumerate().map(|(i, s)| build_tier(s, &train, &store, dump_spec == Some(i), wdump_spec == Some(i))).collect();
@@ -1335,6 +1341,7 @@ fn main() {
     let starts: Vec<usize> = (offset * unit..held_out.len() - seq_len()).step_by(unit * stride).filter(|s| s / seq_len() * part_n / n_win == part_i).collect();
     // Wall time per phase: forward launch + readback, tier prepare (kNN search + readback), per-row scoring, online writes.
     let mut phase = [std::time::Duration::ZERO; 4];
+    stamp("tiers built, chunk loop starts");
     let t_all = std::time::Instant::now();
     let (mut t_lap, mut paused) = (std::time::Instant::now(), std::time::Duration::ZERO);
     // Chunks are run through the model (and adapted) `batch` at a time, then their neighbour searches are done together,
