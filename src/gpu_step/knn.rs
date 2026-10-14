@@ -205,10 +205,10 @@ impl KnnStore {
                                 *o = (x / scale).round() as i32;
                             }
                             let row = &mut qc[r * kb..(r + 1) * kb];
-                            if bits == 8 {
-                                row.iter_mut().zip(&v).for_each(|(b, &x)| *b = x as i8 as u8);
-                            } else {
-                                row.iter_mut().zip(v.chunks(2)).for_each(|(b, p)| *b = (p[0] & 15) as u8 | ((p[1] & 15) as u8) << 4);
+                            row.fill(0);
+                            for (i, &x) in v.iter().enumerate() {
+                                let at = i * bits as usize;
+                                row[at / 8] |= ((x & ((1 << bits) - 1)) as u8) << (at % 8);
                             }
                             scc[r] = scale;
                             nc[r] = v.iter().map(|&x| f16::from_f32(x as f32 * scale).to_f32().powi(2)).sum();

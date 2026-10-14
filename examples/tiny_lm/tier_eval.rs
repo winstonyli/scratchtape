@@ -1318,6 +1318,7 @@ fn main() {
         None
     };
 
+    client().memory_cleanup(); // a cold build's transient buffers would otherwise stay pooled and starve the search workspace
     stamp("memory ready");
     let dump_spec = opt.contains_key("dump").then(|| specs.len() - 1);
     let wdump_spec = opt.contains_key("wdump").then(|| specs.len() - 1);
