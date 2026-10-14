@@ -520,14 +520,14 @@ impl KnnStore {
         let mut out = Vec::with_capacity(q * KMAX);
         for r in 0..q {
             let qn: f32 = block[r * self.d..(r + 1) * self.d].iter().map(|x| x * x).sum();
-            let c: Vec<(f32, f32)> = (0..KMAX).map(|j| (bd[r * KMAX + j], bv[r * KMAX + j])).collect();
+            let c: Vec<(f32, u16)> = (0..KMAX).map(|j| (bd[r * KMAX + j], bv[r * KMAX + j])).collect();
             if thr_q[r].is_finite() && c[KMAX - 1].0.is_infinite() {
                 if timing {
                     eprintln!("knn: query {r} had fewer than {KMAX} keys under its rank-{rank:?} threshold {}", thr_q[r]);
                 }
                 return None;
             }
-            out.extend(c.iter().map(|&(dd, v)| ((dd + qn).max(0.0), v as u16)));
+            out.extend(c.iter().map(|&(dd, v)| ((dd + qn).max(0.0), v)));
         }
         Some(out)
     }
@@ -589,7 +589,7 @@ fn rank_of_parts(thr: &[f32], r: usize, q: usize, parts: usize, rank: usize) -> 
     *c.select_nth_unstable_by(rank - 1, |a, b| a.partial_cmp(b).unwrap()).1
 }
 
-/// Pass 1: the `THRESH_RANK` nearest sample keys of each (query, part) thread (ascending, in `best`, `TR` per thread;
+/// Pass 1: the `THRESH_RANK` nearest sample keys of each (query, part) thread (a max-heap, in `best`, `TR` per thread;
 /// thread t scans part t / q of the chunk for query t % q, as in `k_topk`; the host merges the parts). The sample chunk's
 /// key i has store-wide index (gs0 + i) * SAMPLE_STRIDE; keys outside the query's allowed ranges are skipped.
 #[allow(clippy::too_many_arguments)]
@@ -615,18 +615,8 @@ fn k_thresh(d: &[f32], norms: &[f32], best: &mut [f32], lo: &[u32], hi: &[u32], 
                         dist = f32::INFINITY;
                     }
                 }
-                if dist < best[(base + TR - 1) as usize] {
-                    let mut p = 0u32;
-                    for i in 0..TR {
-                        if best[(base + i) as usize] <= dist {
-                            p += 1;
-                        }
-                    }
-                    for s in 0..TR - 1 - p {
-                        let i = TR - 1 - s;
-                        best[(base + i) as usize] = best[(base + i - 1) as usize];
-                    }
-                    best[(base + p) as usize] = dist;
+                if dist < best[base as usize] {
+                    heap_replace_key(best, base, TR, dist);
                 }
             }
         }
@@ -659,7 +649,7 @@ const MERGE_PARTS_MAX: usize = 64;
 /// Each query's `KM` nearest from its `parts` ascending lists (`best_*`, list p of query i at (p * q + i) * KM): out_*[i * KM ..], ascending,
 /// infinity-padded. One thread per query; this keeps the host from reading back and sorting `parts` lists per query.
 #[cube(launch)]
-fn k_merge_parts(best_d: &[f32], best_v: &[f32], out_d: &mut [f32], out_v: &mut [f32], q: u32, parts: u32) {
+fn k_merge_parts(best_d: &[f32], best_v: &[f32], out_d: &mut [f32], out_v: &mut [u32], q: u32, parts: u32) {
     let i = ABSOLUTE_POS as u32;
     if i < q {
         let mut head = Array::<u32>::new(MERGE_PARTS_MAX);
@@ -687,7 +677,14 @@ fn k_merge_parts(best_d: &[f32], best_v: &[f32], out_d: &mut [f32], out_v: &mut 
             } else {
                 out_d[(i * KM + k) as usize] = f32::INFINITY;
             }
-            out_v[(i * KM + k) as usize] = best_v[((bp * q + i) * KM + h) as usize];
+            // Values (< 2^16) go out two to a word: entry k in half (k % 2) of word k / 2.
+            let v = u32::cast_from(best_v[((bp * q + i) * KM + h) as usize]);
+            let w = (i * KM + k) / 2;
+            if k % 2 == 0 {
+                out_v[w as usize] = v;
+            } else {
+                out_v[w as usize] = out_v[w as usize] | (v << 16);
+            }
             if found == 1u32 {
                 head[bp as usize] = h + 1;
             }
@@ -696,14 +693,16 @@ fn k_merge_parts(best_d: &[f32], best_v: &[f32], out_d: &mut [f32], out_v: &mut 
 }
 
 /// Reads back the merged lists of `q` queries: ([q * KMAX] distances, [q * KMAX] values), ascending per query.
-fn merged_lists(best_d: &Handle, best_v: &Handle, q: usize, parts: usize) -> (Vec<f32>, Vec<f32>) {
+fn merged_lists(best_d: &Handle, best_v: &Handle, q: usize, parts: usize) -> (Vec<f32>, Vec<u16>) {
     assert!(parts <= MERGE_PARTS_MAX);
-    let (od, ov) = (client().empty(q * KMAX * 4), client().empty(q * KMAX * 4));
+    let (od, ov) = (client().empty(q * KMAX * 4), client().empty(q * KMAX * 2));
     super::count_launch();
     k_sort_lists::launch(client(), cubes(parts * q), CubeDim::new_1d(EW_DIM), buf(best_d, parts * q * KMAX), buf(best_v, parts * q * KMAX), (parts * q) as u32);
     super::count_launch();
-    k_merge_parts::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(best_d, parts * q * KMAX), buf(best_v, parts * q * KMAX), buf(&od, q * KMAX), buf(&ov, q * KMAX), q as u32, parts as u32);
-    (read(&od), read(&ov))
+    k_merge_parts::launch(client(), cubes(q), CubeDim::new_1d(EW_DIM), buf(best_d, parts * q * KMAX), buf(best_v, parts * q * KMAX), buf(&od, q * KMAX), buf(&ov, q * KMAX / 2), q as u32, parts as u32);
+    let packed = client().read_one(ov).unwrap();
+    let vals = u32::from_bytes(&packed).iter().flat_map(|w| [(w & 0xffff) as u16, (w >> 16) as u16]).collect();
+    (read(&od), vals)
 }
 
 /// Copies `count` rows of `row_words` 32-bit words from `src` (every `stride`-th row from row `first`) to `out` from row `o0`, and
@@ -755,6 +754,36 @@ fn heap_replace(best_d: &mut [f32], best_v: &mut [f32], base: u32, size: u32, di
     }
     best_d[(base + i) as usize] = dist;
     best_v[(base + i) as usize] = val;
+}
+
+/// `heap_replace` for a list of distances only (the threshold samples).
+#[cube]
+fn heap_replace_key(best: &mut [f32], base: u32, size: u32, dist: f32) {
+    let mut i = 0u32;
+    let mut go = true;
+    for _l in 0..HEAP_LEVELS {
+        if go {
+            let l = 2 * i + 1;
+            if l < size {
+                let mut c = l;
+                if l + 1 < size {
+                    if best[(base + l + 1) as usize] > best[(base + l) as usize] {
+                        c = l + 1;
+                    }
+                }
+                let cd = best[(base + c) as usize];
+                if cd > dist {
+                    best[(base + i) as usize] = cd;
+                    i = c;
+                } else {
+                    go = false;
+                }
+            } else {
+                go = false;
+            }
+        }
+    }
+    best[(base + i) as usize] = dist;
 }
 
 /// Heapsort in place: each of the `lists` max-heaps of `KM` entries (list l at l * KM) becomes ascending. One thread per list.

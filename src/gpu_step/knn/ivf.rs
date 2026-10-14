@@ -161,7 +161,7 @@ fn k_probe(dist: &[f32], cnorm: &[f32], out: &mut [f32], q: u32, qp: u32, nl: u3
 }
 
 /// Pass 1 of the scan: thread t = (part t / nq, query t % nq) keeps the `TR` nearest of every `SAMP`-th row of its part of
-/// query gi's row ranges (laid out as in `k_scan`), ascending, at thr_d[t * TR].
+/// query gi's row ranges (laid out as in `k_scan`), a max-heap (unsorted; the host takes a rank), at thr_d[t * TR].
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
 fn k_sample(ws: &[f32], norms: &[f32], thr_d: &mut [f32], q_off: &[u32], v_base: &[u32], v_stride: &[u32], v_g0: &[u32], v_len: &[u32], nq: u32, parts: u32) {
@@ -182,18 +182,8 @@ fn k_sample(ws: &[f32], norms: &[f32], thr_d: &mut [f32], q_off: &[u32], v_base:
                 let jj = start + sj * SAMP;
                 if jj < len {
                     let dist = norms[(g0 + jj) as usize] - 2.0 * ws[(dbase + jj * stride) as usize];
-                    if dist < thr_d[(base + TR - 1) as usize] {
-                        let mut pos = 0u32;
-                        for i in 0..TR {
-                            if thr_d[(base + i) as usize] <= dist {
-                                pos += 1;
-                            }
-                        }
-                        for s in 0..TR - 1 - pos {
-                            let i = TR - 1 - s;
-                            thr_d[(base + i) as usize] = thr_d[(base + i - 1) as usize];
-                        }
-                        thr_d[(base + pos) as usize] = dist;
+                    if dist < thr_d[base as usize] {
+                        heap_replace_key(thr_d, base, TR, dist);
                     }
                 }
             }
@@ -686,14 +676,14 @@ impl KnnStore {
         for gi in 0..nq {
             let r = qs[gi] as usize;
             let qn: f32 = rq[r * d..(r + 1) * d].iter().map(|x| x.to_f32() * x.to_f32()).sum();
-            let c: Vec<(f32, f32)> = (0..KMAX).map(|j| (bd[gi * KMAX + j], bv[gi * KMAX + j])).collect();
+            let c: Vec<(f32, u16)> = (0..KMAX).map(|j| (bd[gi * KMAX + j], bv[gi * KMAX + j])).collect();
             if thr_q[gi].is_finite() && c[KMAX - 1].0.is_infinite() {
                 // A threshold left fewer than KMAX keys: this group again without thresholds.
                 out.truncate(first);
                 stage[2] += t0.elapsed();
                 return self.scan_group(ivf, rq, rq_dev, qs, probes, nprobe, ws, false, stage, out);
             }
-            out.extend(c.iter().map(|&(dd, v)| ((dd + qn).max(0.0), v as u16)));
+            out.extend(c.iter().map(|&(dd, v)| ((dd + qn).max(0.0), v)));
         }
         stage[2] += t0.elapsed();
     }
