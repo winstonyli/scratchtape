@@ -1642,3 +1642,27 @@ rises with the weight), but the stack gets monotonically worse. Held-out CE is n
 towards the positions the tiers help least. One seed per cell on half 0; seed spread of the model alone is ~0.005 at the end of
 training, so weight 2 is a tie and weight 4 a loss. Ideas 3 and 5 (as tried) are closed; what remains of the list is 2 (in-model
 memory, large) and 4 (hashed previous-word inputs, adds parameters).
+
+### In-model kNN attention: design pass, recommendation not to build (2026-10-14)
+
+What it would be here: one attention layer (say block 2) also attends over the top-k (key, value) states retrieved from the earlier text
+of the same book (Memorizing Transformers, Wu et al. 2022), with a learned per-head gate; trained end to end so the model learns how
+to use retrieved states instead of the fixed output-level mixture.
+
+Build list: (1) the trainer samples random windows (`sample_start`), so there is no in-book history; it would need document-ordered
+batches and a per-document cache of block-2 K/V, written as training proceeds (stop-gradient); (2) a top-k attention kernel over
+that cache in `gpu_step` (scores against up to ~64k stored states, softmax over k plus the local window, backward through the retrieved
+values only); (3) a few parameters (gate, maybe a key projection), well inside 2M; (4) `tier_eval` must carry the cache through the
+chunked, adapted forward, and the dynamic-evaluation step must differentiate through it. A multi-day change across `tape.rs`, the
+trainer and `tier_eval`.
+
+Evidence on the headroom, all from this log: the in-book memory is already half of the kNN neighbours and the tuned stack prefers it
+(in-document temperature 30 vs 50); dynamic evaluation and the memory "learn the same book" (a 0.0084 model gain reached the stack
+as 0.0030, RMS's extra 0.0032 as 0.0001); a longer window is the nearest proxy for a longer in-model reach and doubled the window for
+-0.0086 on the model and -0.0021 on the stack; and the tiers barely touch word starts (1.9%), the only large CE mass left, which a
+retrieval over this book's earlier states does not contain unless the word recurs (the recency prior tested exactly that: negative).
+The expected gain on the stack is at most a few thousandths, with the same overlap that cost the longer window most of its gain.
+
+Recommendation: do not build. The cheapest falsifier, if wanted anyway, is the Transformer-XL variant (one cached previous window, no
+retrieval): it shares the trainer change (1) and the attention change (2) in simplified form and measures the same overlap; if its
+stack gain at 4M windows is under 0.003, the retrieval version is closed too. Revisit only if a cheaper variant shows more than that.

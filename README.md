@@ -105,6 +105,11 @@ exact top-128 ~0.99). With 4-bit keys the 83M-key memory of 91 novels gives 0.97
 ~11 min (whitening on the device) and is cached on disk (`memcache=<dir>`, ~30 s to reload); a scored held-out half takes ~59 s
 (48 s at 83M keys). The tiers never alter the adaptation, so their searches are batched.
 
+Where the rest sits: word-initial letters carry 45% of the model's CE and the tiers remove only 1.9% of it there (6.5% inside words).
+Tried and closed on that front (all negative, `docs/tiers_design.md`): a recency prior for rare words, tier-weight gating, auxiliary
+word-start heads, word-start loss weighting, 16384 cells. The open lines are more memory text (about -0.005 per 2.5x) and the two
+parked model changes (hashed previous-word inputs, in-model kNN attention).
+
 ## Quick start
 
 ```bash
