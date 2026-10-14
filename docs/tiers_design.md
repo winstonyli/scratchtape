@@ -1589,3 +1589,21 @@ expected small given the monotone trend. The "only measured KR&R lead" above is 
 against 58.7 s at 12288 cells, CE 0.9755 against 0.9754, build 750 s against 641 s, 10.59 GB in use. The search cost has stopped
 falling (the larger centroid pass and smaller cells cost more than they save), so 12288 stays. Cell count is closed as a lever
 at this store size.
+
+### Auxiliary word-start heads: negative at 4M windows (2026-10-14)
+
+Spike of ranked idea 3 above (code reverted; this is the record). Three extra linear heads on the final LayerNorm (bytes +2 and +3
+ahead, and the first letter of the next word), each with a cross-entropy of weight 0.2 added to the loss and dropped at inference.
+Paired A/B on novels22, seq 128, the 64M recipe otherwise (dropout 0.1, wd 2e-4, momentum 0.9), 4096000 windows, K=2 fused models
+(seeds 1, 2) per condition, main-head held-out CE (score_tail 32):
+
+| windows seen | baseline | with aux heads |
+|---|---|---|
+| 1.02M | 1.2262 | 1.2240 |
+| 4.10M (end) | 1.1502 | 1.1623 |
+
+The aux models led by 0.002 at 1M windows (inside the noise) and ended 0.012 worse; the two seeds of one condition agree within
+0.005. They also cost 17% more per step (10.3 vs 9.0 ms) and their train-probe CE was higher (1.077 vs 1.064 at 1.6M windows), so
+at 2M parameters the extra targets compete for the trunk's capacity rather than sharing it. Not tried: a smaller weight (0.05),
+the word-start head alone, or a later start (the heads switched on after most of training); a monotone loss in capacity makes
+those unlikely to reach the +0.005 bar. Idea 3 is closed at this size.
