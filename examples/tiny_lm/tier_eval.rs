@@ -1366,6 +1366,8 @@ fn main() {
     // Wall time per phase: forward launch + readback, tier prepare (kNN search + readback), per-row scoring, online writes.
     let mut phase = [std::time::Duration::ZERO; 4];
     stamp("tiers built, chunk loop starts");
+    let mu = client().memory_usage();
+    println!("device memory: {:.2} GB in use, {:.2} GB reserved", mu.bytes_in_use as f64 / 1e9, mu.bytes_reserved as f64 / 1e9);
     let t_all = std::time::Instant::now();
     let (mut t_lap, mut paused) = (std::time::Instant::now(), std::time::Duration::ZERO);
     // Chunks are run through the model (and adapted) `batch` at a time, then their neighbour searches are done together,

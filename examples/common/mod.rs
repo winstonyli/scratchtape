@@ -320,6 +320,11 @@ fn books(name: &str) -> Vec<(String, f32)> {
             let extra = ["little_women", "middlemarch", "vanity_fair", "bleak_house", "mansfield_park", "northanger_abbey", "dombey_and_son", "nicholas_nickleby", "little_dorrit", "hard_times", "silas_marner", "adam_bede", "scarlet_letter", "kidnapped", "three_musketeers", "ivanhoe", "moonstone", "woman_in_white"];
             books("novels22").into_iter().chain(extra.iter().map(|n| (read("gutenberg_memory", n, "fetch_gutenberg_memory.sh"), 1.0))).collect()
         }
+        // novels40 plus fifty-one more novels (scripts/fetch_gutenberg_memory2.sh), training text only; same held-out as novels22.
+        "novels90" => {
+            let extra = ["crime_and_punishment", "war_and_peace", "anna_karenina", "brothers_karamazov", "les_miserables", "count_of_monte_cristo", "ten_years_later", "study_in_scarlet", "return_of_sherlock_holmes", "sign_of_the_four", "pickwick_papers", "edwin_drood", "old_curiosity_shop", "barnaby_rudge", "our_mutual_friend", "mayor_of_casterbridge", "jude_the_obscure", "agnes_grey", "tenant_of_wildfell_hall", "villette", "cranford", "north_and_south", "wives_and_daughters", "jekyll_and_hyde", "lord_jim", "nostromo", "secret_agent", "invisible_man", "island_of_doctor_moreau", "first_men_in_the_moon", "twenty_thousand_leagues", "around_the_world", "journey_to_the_centre", "house_of_the_seven_gables", "last_of_the_mohicans", "little_men", "call_of_the_wild", "white_fang", "secret_garden", "little_princess", "anne_of_green_gables", "jungle_book", "four_million", "king_solomons_mines", "she", "robinson_crusoe", "gullivers_travels", "tom_jones", "connecticut_yankee", "prince_and_the_pauper", "innocents_abroad"];
+            books("novels40").into_iter().chain(extra.iter().map(|n| (read("gutenberg_memory2", n, "fetch_gutenberg_memory2.sh"), 1.0))).collect()
+        }
         _ => vec![(corpus(name).to_string(), 0.9)],
     }
 }
