@@ -299,6 +299,11 @@ pub fn read(h: &Handle) -> Vec<f32> {
     f32::from_bytes(&client().read_one(h.clone()).unwrap()).to_vec()
 }
 
+/// Several buffers in one blocking read (one wait for the device, one pass over the link).
+pub fn read_many(hs: Vec<Handle>) -> Vec<Vec<f32>> {
+    client().read(hs).iter().map(|b| f32::from_bytes(b).to_vec()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

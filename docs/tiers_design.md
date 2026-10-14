@@ -1492,3 +1492,6 @@ Startup trims (2026-10-13): the lexicon build inserted every prefix of every wor
 
 ### Result lists of 128 instead of 256 (2026-10-13)
 `KMAX` 256 -> 128: the best stack uses k = 128 and the list-insert shifting in `k_scan`/`k_topk` costs in proportion to the list length. Half-0 eval **52.5 -> 50.5 s** (tier prepare 32.0 -> 28.4 s), CE identical (0.9793), 13 knn tests pass. Costs the option of k = 256 (+0.001 CE in the older stack, `knn:256` rows above). A shared-memory candidate batch (kernel redesign) is still parked; this was the cheap form of the same lever.
+
+### Forward readbacks: whitener uploaded once, one read per forward (2026-10-13)
+Instrumented `forward` (1968 scored chunks + frozen-key forwards, ~2000 calls per half): launch ~1.4 ms, logits read ~3.2 ms (includes waiting for the forward), hidden ~1.8 ms per call. `whiten_device` re-uploaded the 256 KB whitening matrix and bias on every call (~0.9 ms at the 0.35 GB/s link); they are now uploaded once. Logits, row losses and hidden now come back in one `read_many`. Forward stage 12.1 -> 8.9 s, CE identical (0.9793); the half-0 loop is ~46 s (was 50.5). What is left per call is the logits (0.5 MB) and hidden (0.5 MB) crossing the link, plus launch; keeping hidden on the device through the kNN search is the next lever (large plumbing: the search takes host slices).

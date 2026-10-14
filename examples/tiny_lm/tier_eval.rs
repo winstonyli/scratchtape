@@ -68,7 +68,7 @@ use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::knn::{DOC, KMAX, KnnStore};
 use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::matmul::{Epilogue, MatRef, matmul_f32};
-use scratchtape::gpu_step::{DeviceParams, Handle, client, read, upload_f32};
+use scratchtape::gpu_step::{DeviceParams, Handle, client, read_many, upload_f32};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -913,12 +913,20 @@ fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], t
     }
     let mut dt = DeviceTape::new(dev);
     let (outs, logits, loss) = model_forward(&mut dt, cfg, &ids, &targets, starts.len());
-    let (logits, row_loss) = if want_logits { (read(dt.value(logits)), read(dt.row_losses(loss))) } else { (vec![], vec![]) };
-    let hidden = match (WHITEN.get(), want_hidden) {
-        (Some((mu, w)), true) => read(&whiten_device(dt.value(outs[tap]), ids.len(), mu, w, cfg.d)),
-        (None, true) => read(dt.value(outs[tap])),
-        _ => vec![],
+    // Everything the host needs comes back in one read.
+    let hidden_h = match (WHITEN.get(), want_hidden) {
+        (Some((mu, w)), true) => Some(whiten_device(dt.value(outs[tap]), ids.len(), mu, w, cfg.d)),
+        (None, true) => Some(dt.value(outs[tap]).clone()),
+        _ => None,
     };
+    let mut handles = vec![];
+    if want_logits {
+        handles.extend([dt.value(logits).clone(), dt.row_losses(loss).clone()]);
+    }
+    handles.extend(hidden_h);
+    let mut bytes = read_many(handles).into_iter();
+    let (logits, row_loss) = if want_logits { (bytes.next().unwrap(), bytes.next().unwrap()) } else { (vec![], vec![]) };
+    let hidden = bytes.next().unwrap_or_default();
     Forward { ids, targets, logits, row_loss, hidden }
 }
 
@@ -992,8 +1000,15 @@ static WHITEN: std::sync::OnceLock<(Vec<f32>, Vec<f32>)> = std::sync::OnceLock::
 /// The tap hidden states `x` ([rows, d]) as (x - mu) W^T on the device, in f32 so it equals the host formula to rounding; only the
 /// whitened rows cross the link, with no host matmul.
 fn whiten_device(x: &Handle, rows: usize, mu: &[f32], w: &[f32], d: usize) -> Handle {
-    let c: Vec<f32> = w.chunks(d).map(|row| -row.iter().zip(mu).map(|(a, b)| a * b).sum::<f32>()).collect();
-    let (wd, cd) = (upload_f32(w), upload_f32(&c));
+    // The matrix and bias go up once: the whitener is fixed, and each upload crosses the link.
+    thread_local!(static UPLOADED: std::cell::OnceCell<(Handle, Handle)> = const { std::cell::OnceCell::new() });
+    let (wd, cd) = UPLOADED.with(|u| {
+        u.get_or_init(|| {
+            let c: Vec<f32> = w.chunks(d).map(|row| -row.iter().zip(mu).map(|(a, b)| a * b).sum::<f32>()).collect();
+            (upload_f32(w), upload_f32(&c))
+        })
+        .clone()
+    });
     let out = client().empty(rows * d * 4);
     let epi = Epilogue { bias: Some((&cd, 0)), ..Epilogue::default() };
     matmul_f32(MatRef::new(x), MatRef { trans: true, ..MatRef::new(&wd) }, MatRef::new(&out), 1, rows, d, d, epi);
