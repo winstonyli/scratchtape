@@ -1560,3 +1560,25 @@ novels90, 64M model, `runs/t44`-`t47` (half 0 / half 1; loop time half 0, single
 - The text-vs-CE trend continues log-linear (~-0.002 per 1.5x), now at the point where each further step costs more search time than it earns CE.
 
 **12288 cells (2026-10-14, `runs/t51.sh`, novels150 half 0).** IVF 12288 x 8 (mean cell 10.2k rows, as at 36.7M keys): loop **58.7 s** (tier prepare 32.8 s) against 72.6 s at 8192 cells, CE identical (0.9754). The cold build is 641 s (k-means + assignment 199 s of it, 143 s at 8192). Recall was not measured. Cell count is the knob that keeps the search cost flat as the store grows; 16384 cells would be the next step (k-means ~260 s). The memory cache in `runs/memcache` is now the 12288-cell one; `t50.sh`/`t49.sh` (8192) would rebuild.
+
+### Recency prior for rare in-lexicon words: negative (2026-10-14)
+
+Prototype tier `recent:<lambda>:<max train count>:<span>` (not kept): at a word start, the first letters of the train words with
+1..max occurrences that the book used in its last `span` bytes (same book only) get a share `lambda` of the letter mass, appended
+to the full stack (novels150 2-bit memory, 12288 cells, half 0, one pass, 7 specs). Stack alone 0.9754 (model 1.0165).
+
+| lambda | max count | span (B) | CE |
+|---|---|---|---|
+| 0.05 | 200 | 5000 | 0.9770 |
+| 0.10 | 200 | 5000 | 0.9798 |
+| 0.05 | 20 | 5000 | 0.9777 |
+| 0.10 | 20 | 5000 | 0.9813 |
+| 0.05 | 200 | 20000 | 0.9770 |
+| 0.10 | 200 | 50000 | 0.9796 |
+
+Every setting is worse, monotonically in lambda (extrapolates to zero gain as lambda -> 0), and the span barely matters. The
+estimate of 0.005 assumed the cache saves a third of a nat on the 1.5% repeating rare-word starts; a flat mix over all recently
+used rare words dilutes: most word starts (60300 of 251904 had a candidate) do not repeat a rare word, and the candidates
+carry no information about which one comes next. The online kNN memory (50% in-document neighbours) already captures what
+repeats are cheap to capture. Not tried: gating by the model's entropy or weighting candidates by distance to their last use;
+expected small given the monotone trend. The "only measured KR&R lead" above is closed.
