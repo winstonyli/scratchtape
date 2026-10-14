@@ -1666,3 +1666,17 @@ The expected gain on the stack is at most a few thousandths, with the same overl
 Recommendation: do not build. The cheapest falsifier, if wanted anyway, is the Transformer-XL variant (one cached previous window, no
 retrieval): it shares the trainer change (1) and the attention change (2) in simplified form and measures the same overlap; if its
 stack gain at 4M windows is under 0.003, the retrieval version is closed too. Revisit only if a cheaper variant shows more than that.
+
+### First-letter probe tier (residual mining): marginal, reverted (2026-10-14)
+
+Word-initial letters hold ~45% of the CE and the stack removes only 1.9% of it there, so a count tier `fl:<feature>:<lambda>:<c>` was tried: at a word start, mix in the TRAIN-text first-letter distribution for a context feature (weight `lambda*n/(n+c)`), after the stack. Single runs on the cached 12288-cell memory; stack alone 0.9754, model alone 1.0165.
+
+| feature (previous...) | lambda:c | CE |
+|---|---|---|
+| separator + capitalised? (`sep`) | 0.1:3 | 0.9772 |
+| last 3 letters (`suf3`) | 0.1:3 / 0.3:3 | 0.9765 / 0.9817 |
+| word (`w1`) | 0.1:3 | 0.9757 |
+| two words (`w2`) | 0.1:3 / 0.1:10 / 0.2:3 / 0.05:3 | 0.9747 / 0.9748 / 0.9750 / 0.9749 |
+| three words (`w3`) | 0.1:3 | 0.9748 |
+
+Coarse classes (`sep`, `suf3`) and one word hurt, and the damage grows with lambda: the model's hidden state already carries that information. Only the sparse, specific contexts (`w2`, `w3`) help, by at most 0.0007 (applied at 34k of ~250k positions for `w2`). That is below the 0.002 bar and close to run noise, so the tier is not kept; the code is reverted. Closes first-letter count tiers: the remaining word-start residual is not recoverable from train-text context counts.
