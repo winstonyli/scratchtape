@@ -1582,3 +1582,10 @@ used rare words dilutes: most word starts (60300 of 251904 had a candidate) do n
 carry no information about which one comes next. The online kNN memory (50% in-document neighbours) already captures what
 repeats are cheap to capture. Not tried: gating by the model's entropy or weighting candidates by distance to their last use;
 expected small given the monotone trend. The "only measured KR&R lead" above is closed.
+
+### 16384 cells: no gain over 12288 (2026-10-14)
+
+`ivf=16384:8` on the novels150 2-bit memory (half 0, single run, GPU and CPU idle at launch, contention not rechecked): loop 66.7 s
+against 58.7 s at 12288 cells, CE 0.9755 against 0.9754, build 750 s against 641 s, 10.59 GB in use. The search cost has stopped
+falling (the larger centroid pass and smaller cells cost more than they save), so 12288 stays. Cell count is closed as a lever
+at this store size.
