@@ -1532,3 +1532,22 @@ Negative (2026-10-13): logits read back as f16 (rounded on the device, widened o
 - **Cold build + eval in one process now fits.** `tier_eval` calls `client().memory_cleanup()` right after the memory is ready (the build's transient buffers otherwise stay pooled). A cold novels90 run (build 371 s) then went through: device memory 12.39 GB in use / 13.97 GB reserved, CE **0.9751** (same as the cache-loaded run), loop 66.1 s. Evidence is one failing run without the call and one passing run with it; the pool state at the failure was not measured.
 - **Negative: 2-bit keys.** Prototyped by generalising the host packer (`tile_of` packs any `bits` dividing 8 at bit offset `i * bits`, replacing the 8/4 branches; kept) and allowing `keybits=2` (levels -1, 0, 1 per key; the device kernels were already generic in `bits`; a `bits.max(4)` in the `k_dots_group` launch had to become `.max(2)` for it). novels90, half 0: device memory 7.06 GB (vs 12.39), but memory build 341 s and **CE 1.0258, worse than the model alone (1.0165)**, and the loop 90.6 s (tier prepare 67 s; the IVF cells became very uneven, max 348,700 rows vs 136,448). Ternary keys lose the neighbours; 2 bits uniform is out. The 2-bit permission is reverted (4-bit stays the floor); a non-uniform or product quantiser would be the next try, not more uniform bits.
 - Pruned `runs/memcache`: the novels40 caches (64M and 32M models) and the 2-bit cache are deleted; only the novels90 4-bit cache (10.9 GB) remains. The novels40 A/B timing scripts (`t7`, `t11`-`t13`) point at a deleted exe and cache; novels90 scripts are `t40.sh` (half 0) and `t41.sh` (half 1).
+
+### Rotated, rms-scaled keys: 2-bit memory works; 8192 cells (2026-10-14)
+Ternary max-abs 2-bit keys failed (above). Following RaBitQ (Gao & Long 2024, arXiv 2405.12497) two changes, both general rather than per-bit-width:
+1. **Random rotation folded into the whitener** (`tier_eval rotate=<seed>`: W' = R W with R a Gram-Schmidt orthogonal matrix; keys and queries are rotated alike, distances unchanged, no query-time cost; test `random_rotation_is_orthogonal`). The cache key is now `v2` and includes `rotate`.
+2. **Quantiser**: a row's scale is `quant_step(bits) x rms(row)` (the Gaussian-optimal uniform step: 0.9957 for 2 bits, 0.3352 for 4, 0.031 for 8) and the codes are mid-rise, `u in 0..2^bits` decoding to `(u - (2^bits-1)/2) x scale`, clamped. This replaces the max-abs scale and the signed-integer decode (one decode for every width, the sign branch deleted from `k_dequant` and `k_dots_group`; the host packer handles any width; the 13 knn tests pass for 8, 4 and 2 bits).
+
+novels90, 64M model, `runs/t44`-`t47` (half 0 / half 1; loop time half 0, single runs, contention not checked):
+
+| keys | cells | device memory | CE half 0 | CE half 1 | loop |
+|---|---|---|---|---|---|
+| 4-bit max-abs (before) | 4096 | 12.39 GB | 0.9751 | 1.0687 | 66 s |
+| 4-bit rotated, rms | 4096 | 12.39 GB | **0.9750** | - | 66 s |
+| 2-bit rotated, rms | 4096 | **7.06 GB** | 0.9772 | - | 65 s |
+| 2-bit rotated, rms | 8192 | 7.06 GB | 0.9772 | 1.0711 | **48 s** (half 1: 51 s) |
+| novels40, 4-bit (36.7M keys) | 4096 | - | 0.9793 | 1.0729 | 38 s |
+
+- 4-bit is unchanged by the new quantiser (0.9750 vs 0.9751). **2-bit costs +0.0022 / +0.0024 CE against 4-bit and still beats the 36.7M-key memory** (0.9793 / 1.0729) while using 57% of the device memory it needed.
+- **8192 cells x 8 probes** (mean cell 10k rows, as at 36.7M keys) cuts tier prepare from 43 s to 28 s with identical CE: the loop is 48 s instead of 65 s. With 4-bit keys the same setting ran out of device memory in the search scratch (12.4 GB in use before it), so the 2-bit memory is what makes the cheaper schedule fit.
+- The 2-bit memory frees ~9 GB: room for roughly 2x more keys (about 170M, ~200 MB of text) before the card is full again.

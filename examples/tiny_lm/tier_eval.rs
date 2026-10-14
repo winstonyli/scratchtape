@@ -1083,7 +1083,25 @@ fn whitening_matrix(cov: &[f64], d: usize, alpha: f64, rank: usize) -> (Vec<f32>
     (w, lam)
 }
 
-fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, alpha: f64, rank: usize) {
+/// A random orthogonal d x d matrix (row-major): Gram-Schmidt on Gaussian rows, from `seed`.
+fn random_rotation(d: usize, seed: u64) -> Vec<f64> {
+    let mut rng = scratchtape::nn::Rng::new(seed);
+    let mut r = vec![0f64; d * d];
+    for i in 0..d {
+        let mut v: Vec<f64> = (0..d).map(|_| rng.next_gaussian() as f64).collect();
+        for _ in 0..2 {
+            for j in 0..i {
+                let dot: f64 = (0..d).map(|k| v[k] * r[j * d + k]).sum();
+                (0..d).for_each(|k| v[k] -= dot * r[j * d + k]);
+            }
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        (0..d).for_each(|k| r[i * d + k] = v[k] / norm);
+    }
+    r
+}
+
+fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, alpha: f64, rank: usize, rotate: Option<u64>) {
     let d = cfg.d;
     let total = (train.len() - 1) / seq_len();
     let starts: Vec<usize> = (0..2000.min(total)).map(|i| i * total / 2000.min(total) * seq_len()).collect();
@@ -1111,7 +1129,13 @@ fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, a
             cov[j * d + i] = cov[i * d + j];
         }
     }
-    let (w, lam) = whitening_matrix(&cov, d, alpha, rank);
+    let (mut w, lam) = whitening_matrix(&cov, d, alpha, rank);
+    if let Some(seed) = rotate {
+        // Keys and queries are rotated alike, so distances are unchanged; the coordinates become close to Gaussian with equal variance,
+        // which is what the low-bit key quantiser (`keybits`) assumes (RaBitQ, arXiv 2405.12497).
+        let r = random_rotation(d, seed);
+        w = (0..d * d).map(|ij| (0..d).map(|k| r[ij / d * d + k] * w[k * d + ij % d] as f64).sum::<f64>() as f32).collect();
+    }
     let mut sorted = lam.clone();
     sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
     println!(
@@ -1136,7 +1160,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
-            | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" | "keybits" | "memcache" => {
+            | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" | "keybits" | "rotate" | "memcache" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -1215,15 +1239,15 @@ fn main() {
         assert!(from == "train" || causal || stride > 1, "store_from=held needs stride > 1 so some held-out windows are left unscored");
         if let Some(a) = opt.get("whiten").map(|a| a.parse::<f64>().unwrap_or_else(|_| panic!("whiten=<alpha>, got {a}"))).filter(|&a| a > 0.0) {
             stamp("before whitener");
-            fit_whitener(&dev, &cfg, &train, tap, a, size("whiten_rank", &cfg.d.to_string()));
+            fit_whitener(&dev, &cfg, &train, tap, a, size("whiten_rank", &cfg.d.to_string()), opt.get("rotate").map(|s| s.parse().unwrap_or_else(|_| panic!("rotate=<seed>, got {s}"))));
         }
         stamp("after whitener");
         // `memcache=<dir>` (with `ivf`): the built memory is saved there once and reloaded by later runs with the same model and build options.
         let cache = opt.get("memcache").zip(opt.get("ivf")).map(|(dir, ivf)| {
             let meta = std::fs::metadata(ckpt).unwrap_or_else(|e| panic!("{ckpt}: {e}"));
             let secs = meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-            let mut key = format!("v1 {ckpt} {} {secs} cells={}", meta.len(), ivf.split(':').next().unwrap_or(""));
-            for k in ["corpus", "memory_corpus", "seq", "warm", "stride", "offset", "whiten", "whiten_rank", "tap", "store", "store_from", "keybits", "memory", "d_model", "heads", "d_ff", "blocks"] {
+            let mut key = format!("v2 {ckpt} {} {secs} cells={}", meta.len(), ivf.split(':').next().unwrap_or(""));
+            for k in ["corpus", "memory_corpus", "seq", "warm", "stride", "offset", "whiten", "whiten_rank", "tap", "store", "store_from", "keybits", "rotate", "memory", "d_model", "heads", "d_ff", "blocks"] {
                 key += &format!(" {k}={}", opt.get(k).map_or("", |v| v.as_str()));
             }
             let hash = key.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
@@ -1243,7 +1267,7 @@ fn main() {
             None => {
                 let mut g = KnnStore::new(cfg.d, 16384);
                 if let Some(bits) = opt.get("keybits") {
-                    g.set_key_bits(bits.parse().unwrap_or_else(|_| panic!("keybits=8|4, got {bits}")));
+                    g.set_key_bits(bits.parse().unwrap_or_else(|_| panic!("keybits=8|4|2, got {bits}")));
                 }
                 g
             }
@@ -1605,6 +1629,20 @@ mod tests {
         let seen = Ctx { window: &line, ..ctx };
         wrap.adjust(&seen, &mut probs2);
         assert_eq!((probs2[b'\n' as usize], probs2[b' ' as usize]), (0.1, 0.4));
+    }
+
+    /// A random rotation is orthogonal (R R^T = I), so rotating keys and queries alike keeps every distance.
+    #[test]
+    fn random_rotation_is_orthogonal() {
+        let d = 24;
+        let r = random_rotation(d, 3);
+        for i in 0..d {
+            for j in 0..d {
+                let dot: f64 = (0..d).map(|k| r[i * d + k] * r[j * d + k]).sum();
+                assert!((dot - if i == j { 1.0 } else { 0.0 }).abs() < 1e-9, "({i},{j}) = {dot}");
+            }
+        }
+        assert_ne!(r, random_rotation(d, 4));
     }
 
     /// alpha = 1 whitens: W cov W is c^2 times the identity up to the ridge (1%), and alpha = 0 leaves the metric alone (W = identity).

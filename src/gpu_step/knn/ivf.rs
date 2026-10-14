@@ -285,7 +285,7 @@ fn k_dots_group(keys: &[f16], q: &[u32], scale: &[f32], b: &[f16], out: &mut [f3
         let per = 32 / bits;
         let dw = k * bits / 32;
         let mask = (1u32 << bits) - 1;
-        let half = 1u32 << (bits - 1);
+        let half = f32::cast_from(mask) * 0.5;
         for kk in 0..k / 16 {
             let b_off = (b_off0 + kk * 16 * n + col0) as usize;
             let qt = cmma::Matrix::<f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &b[b_off..b.len()], n);
@@ -299,10 +299,7 @@ fn k_dots_group(keys: &[f16], q: &[u32], scale: &[f32], b: &[f16], out: &mut [f3
                         let w = q[(trow * dw + kk * wpr + wi) as usize];
                         let s = scale[trow as usize];
                         for e in 0..per {
-                            let mut v = f32::cast_from((w >> (bits * e)) & mask);
-                            if v >= f32::cast_from(half) {
-                                v -= f32::cast_from(1u32 << bits);
-                            }
+                            let v = f32::cast_from((w >> (bits * e)) & mask) - half;
                             sh[(r * 16 + wi * per + e) as usize] = f16::cast_from(v * s);
                         }
                     }
@@ -621,7 +618,7 @@ impl KnnStore {
             };
             crate::gpu_step::count_launch();
             #[rustfmt::skip]
-            k_dots_group::launch(client(), CubeCount::Static(GROUP_GX.min(count as u32), (count as u32).div_ceil(GROUP_GX), 1), CubeDim::new_1d(plane), buf(keys, klen), buf(qk, qlen), buf(scales, slen), buf(&qall, total), buf(ws, WS_FLOATS), buf(&desc_dev, items.len() * 4), buf(&cube_start_dev, items.len() + 1), d as u32, quant, self.kbits.max(4), p0 as u32, p1 as u32, count as u32);
+            k_dots_group::launch(client(), CubeCount::Static(GROUP_GX.min(count as u32), (count as u32).div_ceil(GROUP_GX), 1), CubeDim::new_1d(plane), buf(keys, klen), buf(qk, qlen), buf(scales, slen), buf(&qall, total), buf(ws, WS_FLOATS), buf(&desc_dev, items.len() * 4), buf(&cube_start_dev, items.len() + 1), d as u32, quant, self.kbits.max(2), p0 as u32, p1 as u32, count as u32);
             p0 = p1;
         }
         if timing {
@@ -746,7 +743,7 @@ mod tests {
     /// Quantised keys (8 and 4 bits): the same search to within the rounding, and probing every cell equals the exact quantised search.
     #[test]
     fn quantised_keys_search_like_f16_keys() {
-        for (bits, tol) in [(8u32, 0.05f32), (4, 0.4)] {
+        for (bits, tol) in [(8u32, 0.05f32), (4, 0.4), (2, f32::INFINITY)] {
             quantised_case(bits, tol);
         }
     }

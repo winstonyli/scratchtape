@@ -97,12 +97,13 @@ replay buffers, checkpoints and consolidation in `examples/memory_tiers/`
 (the long-term side, so far at toy or Aesop-quarters scale). Experiments
 are chosen by what they say about the tiers and how they connect.
 
-Current best stack (2026-10-13, `docs/tiers_design.md`; seq-128 byte model trained on 64M windows, dynamic
+Current best stack (2026-10-14, `docs/tiers_design.md`; seq-128 byte model trained on 64M windows, dynamic
 evaluation, lexicon + word bigram + online kNN memory; held-out CE, nats/byte, halves 0 / 1): model alone
-1.0165 / 1.1146, full stack **0.9793 / 1.0729**. The memory holds 36.7M keys of 40 novels as 4-bit integers (one scale per
-key, 4.7 GB on the device) and is searched approximately (IVF: 4096 cells, 8 probes, recall of the exact top-128 0.99).
-Building it takes ~145 s (whitening on the device) and is cached on disk (`memcache=<dir>`, 14 s to reload); a scored
-held-out half takes ~38 s. The tiers never alter the adaptation, so their searches are batched.
+1.0165 / 1.1146, full stack **0.9750 / 1.0687** with 4-bit keys (**0.9772 / 1.0711** with 2-bit keys, half the device memory). The memory
+holds 83.4M keys of 91 novels as integers (one scale per key; keys randomly rotated, `rotate=1`) and is searched approximately
+(IVF, 8 probes of 4096 or 8192 cells; recall of the exact top-128 ~0.99). 4-bit keys take 10.7 GB of the 16 GB card, 2-bit keys 5.3 GB.
+Building it takes ~6 min (whitening on the device) and is cached on disk (`memcache=<dir>`, ~20 s to reload); a scored held-out
+half takes ~48 s (2-bit keys, 8192 cells; 65 s at 4096 cells). The tiers never alter the adaptation, so their searches are batched.
 
 ## Quick start
 
@@ -1068,6 +1069,12 @@ stale output from before a later `forward()` call.
 
 Literature (surveyed 2026-09-23) and a sibling project, each with what
 it means here.
+
+**Low-bit key quantisation for the kNN memory**
+- Gao & Long 2024, *RaBitQ* ([arXiv 2405.12497](https://arxiv.org/abs/2405.12497)): rotate vectors with a random orthogonal
+  matrix, then quantise each coordinate, for nearest-neighbour search with an error bound. Here the rotation is folded into the
+  whitener (`rotate=<seed>`, free at query time) and the keys are per-row-scaled uniform integers (2 or 4 bits) with the
+  Gaussian-optimal step; a plain max-abs scale without the rotation made 2-bit keys useless (CE worse than the model alone).
 
 **QK-norm**
 - Henry et al. 2020, *Query-Key Normalization for Transformers*

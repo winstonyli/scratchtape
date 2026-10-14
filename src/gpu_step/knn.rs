@@ -137,10 +137,10 @@ impl KnnStore {
         }
     }
 
-    /// Stores keys added from now on as `bits`-bit integers (8 or 4) with one scale per key: a quarter or an eighth of the f16
-    /// device memory, for a rounding error of 0.4% (8 bits) or 7% (4 bits) of a key's largest component. Call before the first `add`.
+    /// Stores keys added from now on as `bits`-bit integers (8, 4 or 2) with one scale per key: a quarter, an eighth or a sixteenth of
+    /// the f16 device memory. Call before the first `add`.
     pub fn set_key_bits(&mut self, bits: u32) {
-        assert!(self.f16 && self.len() == 0 && (bits == 8 || bits == 4) && self.d % 8 == 0, "quantised keys need the f16 matrix cores, an empty store, 8 or 4 bits and d % 8 == 0");
+        assert!(self.f16 && self.len() == 0 && matches!(bits, 8 | 4 | 2) && self.d % 16 == 0, "quantised keys need the f16 matrix cores, an empty store, 8, 4 or 2 bits and d % 16 == 0");
         self.kbits = bits;
     }
 
@@ -191,7 +191,9 @@ impl KnnStore {
         let vals_f: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
         if self.kbits > 0 {
             let (d, kb, rows, bits) = (self.d, self.key_bytes(), vals.len(), self.kbits);
-            let levels = ((1 << (self.kbits - 1)) - 1) as f32;
+            // Codes u in 0..2^bits decode to (u - half) * scale: 2^bits evenly spaced levels around zero, step `scale` = QUANT_STEP * the row's rms.
+            let (half, top) = (((1u32 << bits) - 1) as f32 / 2.0, ((1u32 << bits) - 1) as f32);
+            let step = quant_step(bits);
             let (mut q, mut scales, mut norms) = (vec![0u8; rows * kb], vec![0f32; rows], vec![0f32; rows]);
             // Rows are independent: split them over a few threads (the CPU is shared, so not all cores).
             let per = rows.div_ceil(8).max(1);
@@ -200,9 +202,9 @@ impl KnnStore {
                     sc.spawn(move || {
                         let mut v = vec![0i32; d];
                         for (r, k) in kc.chunks_exact(d).enumerate() {
-                            let scale = k.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-30) / levels;
+                            let scale = (step * (k.iter().map(|x| x * x).sum::<f32>() / d as f32).sqrt()).max(1e-30);
                             for (o, &x) in v.iter_mut().zip(k) {
-                                *o = (x / scale).round() as i32;
+                                *o = (x / scale + half).round().clamp(0.0, top) as i32;
                             }
                             let row = &mut qc[r * kb..(r + 1) * kb];
                             row.fill(0);
@@ -211,7 +213,7 @@ impl KnnStore {
                                 row[at / 8] |= ((x & ((1 << bits) - 1)) as u8) << (at % 8);
                             }
                             scc[r] = scale;
-                            nc[r] = v.iter().map(|&x| f16::from_f32(x as f32 * scale).to_f32().powi(2)).sum();
+                            nc[r] = v.iter().map(|&x| f16::from_f32((x as f32 - half) * scale).to_f32().powi(2)).sum();
                         }
                     });
                 }
@@ -632,14 +634,21 @@ fn k_dequant(q: &[u32], scale: &[f32], out: &mut [f16], row0: u32, dw: u32, bits
         let s = scale[(row0 + i / dw) as usize];
         let per = 32 / bits;
         let mask = (1u32 << bits) - 1;
-        let half = 1u32 << (bits - 1);
+        let half = f32::cast_from(mask) * 0.5;
         for b in 0..per {
-            let mut v = f32::cast_from((w >> (bits * b)) & mask);
-            if v >= f32::cast_from(half) {
-                v -= f32::cast_from(1u32 << bits);
-            }
+            let v = f32::cast_from((w >> (bits * b)) & mask) - half;
             out[(i * per + b) as usize] = f16::cast_from(v * s);
         }
+    }
+}
+
+/// Step of the best uniform quantiser for a unit Gaussian with 2^bits levels (Max 1960): a row's scale is this times its rms. Keys are
+/// randomly rotated first (`tier_eval rotate=`), which makes their coordinates close to Gaussian with equal variance.
+fn quant_step(bits: u32) -> f32 {
+    match bits {
+        2 => 0.9957,
+        4 => 0.3352,
+        _ => 0.031,
     }
 }
 
