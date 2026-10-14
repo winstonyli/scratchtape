@@ -298,11 +298,14 @@ struct Lexicon {
 impl Lexicon {
     fn new(train: &[usize], eps: f64, hist: bool) -> Lexicon {
         let (mut prefixes, mut words) = (HashSet::new(), HashSet::new());
+        // Most tokens repeat an earlier word: only a new word adds prefixes.
         for word in word_list(train) {
-            for n in 1..=word.len() {
-                prefixes.insert(word[..n].to_vec());
+            if !words.contains(&word) {
+                for n in 1..=word.len() {
+                    prefixes.insert(word[..n].to_vec());
+                }
+                words.insert(word);
             }
-            words.insert(word);
         }
         Lexicon { prefixes, words, eps, hist, positions: 0, constrained: 0, top1_rejected: 0, top1_fixed: 0 }
     }
@@ -391,7 +394,12 @@ impl Words {
         let list = word_list(train);
         let mut uni: HashMap<Vec<u8>, u32> = HashMap::new();
         for w in &list {
-            *uni.entry(w.clone()).or_default() += 1;
+            match uni.get_mut(w) {
+                Some(c) => *c += 1,
+                None => {
+                    uni.insert(w.clone(), 1);
+                }
+            }
         }
         let mut bi: HashMap<Vec<u8>, HashMap<Vec<u8>, u32>> = HashMap::new();
         if order == 1 {
