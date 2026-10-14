@@ -905,12 +905,18 @@ struct Forward {
     hidden: Vec<f32>,
 }
 
-fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], tap: usize, want_hidden: bool, want_logits: bool) -> Forward {
+/// The input bytes and the bytes they predict, for the windows of `data` starting at `starts`.
+fn window_ids(data: &[usize], starts: &[usize]) -> (Vec<usize>, Vec<usize>) {
     let (mut ids, mut targets) = (vec![], vec![]);
     for &s in starts {
         ids.extend(&data[s..s + seq_len()]);
         targets.extend(&data[s + 1..s + seq_len() + 1]);
     }
+    (ids, targets)
+}
+
+fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], tap: usize, want_hidden: bool, want_logits: bool) -> Forward {
+    let (ids, targets) = window_ids(data, starts);
     let mut dt = DeviceTape::new(dev);
     let (outs, logits, loss) = model_forward(&mut dt, cfg, &ids, &targets, starts.len());
     // Everything the host needs comes back in one read.
@@ -1081,32 +1087,27 @@ fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, a
     let d = cfg.d;
     let total = (train.len() - 1) / seq_len();
     let starts: Vec<usize> = (0..2000.min(total)).map(|i| i * total / 2000.min(total) * seq_len()).collect();
-    let mut h: Vec<f32> = vec![];
+    // The sums and the Gram matrix of the tap's hidden states, on the device (f32 matmuls, summed over launches in f64): the
+    // 260 MB of hidden states never cross the link, only a d x d matrix per launch.
+    let (mut n, mut sum, mut gram) = (0usize, vec![0f64; d], vec![0f64; d * d]);
     for chunk in starts.chunks(2 * chunk_windows()) {
-        h.extend(forward(dev, cfg, train, chunk, tap, true, false).hidden);
+        let (ids, targets) = window_ids(train, chunk);
+        let mut dt = DeviceTape::new(dev);
+        let (outs, _, _) = model_forward(&mut dt, cfg, &ids, &targets, chunk.len());
+        let (x, rows) = (dt.value(outs[tap]), ids.len());
+        let (g, s, ones) = (client().empty(d * d * 4), client().empty(d * 4), upload_f32(&vec![1.0; rows]));
+        matmul_f32(MatRef { trans: true, ..MatRef::new(x) }, MatRef::new(x), MatRef::new(&g), 1, d, rows, d, Epilogue::default());
+        matmul_f32(MatRef::new(&ones), MatRef::new(x), MatRef::new(&s), 1, 1, rows, d, Epilogue::default());
+        let r = read_many(vec![g, s]);
+        n += rows;
+        gram.iter_mut().zip(&r[0]).for_each(|(a, &b)| *a += b as f64);
+        sum.iter_mut().zip(&r[1]).for_each(|(a, &b)| *a += b as f64);
     }
-    let n = h.len() / d;
-    let mut mu = vec![0f64; d];
-    for row in h.chunks(d) {
-        for j in 0..d {
-            mu[j] += row[j] as f64 / n as f64;
-        }
-    }
+    let mu: Vec<f64> = sum.iter().map(|s| s / n as f64).collect();
     let mut cov = vec![0f64; d * d];
-    let mut x = vec![0f64; d];
-    for row in h.chunks(d) {
-        for j in 0..d {
-            x[j] = row[j] as f64 - mu[j];
-        }
-        for i in 0..d {
-            for j in i..d {
-                cov[i * d + j] += x[i] * x[j];
-            }
-        }
-    }
     for i in 0..d {
         for j in i..d {
-            cov[i * d + j] /= n as f64;
+            cov[i * d + j] = gram[i * d + j] / n as f64 - mu[i] * mu[j];
             cov[j * d + i] = cov[i * d + j];
         }
     }
