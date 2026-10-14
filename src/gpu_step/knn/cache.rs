@@ -85,14 +85,34 @@ impl KnnStore {
         let (d, tile, f16, kbits, ntiles) = (get(&mut r)? as usize, get(&mut r)? as usize, get(&mut r)? != 0, get(&mut r)? as u32, get(&mut r)? as usize);
         let mut s = KnnStore::with_precision(d, tile, f16);
         s.kbits = kbits;
-        for _ in 0..ntiles {
-            let len = get(&mut r)? as usize;
-            let keys = client().create_from_slice(&get_bytes(&mut r)?);
-            let scales = if kbits > 0 { Some(client().create_from_slice(&get_bytes(&mut r)?)) } else { None };
-            let norms = client().create_from_slice(&get_bytes(&mut r)?);
-            let vals = client().create_from_slice(&get_bytes(&mut r)?);
-            s.tiles.push(Tile { keys, scales, norms, vals, len });
-        }
+        let (mut all_norms, mut all_vals): (Vec<f32>, Vec<f32>) = (vec![], vec![]);
+        // A reader thread stays a few tiles ahead of the uploads, so the file reads overlap the host-to-device copies.
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let read_err = std::thread::scope(|sc| {
+            let rr = &mut r;
+            let reader = sc.spawn(move || -> std::io::Result<()> {
+                for _ in 0..ntiles {
+                    let len = get(rr)? as usize;
+                    let (kb, sb, nb, vb) = (get_bytes(rr)?, if kbits > 0 { Some(get_bytes(rr)?) } else { None }, get_bytes(rr)?, get_bytes(rr)?);
+                    if tx.send((len, kb, sb, nb, vb)).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            });
+            for (len, kb, sb, nb, vb) in rx {
+                all_norms.extend_from_slice(f32::from_bytes(&nb));
+                all_vals.extend_from_slice(f32::from_bytes(&vb));
+                let keys = client().create_from_slice(&kb);
+                let scales = sb.map(|b| client().create_from_slice(&b));
+                let norms = client().create_from_slice(&nb);
+                let vals = client().create_from_slice(&vb);
+                s.tiles.push(Tile { keys, scales, norms, vals, len });
+            }
+            reader.join().unwrap()
+        });
+        read_err?;
+        assert_eq!(s.tiles.len(), ntiles);
         s.sample_keys = f32::from_bytes(&get_bytes(&mut r)?).to_vec();
         if get(&mut r)? == 1 {
             let (nlist, n) = (get(&mut r)? as usize, get(&mut r)? as usize);
@@ -108,9 +128,7 @@ impl KnnStore {
                 }
                 cells.push(cell);
             }
-            let norms: Vec<f32> = s.tiles.iter().flat_map(|t| read(&t.norms)).collect();
-            let vals: Vec<f32> = s.tiles.iter().flat_map(|t| read(&t.vals)).collect();
-            s.ivf = Some(Ivf { keys, norm, nlist, n, norms: upload_f32(&norms), vals: upload_f32(&vals), cells });
+            s.ivf = Some(Ivf { keys, norm, nlist, n, norms: upload_f32(&all_norms), vals: upload_f32(&all_vals), cells });
         }
         Ok(Some((s, extra)))
     }
