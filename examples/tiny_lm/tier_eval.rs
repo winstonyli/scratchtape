@@ -3,7 +3,7 @@
 //
 //   tier_eval <checkpoint> [corpus=novels6] [d_model=256] [heads=8] [d_ff=512] [blocks=4] [tap=<block index>]
 //             [expect=<CE to reproduce>] [stride=<score every n-th held-out window>] [offset=<first window, < stride>] [part=<i>/<n>] [store_part=<i>/<n>] [store=<windows in the memory>] [store_from=train|held|both] [memory=flat|causal|online] [recent=<windows>] [warm=<t0>] [whiten=<alpha>] [classes=1] [survey=1] [dyn=<lr>] [dyn_every=<windows>] [dyn_steps=<k>] [dyn_rms=<beta>] [dyn_pull=<f>] [dyn_keys=adapted|frozen] [dyn_layers=emb,b0..,head] [dyn_control=1] [dump=<path>] [wdump=<path>]
-//             [tier=<spec> ...]
+//             [tier=<spec> ...] [generate=<len> [prompt=<held-out byte>] [temp=0.8] [seed=7]]
 //
 // A `tier=<spec>` is one or more tier parts joined by '+', applied in order to each position's distribution; each
 // spec is scored on its own, next to the plain model. Parts (add new ones by implementing `Tier` and a line in
@@ -893,6 +893,39 @@ fn from_is_train(v: &str) -> bool {
     v == "train"
 }
 
+/// `generate=<len>`: samples `len` bytes after a prompt (the held-out text from byte `prompt`), once from the model alone and once
+/// through each `tier=` spec (lexicon and words only: they read the text so far; a knn tier would need a search per byte). The same
+/// seed drives every run, so the outputs are comparable; `temp=0` is greedy. The true continuation is printed last.
+fn generate(dev: &DeviceParams, cfg: &Config, train: &[usize], held_out: &[usize], specs: &[String], len: usize, prompt: usize, temp: f64, seed: u64) {
+    let seq = seq_len();
+    let show = |ids: &[usize]| String::from_utf8_lossy(&ids.iter().map(|&b| b as u8).collect::<Vec<_>>()).replace('\n', " ");
+    println!("PROMPT: {}", show(&held_out[prompt..prompt + seq]));
+    for spec in std::iter::once(None).chain(specs.iter().map(Some)) {
+        let mut tiers: Vec<Box<dyn Tier>> = spec.map_or(vec![], |s| build_tier(s, train, &None, false, false));
+        let mut rng = scratchtape::nn::Rng::new(seed);
+        let mut text: Vec<usize> = held_out[prompt..prompt + seq].to_vec();
+        for _ in 0..len {
+            let mut data = text[text.len() - seq..].to_vec();
+            data.push(0); // the target slot of the last row, unused
+            let mut probs = softmax(&forward(dev, cfg, &data, &[0], 0, false, true).logits[(seq - 1) * VOCAB..seq * VOCAB]);
+            let (window, context) = (&text[text.len() - seq..], &text[text.len().saturating_sub(CONTEXT)..]);
+            for tier in tiers.iter_mut() {
+                tier.adjust(&Ctx { row: seq - 1, window, context, target: 0, hidden: &[] }, &mut probs);
+            }
+            let next = if temp == 0.0 {
+                (0..VOCAB).max_by(|&a, &b| probs[a].total_cmp(&probs[b])).unwrap()
+            } else {
+                let w: Vec<f64> = probs.iter().map(|p| p.powf(1.0 / temp)).collect();
+                let mut u = rng.next_f32() as f64 * w.iter().sum::<f64>();
+                w.iter().position(|&x| { u -= x; u < 0.0 }).unwrap_or(VOCAB - 1)
+            };
+            text.push(next);
+        }
+        println!("{:<44}{}", spec.map_or("MODEL:".to_string(), |s| format!("{s}:")), show(&text[seq..]));
+    }
+    println!("ACTUAL: {}", show(&held_out[prompt + seq..prompt + seq + len]));
+}
+
 fn softmax(logits: &[f32]) -> Vec<f64> {
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
     let exp: Vec<f64> = logits.iter().map(|&l| (l as f64 - max).exp()).collect();
@@ -1201,7 +1234,7 @@ fn main() {
         let (k, v) = a.split_once('=').unwrap_or_else(|| panic!("expected key=value, got {a}"));
         match k {
             "tier" => specs.push(v.to_string()),
-            "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
+            "generate" | "prompt" | "temp" | "seed" | "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
             | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dyn_nn" | "dyn_nn_mode" | "dyn_nn_stride" | "dyn_nn_lr" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" | "keybits" | "rotate" | "memcache" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
@@ -1249,6 +1282,10 @@ fn main() {
     let memory_train: &[usize] = memory_train.as_deref().unwrap_or(&train);
     let _lease = gpu_lease::hold(Kind::Shared, "scratchtape tier_eval", Duration::from_secs(4 * 3600));
     let mut dev = DeviceParams::upload(&flat);
+    if let Some(len) = opt.get("generate") {
+        generate(&dev, &cfg, &train, &held_out, &specs, len.parse().unwrap(), size("prompt", "20000"), get("temp", "0.8").parse().unwrap(), size("seed", "7") as u64);
+        return;
+    }
 
     stamp("corpus and checkpoint read");
     // Held-out words the train split has never shown: the ceiling on what a train-split lexicon can know.
