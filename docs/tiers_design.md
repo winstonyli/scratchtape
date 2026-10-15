@@ -1761,3 +1761,23 @@ Retuning the weight alone gains 0.0046; neighbour adaptation adds a steady 0.002
 | retuned + `dyn_nn=16` | **0.9682** | **1.0630** |
 
 Half 1 (not used for tuning) confirms: lambda 0.5 is its optimum too (0.3: 1.0691, 0.4: 1.0663, 0.5: 1.0658, 0.6: 1.0676); `dyn_nn` gains -0.0024 there (1.0654 -> 1.0630), against -0.0010 for 16 random windows. Other first-grid facts: the last row as the window embedding (instead of the mean over scored rows) is worse (0.9741 vs 0.9731; code removed); 64 neighbours = 16; neighbours cannot replace the chunk's own step. New best: **0.9682 / 1.0630** (was 0.9754 / 1.0691).
+
+Final tier tuning and dynamic-evaluation retune with `dyn_nn=16` on (`runs/t63.sh`, lexicon 0.2, words 0.1, kNN 128:0.5, temperatures `30:<doc>:100`; single deterministic runs):
+
+| in-document temperature | half 0 | half 1 |
+|---|---|---|
+| 20 | 0.9682 | 1.0630 |
+| **15** | **0.9678** | **1.0626** |
+| 10 | 0.9682 | 1.0636 |
+
+New best **0.9678 / 1.0626** (doc temperature 15, confirmed on both halves). Dynamic evaluation retuned on half 0 at doc temperature 15 (neighbour step fixed at lr 0.05, 16 windows per chunk):
+
+| dyn lr, chunk (windows) | model alone | stack |
+|---|---|---|
+| 0.05, 4 (current) | 1.0102 | 0.9678 |
+| 0.03, 4 | 1.0157 | 0.9702 |
+| 0.08, 4 | 1.0092 | 0.9673 |
+| 0.05, 2 | 1.0063 | **0.9665** |
+| 0.05, 8 | 1.0193 | 0.9719 |
+
+Both directions point the same way: more and larger steps help (smaller chunks -0.0013, lr 0.08 -0.0005), so the optimum is not yet bracketed; the model alone gains more than the stack (-0.0039 against -0.0013 at 2 windows). Not yet confirmed on half 1; smaller chunks also cost time (twice the steps, and twice the neighbour steps at 16 windows per chunk).
