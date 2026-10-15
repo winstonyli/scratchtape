@@ -945,7 +945,8 @@ struct WordClasses {
 }
 
 impl WordClasses {
-    const COUNT: usize = 13;
+    const NONLETTER: [&'static str; 6] = ["word-end space", "other space", "newline", ". ! ?", ", ; :", "other"];
+    const COUNT: usize = 6 + 12;
 
     fn new(train: &[usize]) -> Self {
         let mut counts = std::collections::HashMap::<Vec<u8>, u32>::new();
@@ -963,7 +964,7 @@ impl WordClasses {
     }
 
     fn names() -> Vec<String> {
-        std::iter::once("non-letter".to_string())
+        Self::NONLETTER.iter().map(|s| s.to_string())
             .chain(["lower", "Cap-initial", "Cap-mid"].iter().flat_map(|k| ["/0", "/1-9", "/10-99", "/100+"].map(|b| format!("{k}{b}"))))
             .collect()
     }
@@ -984,7 +985,15 @@ impl WordClasses {
     /// The class of the byte `text[at]`.
     fn class(&self, text: &[usize], at: usize) -> usize {
         if !(text[at] as u8).is_ascii_alphabetic() {
-            return 0;
+            let after_letter = at > 0 && (text[at - 1] as u8).is_ascii_alphabetic();
+            return match text[at] as u8 {
+                b' ' if after_letter => 0,
+                b' ' => 1,
+                b'\n' => 2,
+                b'.' | b'!' | b'?' => 3,
+                b',' | b';' | b':' => 4,
+                _ => 5,
+            };
         }
         let c = self.counts.get(&Self::word(text, at)).copied().unwrap_or(0);
         let mut a = at;
@@ -998,7 +1007,7 @@ impl WordClasses {
         });
         let bucket = (c >= 1) as usize + (c >= 10) as usize + (c >= 100) as usize;
         let kind = if !(text[a] as u8).is_ascii_uppercase() { 0 } else if sentence_start.unwrap_or(true) { 1 } else { 2 };
-        1 + 4 * kind + bucket
+        6 + 4 * kind + bucket
     }
 }
 
