@@ -1737,3 +1737,27 @@ Second grid (`runs/t58.sh`, half 0, single runs, same stack; baseline 1.0165 / 0
 | only, m=16 (no own-chunk step) | 1.0406 | 0.9880 |
 
 The gain saturates at m=16 (64 neighbours add nothing; the margin over the random control shrinks from 0.0020 to 0.0015) and is flat in the neighbour learning rate between 0.05 and 0.1 (0.02 is worse). Neighbours cannot replace the chunk's own step: `only` is 0.015 worse than dynamic evaluation alone, so the text just scored is the stronger signal and retrieval is a supplement. Next: half 1, a repeat for run noise, and re-tuned tier weights.
+
+### Retuning the tiers for the 125M-key memory; `dyn_nn` confirmed (2026-10-14)
+
+Controls on `dyn_nn` showed the stack itself was mistuned: the kNN weight 0.3 was set for a far smaller memory. Half 0 (`runs/t60.sh`, `t61.sh`, `t62.sh`; single runs, deterministic: a repeat reproduced 0.9731 exactly; `knn:128:<lambda>:30:20:100`, lexicon 0.3, words 0.15 unless noted):
+
+| kNN lambda | dyn only | + `dyn_nn=16` |
+|---|---|---|
+| 0.3 | 0.9754 | 0.9731 |
+| 0.4 | 0.9721 | 0.9699 |
+| 0.45 | 0.9712 | 0.9691 |
+| 0.5 | **0.9708** | **0.9687** |
+| 0.55 | 0.9709 | 0.9689 |
+| 0.6 | 0.9715 | 0.9695 |
+| 0.7 / 0.8 | 0.9745 / 0.9802 | 0.9724 / 0.9780 |
+
+Retuning the weight alone gains 0.0046; neighbour adaptation adds a steady 0.0021 at every weight. Other settings at lambda 0.5: lexicon 0.2 + words 0.1 -0.0005 (0.9703 / 0.9682); in-document temperature 15 -0.0006 (0.9702 / 0.9684; not combined with the others); train temperature 25 or 40, in-document temperature 30, shift 80 or 120 or (at 0.6) 50 or 150 all worse or equal. Combined best (lexicon 0.2, words 0.1, lambda 0.5, temperatures 30:20:100):
+
+| | half 0 | half 1 |
+|---|---|---|
+| old stack (lambda 0.3) | 0.9754 | 1.0691 |
+| retuned, dyn only | 0.9703 | 1.0654 |
+| retuned + `dyn_nn=16` | **0.9682** | **1.0630** |
+
+Half 1 (not used for tuning) confirms: lambda 0.5 is its optimum too (0.3: 1.0691, 0.4: 1.0663, 0.5: 1.0658, 0.6: 1.0676); `dyn_nn` gains -0.0024 there (1.0654 -> 1.0630), against -0.0010 for 16 random windows. Other first-grid facts: the last row as the window embedding (instead of the mean over scored rows) is worse (0.9741 vs 0.9731; code removed); 64 neighbours = 16; neighbours cannot replace the chunk's own step. New best: **0.9682 / 1.0630** (was 0.9754 / 1.0691).
