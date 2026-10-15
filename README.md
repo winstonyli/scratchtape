@@ -141,7 +141,7 @@ Full descriptions and every measured result: [`docs/examples.md`](docs/examples.
 - **The transformer LM family**: `tiny_lm` (original), `tiny_lm_corpus` (Aesop, 90/10 split; also the symbolic/KR&R investigation), `training_recipe_check` (GPU recipe sweeps), `fused_models_check` (K fused models, the 64M-window recipe), `ngram_baseline` (the count-model bar).
 - **Alternatives to attention**: `attention_recall`, `ssm_recall`, `softmax1_comparison`, `attention_null_baseline`.
 - **Structure and memory**: `gnn_byte_classification`, `predictive_coding`, `catastrophic_forgetting` and the `memory_tiers` family, differentiable reasoning.
-- **Tiers**: `tier_eval` (lexicon, word bigram, online kNN memory, `docs/tiers_design.md`); `gpu_*_check` probes for dispatch overhead, priority and contention.
+- **Tiers**: `tier_eval` (lexicon, word bigram, online kNN memory, `docs/tiers_design.md`); `sample` (text from a checkpoint, model alone, next to the true continuation; greedy loops, temperature 0.8 is fluent but drifts); `gpu_*_check` probes for dispatch overhead, priority and contention.
 
 ## Related work
 
