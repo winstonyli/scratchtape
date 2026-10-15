@@ -92,9 +92,7 @@ pub fn cross_entropy(logits: &Handle, targets: &Handle, rows: usize, vocab: usiz
 }
 
 /// dlogits = (softmax(logits) - onehot(target)) / rows per model: the
-/// gradient of each model's mean loss. One launch. A row whose target is
-/// >= `vocab` is ignored: zero loss and zero gradient, but still counted
-/// in the divisor `rows`.
+/// gradient of each model's mean loss. One launch.
 ///
 /// `distill` > 0 (fused models only) adds deep mutual learning's term
 /// (Zhang et al. 2018): distill · KL(q ‖ p) per row, q the other models'
@@ -211,12 +209,7 @@ fn k_ce_rows(x: &[f32], targets: &[u32], lse: &mut [f32], loss: &mut [f32], rows
         }
         let l = m + f32::ln(s);
         lse[r as usize] = l;
-        let target = targets[r as usize];
-        if target < vocab {
-            loss[r as usize] = l - x[(base + target) as usize];
-        } else {
-            loss[r as usize] = 0.0;
-        }
+        loss[r as usize] = l - x[(base + targets[r as usize]) as usize];
     }
 }
 
@@ -255,11 +248,7 @@ fn k_ce_bwd(x: &[f32], targets: &[u32], lse: &[f32], dl: &mut [f32], rows: u32, 
             }
             v += alpha * (p - q / f32::cast_from(models - 1));
         }
-        if targets[r as usize] < vocab {
-            dl[i as usize] = v / f32::cast_from(per);
-        } else {
-            dl[i as usize] = 0.0;
-        }
+        dl[i as usize] = v / f32::cast_from(per);
     }
 }
 
