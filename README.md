@@ -347,6 +347,8 @@ then reset to the pretrained weights; it does not train on the test input itself
 dynamic evaluation (SGD on the chunk just scored, reset per book) is the second; the first is untried here, where the kNN memory could supply
 the neighbours (`docs/tiers_design.md`).
 
+**Training for test-time adaptation** (read 2026-10-15, arXiv abstract pages only). Krause et al., "Dynamic Evaluation of Transformer Language Models" (arXiv:1904.08378), put dynamic evaluation on Transformer-XL (enwik8 0.99 to 0.94 bits/char, WikiText-103 perplexity 18.3 to 16.4); their model is trained without adaptation, as ours is. Sun et al., "Learning to (Learn at Test Time)" (arXiv:2407.04620), make the hidden state a model updated by a self-supervised step at test time; the abstract page does not describe the outer loop, so reading that it is trained through the inner updates is from memory, not verified. Finn et al., MAML (arXiv:1703.03400): train parameters so that a few gradient steps on a little data from a new task give good performance. The design for the same move here (meta-training the checkpoint so the per-chunk step works better) is in `docs/tiers_design.md`, "Meta-trained adaptability".
+
 **Sibling project: `humble-cortex`** (`../humble-cortex`, predictive
 coding in Rust). Its 95 checks overlap here in three places. First, every
 model is benchmarked against the simplest baseline for the task
