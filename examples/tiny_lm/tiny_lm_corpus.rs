@@ -318,7 +318,7 @@ fn kmeans(points: &[Vec<f32>], k: usize, iterations: usize, rng: &mut Rng) -> Ve
 }
 
 /// Plain softmax, no QK-norm - back from softmax1+QK-norm ([22437d0]),
-/// whose promotion evidence fell (README "Correction", "Measured
+/// whose promotion evidence fell (docs/examples.md "Correction", "Measured
 /// directly"): the diversity gain was an argmax artifact of the original
 /// L2 QK-norm making every head a near-exact mean-pool, and the loss
 /// "parity" compared 64000 treatment steps with 16000 control steps. With a

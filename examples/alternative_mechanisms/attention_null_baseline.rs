@@ -16,7 +16,7 @@
 // Result: uniform attention alone reproduces the reported numbers - same
 // 19953 usable windows, self-attention rate ~0.72 (reported 0.64-0.78),
 // and '\u{bc}' as the top sink with 10 votes (reported 9-11). See the
-// README/doc correction: the "all 32 heads converge on '\u{bc}'" finding
+// docs/examples.md correction: the "all 32 heads converge on '\u{bc}'" finding
 // was a measurement artifact of near-uniform attention, not learned
 // geometry.
 //
