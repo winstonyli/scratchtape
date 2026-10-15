@@ -1840,3 +1840,16 @@ Built as designed (code in commit `db75b17`, then removed: `examples/tiny_lm/met
 | fine-tuned, control (K = 1) | 1.0314 / 1.1311 | 1.0069 / 1.1089 |
 
 **Meta-training adds nothing**: meta and control agree to 0.0003 everywhere, so the model gets nothing from having seen its own inner steps; within-run loss by chunk position is the same for both. **The control itself is the finding**: 96k windows of fine-tuning without dropout at constant lr 0.01 (momentum 0.9, wd 0.0002) lower the model alone by -0.025 without dynamic evaluation and by -0.013 / -0.012 with it. The 64M-window recipe ended at constant lr 0.05 with dropout 0.1 and no final decay (`lr_decay_frac` exists in `fused_models_check`, but it was tried only on the aesop runs, docs/fusion_results.md round 6), so the checkpoint is un-annealed. The dynamic-evaluation gain shrinks as the model improves (-0.0363 to -0.0245 on half 0). Overlap rule: expect -0.002 to -0.004 in the stack, to be measured; the memory is built from the model's hidden states, so a new checkpoint needs a new cache (cold build ~11 min). Not yet run: the stack with the fine-tuned checkpoint; a proper anneal (linear decay to 0, with and without dropout, `fused_models_check lr_decay_frac=`) as the cleaner way to get the same effect.
+
+### Annealing the checkpoint: -0.035 model alone (2026-10-15, `runs/t71.sh`, `runs/anneal/`)
+
+`fused_models_check` gained `init=<checkpoint>` (k = 1). Anneal = continue the 64M-window checkpoint from its own constant lr: lr 0.05 (the recipe's, momentum 0.9, wd 0.0002, batch 16, score_tail 32) decayed linearly to 0 over 1.6M windows (2.5% of the original; 488 s), dropout 0.1 or 0. Held-out CE of the whole set at the end: 1.0634 (dropout 0.1) against 1.1072 at the start. Model alone, original halves (half 0 / half 1), dyn_every 2:
+
+| checkpoint | no dyn | dyn 0.04 | dyn 0.02 | dyn 0.01 | dyn 0.005 |
+|---|---|---|---|---|---|
+| original | 1.0562 / 1.1586 | 1.0199 / 1.1210 | | | |
+| fine-tune control (lr 0.01 constant, 96k windows) | 1.0314 / 1.1311 | 1.0069 / 1.1089 | | | |
+| anneal, dropout 0.1 | 1.0131 / 1.1139 | 1.0119 / 1.1213 | 0.9900 / 1.0898 | **0.9881 / 1.0855** | 0.9925 / 1.0896 |
+| anneal, dropout 0 | 1.0123 / 1.1142 | 1.0448 / 1.1600 | 0.9974 / 1.1011 | **0.9847 / 1.0840** | 0.9859 / 1.0840 |
+
+Two results. (1) The un-annealed checkpoint was leaving a lot on the table: the annealed model alone (no dyn) already beats the original with dynamic evaluation (1.0131 vs 1.0199, half 0), and with a retuned dyn it is **-0.035 / -0.037** below the original's best (0.9847 / 1.0840 against 1.0199 / 1.1210). Dropout 0 is slightly better than 0.1 with dyn (-0.003). (2) The dynamic-evaluation step size must move with the model: a sharper, annealed model wants lr 0.01 where the original wanted 0.04 (0.04 even hurts at dropout 0, 1.0448), so the old tuning is void for it. Overlap rule: expect 15-30% of this in the full stack (-0.005 to -0.010), to be measured. Needs: a new memory (the keys are this model's hidden states, cold build ~11 min), then retune `dyn`, `dyn_every`, `dyn_nn_lr` and the kNN weight on the new model; fresh-split check last. Not yet run: a longer anneal (6.4M windows), the original recipe's longer schedule with decay built in (a 6 h retrain), dyn_every 4 at lr 0.02.

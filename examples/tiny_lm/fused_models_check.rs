@@ -21,7 +21,8 @@
 // of the steps at the end; the model size args default to the 128/8/256/4 model.
 // `groups` > 1 splits the K models into that many groups, each with its own
 // init (seed + 1000 g) that averages only within itself, so the groups can be
-// ensembled (needs shared_init = 1 and sync_every > 0).
+// ensembled (needs shared_init = 1 and sync_every > 0). `init=<checkpoint>` (k = 1) starts from a saved checkpoint instead of a fresh
+// init: a fine-tune or an anneal with its own lr, `lr_decay_frac` and `dropout`.
 // Resumable (LONG_RUNS.md): every `checkpoint_secs` (default 600) the step,
 // each model's RNG state, the parameters and the optimizer state go to
 // runs/<name>.resume; relaunching the same command continues from it, and a
@@ -110,7 +111,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize], tail: usize) ->
 const PROFILE_WARM: usize = 20;
 const PROFILE_STEPS: usize = 50;
 
-const PARAMS: [(&str, &str); 27] = [
+const PARAMS: [(&str, &str); 28] = [
     ("name", ""),
     ("k", ""),
     ("batch", ""),
@@ -138,6 +139,7 @@ const PARAMS: [(&str, &str); 27] = [
     ("profile", "0"),
     ("seq", "64"),
     ("score_tail", "0"),
+    ("init", "-"),
 ];
 
 /// Arguments after the program name: bare values fill PARAMS in order, `key=value` sets one by name
@@ -243,6 +245,15 @@ fn main() {
         (0..groups as u64).flat_map(|g| init(&mut Rng::new(seed + 1000 * g), &cfg).repeat(k / groups)).collect()
     } else {
         rngs.iter_mut().flat_map(|r| init(r, &cfg)).collect()
+    };
+    let flat = match p.get::<String>("init").as_str() {
+        "-" => flat,
+        path => {
+            assert!(k == 1, "init=<checkpoint> needs k = 1");
+            let loaded: Vec<f32> = std::fs::read_to_string(path).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
+            assert_eq!(loaded.len(), flat.len(), "{path} does not match the model config");
+            loaded
+        }
     };
     let config = format!(
         "k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu} corpus={corpus_name} lr_decay_frac={lr_decay_frac} model d={} heads={} d_ff={} blocks={} groups={groups}",
