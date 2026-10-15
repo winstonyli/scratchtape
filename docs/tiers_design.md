@@ -1781,3 +1781,13 @@ New best **0.9678 / 1.0626** (doc temperature 15, confirmed on both halves). Dyn
 | 0.05, 8 | 1.0193 | 0.9719 |
 
 Both directions point the same way: more and larger steps help (smaller chunks -0.0013, lr 0.08 -0.0005), so the optimum is not yet bracketed; the model alone gains more than the stack (-0.0039 against -0.0013 at 2 windows). Not yet confirmed on half 1; smaller chunks also cost time (twice the steps, and twice the neighbour steps at 16 windows per chunk).
+
+Bracketing dynamic evaluation with `dyn_nn=16` (`runs/t64.sh`, `t65.sh`; lexicon 0.2, words 0.1, kNN 128:0.5:30:15:100; stack CE, single deterministic runs; the same pass also scored kNN 0.4/0.6 and doc temperature 10/20 and 0.5/15 was best in every run: the tier weights do not move):
+
+| chunk (windows) | lr 0.04 | 0.05 | 0.06 | 0.08 | 0.12 |
+|---|---|---|---|---|---|
+| 4 | | 0.9678 (half 1 1.0626) | | 0.9673 | |
+| 2 | **0.9659** | 0.9665 (half 1 1.0631) | 0.9677 | 0.9722 | 0.9867 |
+| 1 | | 0.9740 | | 1.0031 | |
+
+The optimum is a narrow ridge in step size x steps per byte, not an open slope: past chunk 2 / lr 0.05 the CE rises and large steps blow up (chunk 1 at lr 0.08, chunk 2 at lr 0.12). Half 0 favours chunk 2 (-0.0013 at lr 0.05, -0.0019 at lr 0.04), but half 1 does not confirm it (1.0631 against 1.0626 at chunk 4), so the README keeps chunk 4, lr 0.05 (0.9678 / 1.0626). Chunk 2 also costs about 25% more loop time (~0.088 s per chunk at twice the chunks, from the per-chunk speed lines, not a wall-clock total). Unchecked: chunk 2 at lr 0.04 on half 1.
