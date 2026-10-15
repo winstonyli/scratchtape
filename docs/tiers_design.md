@@ -1723,3 +1723,17 @@ Hardt & Sun (README, Related work) fine-tune on the nearest training sequences o
 | m=16 nearest windows | **1.0102** | **0.9731** |
 
 Random train windows alone give -0.0046 on the model but only -0.0003 on the stack (a general train-text effect that the memory already supplies). Retrieval adds -0.0017 on the model and **-0.0020 on the stack beyond the control**, -0.0023 against dynamic evaluation alone: just over the 0.002 bar and the 0.001 margin over the control, single run. Not yet done: m, neighbour-step learning rate, `only` mode, half 1, and whether the gain survives re-tuning the tier weights for the adapted model.
+
+Second grid (`runs/t58.sh`, half 0, single runs, same stack; baseline 1.0165 / 0.9754):
+
+| setting | model alone | stack |
+|---|---|---|
+| add, m=16, lr 0.05 (first grid) | 1.0102 | 0.9731 |
+| add, m=64 | 1.0099 | 0.9732 |
+| add, m=16, neighbour lr 0.02 | 1.0121 | 0.9739 |
+| add, m=16, neighbour lr 0.1 | 1.0101 | 0.9731 |
+| random, m=16 (first grid) | 1.0119 | 0.9751 |
+| random, m=64 | 1.0112 | 0.9747 |
+| only, m=16 (no own-chunk step) | 1.0406 | 0.9880 |
+
+The gain saturates at m=16 (64 neighbours add nothing; the margin over the random control shrinks from 0.0020 to 0.0015) and is flat in the neighbour learning rate between 0.05 and 0.1 (0.02 is worse). Neighbours cannot replace the chunk's own step: `only` is 0.015 worse than dynamic evaluation alone, so the text just scored is the stronger signal and retrieval is a supplement. Next: half 1, a repeat for run noise, and re-tuned tier weights.
