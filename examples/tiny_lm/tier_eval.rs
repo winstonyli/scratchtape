@@ -945,8 +945,8 @@ struct WordClasses {
 }
 
 impl WordClasses {
-    const NONLETTER: [&'static str; 6] = ["word-end space", "other space", "newline", ". ! ?", ", ; :", "other"];
-    const COUNT: usize = 6 + 12;
+    const NONLETTER: [&'static str; 7] = ["word-end space", "other space", "newline", ". ! ?", ", ; :", "straight quote", "other"];
+    const COUNT: usize = 7 + 12;
 
     fn new(train: &[usize]) -> Self {
         let mut counts = std::collections::HashMap::<Vec<u8>, u32>::new();
@@ -992,7 +992,8 @@ impl WordClasses {
                 b'\n' => 2,
                 b'.' | b'!' | b'?' => 3,
                 b',' | b';' | b':' => 4,
-                _ => 5,
+                b'"' | b'\'' => 5,
+                _ => 6,
             };
         }
         let c = self.counts.get(&Self::word(text, at)).copied().unwrap_or(0);
@@ -1007,7 +1008,7 @@ impl WordClasses {
         });
         let bucket = (c >= 1) as usize + (c >= 10) as usize + (c >= 100) as usize;
         let kind = if !(text[a] as u8).is_ascii_uppercase() { 0 } else if sentence_start.unwrap_or(true) { 1 } else { 2 };
-        6 + 4 * kind + bucket
+        7 + 4 * kind + bucket
     }
 }
 
