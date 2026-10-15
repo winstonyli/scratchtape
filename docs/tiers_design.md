@@ -1711,3 +1711,15 @@ Coarse classes (`sep`, `suf3`) and one word hurt, and the damage grows with lamb
 ### Hashed previous-word embeddings: closed without a run (2026-10-14)
 
 Idea 4 of the list (hashed previous-word / prefix embeddings as extra inputs) is a trained lookup of "what follows this word". The first-letter probe measured the same lookup with exact train-text counts (`fl:w1`, `fl:w2`, `fl:w3`): at most -0.0007 on the stack, and `w1` hurt, because the model already sees the previous words in its 128-byte window. A hash table holds no more than those counts. The word bigram tier only acts inside words ("between words at 0 positions"), so word starts were the case that mattered, and the counts show nothing there. Budget also bites: 8192 buckets x 256 = 2.1M parameters doubles the model against the ~2M constraint; a 1024-bucket table fits but holds little. Not run. Revisit only if a model-alone probe shows the hidden state lacks previous-word information at word starts.
+
+### Retrieval-driven test-time training (`dyn_nn`): first result, a lead (2026-10-14)
+
+Hardt & Sun (README, Related work) fine-tune on the nearest training sequences of each test sequence. Here: `dyn_nn=<m>` adds, after each chunk's own dynamic-evaluation step (SGD 0.05, 4 windows), one step of the same optimiser on m train windows of the memory corpus (novels150; every 8th window embedded once by the frozen model, 122k windows, ~40-50 s). A window's embedding is the mean frozen hidden state over its scored rows (positions >= warm); each of the chunk's 4 windows contributes its m/4 nearest (brute force on the host, L2). `dyn_nn_mode=random` takes m random train windows instead: the control for "extra train-text steps help whatever they are". Half 0, current stack (`runs/t57.sh`; single runs; CPU about 70% busy from another job at launch, which affects wall time only):
+
+| extra steps | model alone | stack |
+|---|---|---|
+| none (dyn only) | 1.0165 | 0.9754 |
+| m=16 random train windows | 1.0119 | 0.9751 |
+| m=16 nearest windows | **1.0102** | **0.9731** |
+
+Random train windows alone give -0.0046 on the model but only -0.0003 on the stack (a general train-text effect that the memory already supplies). Retrieval adds -0.0017 on the model and **-0.0020 on the stack beyond the control**, -0.0023 against dynamic evaluation alone: just over the 0.002 bar and the 0.001 margin over the control, single run. Not yet done: m, neighbour-step learning rate, `only` mode, half 1, and whether the gain survives re-tuning the tier weights for the adapted model.

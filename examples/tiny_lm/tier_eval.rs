@@ -44,6 +44,10 @@
 // `classes=1` prints the loss by position class (letter or not before, kind of byte predicted): where the model's CE sits and which tier gains where.
 // `dyn_every=<windows>` (default 32) scores, writes the online memory and adapts in chunks of that many windows; `dyn_steps=<k>` (default 1) takes k steps per chunk.
 // `dyn_keys=frozen` takes the hidden states the tiers use (memory queries, in-document keys) from an extra forward of the unadapted checkpoint, so they live in the same space as the train keys; the probabilities still come from the adapted model.
+// `dyn_nn=<m>` adds retrieval-driven test-time training (Hardt & Sun 2023, "nearest neighbours"): after each chunk, a step on the m train windows whose
+// embedding (mean frozen-model hidden state over the scored rows) is nearest to the chunk's windows (m/windows each). `dyn_nn_mode=add` (default; after the
+// chunk's own step), `only` (instead of it) or `random` (m random train windows: the control). `dyn_nn_stride=<n>` (default 8) embeds every n-th memory-corpus
+// window; `dyn_nn_lr` is the neighbour step's learning rate (default dyn). Needs `dyn=<lr>`.
 // `dyn_layers=<comma list of emb, b0.., head>` adapts only those parameters (host-side step, as dyn_rms).
 // `dyn_rms=<beta>` divides each gradient by a bias-corrected running RMS (decay beta; lr is then per-parameter step size, ~1e-4); `dyn_pull=<f>` moves each parameter the fraction f back towards the checkpoint after each step (both: host-side prototype, `Adapter`).
 // `dyn=<lr>` is dynamic evaluation (with tiers, the memory's train keys stay from the frozen model while queries and in-document keys come from the adapted one): after each chunk is scored, one SGD step at that lr on the same chunk (text already scored), parameters reset to the checkpoint at each book boundary. `dyn_control=1` takes each step from a chunk half the held-out text away instead (it must not help).
@@ -999,6 +1003,44 @@ impl Adapter {
     }
 }
 
+/// Train windows embedded by the frozen model (mean hidden state over the scored rows), searched by brute force on the host.
+struct NnIndex {
+    starts: Vec<usize>,
+    emb: Vec<f32>,
+    d: usize,
+}
+
+impl NnIndex {
+    /// The mean over each window's rows at window position >= `warm` of `hidden` ([windows * seq_len, d]).
+    fn embed(hidden: &[f32], d: usize, warm: usize) -> Vec<f32> {
+        let rows = hidden.len() / d;
+        let mut out = vec![0.0f32; rows / seq_len() * d];
+        for (w, o) in out.chunks_mut(d).enumerate() {
+            for t in warm..seq_len() {
+                for (a, b) in o.iter_mut().zip(&hidden[(w * seq_len() + t) * d..(w * seq_len() + t + 1) * d]) {
+                    *a += b;
+                }
+            }
+            o.iter_mut().for_each(|a| *a /= (seq_len() - warm) as f32);
+        }
+        out
+    }
+
+    /// Indices of the `k` embeddings nearest (squared L2) to `q`, nearest first.
+    fn nearest(&self, q: &[f32], k: usize) -> Vec<usize> {
+        let mut best: Vec<(f32, usize)> = vec![];
+        for (j, e) in self.emb.chunks(self.d).enumerate() {
+            let dist: f32 = e.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum();
+            if best.len() < k || dist < best[best.len() - 1].0 {
+                let at = best.partition_point(|&(x, _)| x <= dist);
+                best.insert(at, (dist, j));
+                best.truncate(k);
+            }
+        }
+        best.into_iter().map(|(_, j)| j).collect()
+    }
+}
+
 /// `whiten=<alpha>`: keys and queries are centred and multiplied by Sigma^(-alpha/2) (symmetric, total variance kept, so
 /// distances keep their scale), Sigma estimated from a sample of train positions. Set once before the memory is built.
 static WHITEN: std::sync::OnceLock<(Vec<f32>, Vec<f32>)> = std::sync::OnceLock::new();
@@ -1160,7 +1202,7 @@ fn main() {
         match k {
             "tier" => specs.push(v.to_string()),
             "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
-            | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" | "keybits" | "rotate" | "memcache" => {
+            | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dyn_nn" | "dyn_nn_mode" | "dyn_nn_stride" | "dyn_nn_lr" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" | "keybits" | "rotate" | "memcache" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
             _ => panic!("unknown key {k}"),
@@ -1377,6 +1419,24 @@ fn main() {
     let frozen_keys = get("dyn_keys", "adapted") == "frozen";
     assert!(!frozen_keys || dyn_lr.is_some(), "dyn_keys=frozen needs dyn=<lr>");
     let frozen = DeviceParams::upload(&flat);
+    let nn_m = size("dyn_nn", "0");
+    assert!(nn_m == 0 || dyn_lr.is_some(), "dyn_nn=<m> needs dyn=<lr>");
+    let nn_mode = get("dyn_nn_mode", "add");
+    assert!(["add", "only", "random"].contains(&nn_mode.as_str()), "dyn_nn_mode=add|only|random, got {nn_mode}");
+    let nn_lr: f32 = opt.get("dyn_nn_lr").map_or(dyn_lr.unwrap_or(0.0), |v| v.parse().unwrap());
+    let nn_index = (nn_m > 0).then(|| {
+        let t0 = std::time::Instant::now();
+        let stride = size("dyn_nn_stride", "8");
+        let total = (memory_train.len() - 1) / seq_len();
+        let starts: Vec<usize> = (0..total).step_by(stride).map(|w| w * seq_len()).collect();
+        let mut emb = Vec::with_capacity(starts.len() * cfg.d);
+        for chunk in starts.chunks(2 * chunk_windows()) {
+            emb.extend(NnIndex::embed(&forward(&frozen, &cfg, memory_train, chunk, tap, true, false).hidden, cfg.d, warm));
+        }
+        println!("neighbour index: {} train windows embedded in {:.1}s", starts.len(), t0.elapsed().as_secs_f64());
+        NnIndex { starts, emb, d: cfg.d }
+    });
+    let mut nn_rng = 0x9e3779b97f4a7c15u64;
     let dyn_docs = held_out_docs(&corpus);
     let mut dyn_doc = usize::MAX;
     assert!(!survey || !specs.is_empty(), "survey=1 needs a tier spec");
@@ -1443,8 +1503,30 @@ fn main() {
                 if dyn_lr.is_some() {
                     // The step reads only text that has just been scored (or, for the control, text from far away).
                     let source: Vec<usize> = if dyn_control { chunk.iter().map(|&s| (s + held_out.len() / 2) % (held_out.len() - seq_len() - 1)).collect() } else { chunk.to_vec() };
-                    for _ in 0..dyn_steps {
-                        adapter.step(&mut dev, &cfg, &held_out, &source);
+                    if nn_mode != "only" || nn_index.is_none() {
+                        for _ in 0..dyn_steps {
+                            adapter.step(&mut dev, &cfg, &held_out, &source);
+                        }
+                    }
+                    if let Some(idx) = &nn_index {
+                        let picked: Vec<usize> = if nn_mode == "random" {
+                            (0..nn_m)
+                                .map(|_| {
+                                    nn_rng = nn_rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                                    idx.starts[(nn_rng >> 33) as usize % idx.starts.len()]
+                                })
+                                .collect()
+                        } else {
+                            let hidden = if frozen_keys { f.hidden.clone() } else { forward(&frozen, &cfg, &held_out, chunk, tap, true, false).hidden };
+                            let per = nn_m.div_ceil(chunk.len());
+                            let mut v: Vec<usize> = NnIndex::embed(&hidden, cfg.d, warm).chunks(cfg.d).flat_map(|q| idx.nearest(q, per)).map(|j| idx.starts[j]).collect();
+                            v.sort_unstable();
+                            v.dedup();
+                            v
+                        };
+                        let lr = std::mem::replace(&mut adapter.lr, nn_lr);
+                        adapter.step(&mut dev, &cfg, memory_train, &picked);
+                        adapter.lr = lr;
                     }
                 }
                 ready.push_back((f, base));
@@ -1584,6 +1666,24 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn neighbour_index_embeds_the_scored_rows_and_finds_the_nearest() {
+        let d = 2;
+        // Two windows: rows below warm are ignored, the rest average to (3, 0) and (0, 5).
+        let (warm, n) = (seq_len() - 2, seq_len());
+        let mut hidden = vec![100.0f32; 2 * n * d];
+        for (w, v) in [(0usize, [3.0f32, 0.0]), (1, [0.0, 5.0])] {
+            for t in warm..n {
+                hidden[(w * n + t) * d..(w * n + t + 1) * d].copy_from_slice(&v);
+            }
+        }
+        let emb = NnIndex::embed(&hidden, d, warm);
+        assert_eq!(emb, vec![3.0, 0.0, 0.0, 5.0]);
+        let idx = NnIndex { starts: vec![0, n], emb, d };
+        assert_eq!(idx.nearest(&[0.0, 4.0], 1), vec![1]);
+        assert_eq!(idx.nearest(&[2.0, 0.5], 2), vec![0, 1]);
+    }
+
     use super::*;
 
     /// "aa bb aa bb\n" with only "aa" in the lexicon: the second "bb" is seen earlier in the book, the first is new.
