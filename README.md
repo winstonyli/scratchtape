@@ -355,7 +355,7 @@ Full text: [`docs/open_threads.md`](docs/open_threads.md). Live research lines a
 - **Averaged-model recipe** (2026-10-01): a small-data, overfitting-regime result; the big model's win over the 7-gram comes from data and training.
 - **Replay + Fisher consolidation together**; **CLS-ER-style two-speed memory**: untried combinations from the memory-tier work.
 - **Parked: fold the copy-and-tweak example families** into one runner; not worth it unless more variants are planned.
-- **Persistent on-device GPU training backend**: built (`src/gpu_step/`, milestones 1-5), design in `docs/gpu_step_design.md`; the thread also records the dispatch-overhead, contention and priority findings (GPU-feeding processes need Normal CPU priority).
+- **GPU training backend: done** (`src/gpu_step/`, design and background decisions in `docs/gpu_step_design.md`); `docs/open_threads.md` keeps the contention and CPU-priority findings (GPU-feeding processes need Normal CPU priority).
 - **Parked: report the tracel-llvm space-in-path bug upstream**: waits on the owner's go-ahead (posts publicly).
 
 ## A note on the name

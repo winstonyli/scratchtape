@@ -831,3 +831,18 @@ per-launch encoding and metadata uploads (#1504 caches the uniforms).
 Candidate for milestone 5 or 6, measured against plain queued launches.
 Unverified here: shapes must stay fixed between replays, and the Vulkan
 SPIR-V path may not support it.
+
+## Background decisions (moved from the README's open threads, 2026-10-14)
+
+- **Adapter and backend.** `RequestAdapterOptions::default()` picked the integrated 780M; fixed 2026-09-23 to `HighPerformance` (RX 9060 XT, an eGPU over USB4, so every host-device copy crosses a ~4-lane tunnel: keep weights and activations resident, read back only the loss). Short, overhead-bound dispatches favour DX12 (128x128 matmul round trip 1.1 ms vs 7.8 ms on Vulkan); long compute-bound kernels favour Vulkan (humble-cortex: 1.4-1.6x). The NPU (XDNA, ~10 TOPS, inference toolchain only) has no route for a from-scratch autograd tape.
+- **Launch cost.** 500 chained dispatches in one submit on resident buffers cost ~10 us per queued dispatch (DX12 and Vulkan), 40-100x under a per-op round trip. A batch-8 CPU step spent only 52% in matmul, so multithreading matmul alone caps at ~1.8x.
+- **Launch census** (`step_profile 8 1 census`), launches per step at ~10 us each:
+
+  | layout | unfused | elementwise-fused |
+  |---|---|---|
+  | 8 heads as separate ops | 2372 (23.7 ms) | 1281 (12.8 ms) |
+  | heads batched into one op | 776 (7.8 ms) | 385 (3.9 ms) |
+
+  Hence batched heads from the start and coarse layer-level ops (~145 launches).
+- **cubecl.** The spike (`spikes/cubecl_spike/`) matched raw wgpu on launch cost (~10 us) and is the only route to matrix cores (`VK_KHR_cooperative_matrix`, f16 16x16x16 -> f32); matrix cores keep a 2-3x edge over a tiled f32 kernel. Decided 2026-09-24: cubecl on Vulkan SPIR-V. Its CPU runtime has a ~3.4 ms floor per launch and loses to single-threaded `NdArray::matmul`; a step-shaped 144-launch chain took 157-165 ms on 12 cores vs 59-67 ms for `NdArray`, and the GPU's tiled matmul never finishes there (one spinning OS thread per unit at each barrier). So the CPU tape stays a separate reference.
+- **wgpu 23 to 30** (one wgpu stack in the crate; `lib.rs` sets `recursion_limit = "256"`).

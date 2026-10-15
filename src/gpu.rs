@@ -7,7 +7,7 @@
 //! built standalone before any integration.
 //!
 //! Superseded by `gpu_step` (the device-resident training step); kept for the
-//! per-dispatch overhead measurements docs/open_threads.md cites (DX12 vs Vulkan,
+//! per-dispatch overhead measurements docs/gpu_step_design.md and docs/open_threads.md cite (DX12 vs Vulkan,
 //! CPU-priority starvation), which run through `gpu_matmul`.
 
 use crate::tensor::NdArray;
