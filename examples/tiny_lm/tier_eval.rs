@@ -900,18 +900,13 @@ fn generate(dev: &DeviceParams, cfg: &Config, train: &[usize], held_out: &[usize
     let seq = seq_len();
     let show = |ids: &[usize]| String::from_utf8_lossy(&ids.iter().map(|&b| b as u8).collect::<Vec<_>>()).replace('\n', " ");
     println!("PROMPT: {}", show(&held_out[prompt..prompt + seq]));
+    let mut costs: Vec<Vec<f64>> = vec![];
     for spec in std::iter::once(None).chain(specs.iter().map(Some)) {
         let mut tiers: Vec<Box<dyn Tier>> = spec.map_or(vec![], |s| build_tier(s, train, &None, false, false));
         let mut rng = scratchtape::nn::Rng::new(seed);
         let mut text: Vec<usize> = held_out[prompt..prompt + seq].to_vec();
         for _ in 0..len {
-            let mut data = text[text.len() - seq..].to_vec();
-            data.push(0); // the target slot of the last row, unused
-            let mut probs = softmax(&forward(dev, cfg, &data, &[0], 0, false, true).logits[(seq - 1) * VOCAB..seq * VOCAB]);
-            let (window, context) = (&text[text.len() - seq..], &text[text.len().saturating_sub(CONTEXT)..]);
-            for tier in tiers.iter_mut() {
-                tier.adjust(&Ctx { row: seq - 1, window, context, target: 0, hidden: &[] }, &mut probs);
-            }
+            let probs = next_probs(dev, cfg, &text, &mut tiers);
             let next = if temp == 0.0 {
                 (0..VOCAB).max_by(|&a, &b| probs[a].total_cmp(&probs[b])).unwrap()
             } else {
@@ -922,8 +917,38 @@ fn generate(dev: &DeviceParams, cfg: &Config, train: &[usize], held_out: &[usize
             text.push(next);
         }
         println!("{:<44}{}", spec.map_or("MODEL:".to_string(), |s| format!("{s}:")), show(&text[seq..]));
+        // The same tiers on the true continuation (teacher-forced): the nats each byte costs.
+        let mut tiers: Vec<Box<dyn Tier>> = spec.map_or(vec![], |s| build_tier(s, train, &None, false, false));
+        costs.push((0..len).map(|i| -next_probs(dev, cfg, &held_out[prompt..prompt + seq + i], &mut tiers)[held_out[prompt + seq + i]].ln()).collect());
     }
     println!("ACTUAL: {}", show(&held_out[prompt + seq..prompt + seq + len]));
+    for (k, spec) in specs.iter().enumerate() {
+        let (base, c) = (&costs[0], &costs[k + 1]);
+        println!("CE on ACTUAL: model {:.4}, {spec} {:.4}", base.iter().sum::<f64>() / len as f64, c.iter().sum::<f64>() / len as f64);
+        let mut order: Vec<usize> = (0..len).collect();
+        order.sort_by(|&a, &b| (c[a] - base[a]).total_cmp(&(c[b] - base[b])));
+        for (name, picks) in [("helped most", &order[..5]), ("hurt most", &order[len - 5..])] {
+            let list: Vec<String> = picks.iter().map(|&i| {
+                let at = prompt + seq + i;
+                format!("{:+.2} '{}'->'{}'", c[i] - base[i], show(&held_out[at.saturating_sub(12)..at]), show(&held_out[at..at + 1]))
+            }).collect();
+            println!("  {name}: {}", list.join(" | "));
+        }
+    }
+}
+
+/// The next-byte distribution after `text` (its last `seq_len()` bytes are the window), through `tiers`.
+fn next_probs(dev: &DeviceParams, cfg: &Config, text: &[usize], tiers: &mut [Box<dyn Tier>]) -> Vec<f64> {
+    let seq = seq_len();
+    let window = &text[text.len() - seq..];
+    let mut data = window.to_vec();
+    data.push(0); // the target slot of the last row, unused
+    let mut probs = softmax(&forward(dev, cfg, &data, &[0], 0, false, true).logits[(seq - 1) * VOCAB..seq * VOCAB]);
+    let context = &text[text.len().saturating_sub(CONTEXT)..];
+    for tier in tiers.iter_mut() {
+        tier.adjust(&Ctx { row: seq - 1, window, context, target: 0, hidden: &[] }, &mut probs);
+    }
+    probs
 }
 
 fn softmax(logits: &[f32]) -> Vec<f64> {
