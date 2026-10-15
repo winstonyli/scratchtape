@@ -3,33 +3,30 @@
 Direction and tier map: README, "Direction: tiered AI". Related work: README, "Tiered and neuro-symbolic
 architectures". Status: step 0 and Experiment A built and measured (2026-10-02); Experiments A and B and a second CPU tier (word bigram) measured on the full held-out split.
 
-## Stack history (moved from the README, 2026-10-14)
+## Stack history (moved from the README 2026-10-14; restated as a table)
 
-First cross-tier results (`tier_eval`, `docs/tiers_design.md`): on the
-settled novels6 model (held-out 1.2408 nats/byte) a CPU word-lexicon tier gives
--0.0061, a RAM kNN memory over the final residual stream of all 4.5M train
-positions (searched on the GPU, `gpu_step/knn.rs`) gives -0.0291 (k = 256), a
-word-bigram CPU tier -0.0161, and the three together 1.2053 (-0.0356). The
-memory's gain is document-specific: unseen text of the same books helps most
-(-0.036 from a 472k-key memory), text of other books hurts. Caveat: the standard
-score gives early window positions almost no context; with every byte given at
-least 32 bytes (`warm=32`) the model alone is 1.1778, and then lexicon + word
-bigram + a past-only in-document memory reach 1.1311 (-0.0467), of which the
-memory is -0.0425 (the CPU tiers alone -0.0201). The deployable form writes the memory as the text is read
-(online, no held-out text in advance): on the whole held-out text lexicon + word bigram + online memory give 1.1313
-(-0.0451) against 1.1764 for the model alone at stride 1 (the memory alone -0.0412). Writing each chunk's keys before
-its search (`write=first`), weighting in-document neighbours separately from train neighbours (own temperature and a
-distance shift) and searching the two sources separately (top-256 each) bring the same stack to 1.1138 (-0.0626; the memory
-alone 1.1196), whitening the keys (`whiten=0.5`) to 1.1118 (-0.0646; memory alone 1.1163), and a line-wrap rule tier (`wrap:0.95` after the memory) to 1.0956 (-0.0807); the same stack on a model trained twice as long (16M windows, held-out 1.2319) reaches 1.0876 against its own 1.1651 (a 32M-window model trained in f16, held-out 1.2307, reaches 1.0844; the same model trained on the 22-novel corpus, held-out 1.2193, reaches 1.0821, and with dynamic evaluation (`tier_eval dyn=<lr> dyn_every=<windows>`: one SGD step on each chunk of text after it is scored, reset at each book) and the tiers re-tuned for the adapted model 1.0575; the same on a model with a 128-byte window instead of 64 (`fused_models_check seq=128`; the wrap rule is then redundant and dropped) 1.0392, and with a memory of 100000 windows instead of 50000 **1.0352**); each step and its tuning is in `docs/tiers_design.md`. The memory search is exact
-and took ~5 s per 32-window chunk of 4.5M keys in f32 (2.5x faster than the first version: sampled per-query thresholds,
-multi-thread top-k, unscored rows skipped); the f16 matrix-core search is the default now, and the whole held-out run takes
-826 s (13.8 min; ~1.7 s per chunk, flat as the memory grows to 5M keys; CE identical to 4 decimals). Earlier full runs
-were slow (2502 s in f32; 2 h 38 min once) mainly because the online memory wrote one tiny device tile per window
-(fixed: pending keys are searched as one transient tile; `docs/tiers_design.md`). Existing work by tier: the transformer and its GPU-resident
-step (tier 1); the symbolic-structure and reasoning examples (tier 2);
-replay buffers, checkpoints and consolidation in `examples/memory_tiers/`
-(the long-term side, so far at toy or Aesop-quarters scale). Experiments
-are chosen by what they say about the tiers and how they connect.
+Held-out CE in nats/byte, whole held-out text unless noted; each row adds to the one above and is superseded. The current stack
+(0.9754 / 1.0691 per half, IVF memory of 125M 2-bit keys) is in the README, "Current best stack"; each step is detailed below.
+
+| Step | Model alone | Stack |
+|---|---|---|
+| novels6 model, standard score: lexicon -0.0061, kNN memory over all 4.5M train positions -0.0291 (k = 256), word bigram -0.0161 | 1.2408 | 1.2053 (-0.0356) |
+| `warm=32` (every byte gets at least 32 bytes of context); lexicon + bigram + past-only in-document memory | 1.1778 | 1.1311 (-0.0467; memory -0.0425, CPU tiers -0.0201) |
+| online memory (written as the text is read, no held-out text in advance), stride 1 | 1.1764 | 1.1313 (-0.0451; memory alone -0.0412) |
+| `write=first`, separate in-document weighting and search (top-256 each) | | 1.1138 (-0.0626) |
+| whitened keys (`whiten=0.5`) | | 1.1118 (-0.0646) |
+| line-wrap rule tier (`wrap:0.95`) | | 1.0956 (-0.0807) |
+| 16M-window model | 1.1651 | 1.0876 (held-out 1.2319) |
+| 32M windows, f16 training | | 1.0844 (held-out 1.2307) |
+| 22-novel training corpus | | 1.0821 (held-out 1.2193) |
+| dynamic evaluation (`dyn=<lr> dyn_every=<windows>`: one SGD step per scored chunk, reset per book), tiers re-tuned | | 1.0575 |
+| 128-byte window (`seq=128`; the wrap rule becomes redundant and is dropped) | | 1.0392 |
+| memory of 100000 windows instead of 50000 | | 1.0352 |
+
+Facts about the memory: its gain is document-specific (unseen text of the same books helps most, -0.036 from a 472k-key memory; text of
+other books hurts). Search speed: the first full runs took 2502 s in f32 (2 h 38 min once) because the online memory wrote one tiny
+device tile per window; fixed by searching pending keys as one transient tile, then the f16 matrix-core search gave 826 s for the
+whole held-out run (~1.7 s per chunk, flat to 5M keys). That search was exact; the current one is approximate (IVF, recall ~0.99).
 
 ## What exists and what does not
 
