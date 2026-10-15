@@ -73,3 +73,4 @@ Moved verbatim from the README (2026-10-14). The README keeps a short index; liv
   spinner threads, a BelowNormal `gpu_matmul` round trip's median rose from
   5–8 ms to 138–171 ms (~25×). At Normal it was unaffected. So GPU training
   runs at Normal, the exception LONG_RUNS.md already makes for burn.
+- **Parked: model-side changes (2026-10-15).** Closed or measured: dynamic-evaluation variants, `dyn_nn`, meta-trained adaptability (no gain over a plain fine-tune), checkpoint anneal (-0.02 model alone on unseen books, ties the stack there). Parked with their reasons, not dropped: a longer anneal (6.4M windows), annealing with dyn_every 4, a retrain with lr decay built in (6 h); the stack result makes them unlikely to pay. Decision rule from here: a change is adopted only if it holds on the fresh split (`corpus=fresh22 memory_corpus=fresh150`, `docs/tiers_design.md`), because the original halves are tails of books the model trained on.
