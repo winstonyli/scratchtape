@@ -1803,3 +1803,14 @@ Half 1 check of chunk 2 / lr 0.04 (`runs/t66.sh`): 1.0620 (against 1.0626 at chu
 | chunk 2, lr 0.04, no `dyn_nn` | 1.0138 | 1.0203 |
 
 The ordering and size of both gains carry over: the chunk-2 retune gives -0.0033 / -0.0031 (it was -0.0019 / -0.0006 on the tuning set), `dyn_nn` gives -0.0093 / -0.0063. Model alone is worse here (1.0796 vs 1.0165), as the model never saw the first 90% of these books, yet the tiers recover more (-0.075 vs -0.05), so the stack gain is not an artefact of the tuning halves. Contention: CPU was ~30% busy from another session at launch (timings not used).
+
+**Does the `dyn_nn` gain grow with the memory? No (2026-10-15, `runs/t68.sh`, logs `runs/fresh/small_*`).** Same fresh split, same settings (kNN weight 0.5 untuned for the small memory), memory built from `fresh22` alone (20.1M keys, 22 books) against `fresh150` (125.6M keys). Half 0 / half 1:
+
+| memory | with `dyn_nn=16` | without | `dyn_nn` gain |
+|---|---|---|---|
+| 20.1M keys | 1.0224 / 1.0352 | 1.0335 / 1.0427 | -0.0111 / -0.0075 |
+| 125.6M keys | 1.0045 / 1.0140 | 1.0138 / 1.0203 | -0.0093 / -0.0063 |
+
+Six times the keys is worth -0.0179 / -0.0212 on the full stack, while the `dyn_nn` gain is slightly smaller with the larger pool (its neighbours come from the same train windows either way, so a bigger kNN memory takes over part of what it supplied). So `dyn_nn` is not a reason to add memory text; the memory itself is.
+
+**Cost of the dynamic-evaluation settings (same logs, half 0, 244,736 positions, another session using ~30% CPU).** Chunk loop: 97 s without dynamic neighbour steps (chunk 2), 234 s at chunk 4 / lr 0.05 with `dyn_nn`, 353 s at chunk 2 / lr 0.04 with `dyn_nn`; the neighbour index adds 42 s of setup. Per 0.001 of CE (half 0 / half 1 average): `dyn_nn` costs ~28 s of loop (-0.0093 / -0.0063 for 256 s), and chunk 2 over chunk 4 costs ~36 s (+119 s, +51%, for -0.0033 / -0.0031). The "about 25% more" quoted earlier was measured on a quiet machine; this ratio is contended, so treat it as an upper bound.
