@@ -1087,7 +1087,7 @@ words, 42%; it does not use repeats of rare words in the book):
    **Started 2026-10-10.**
 2. In-model memory: kNN attention over earlier hidden states of the book (Memorizing Transformers), trained end to end.
 3. Auxiliary heads aimed at word starts (next 2-4 bytes, next word's first letter or class); free at inference.
-4. Hashed previous-word / prefix embeddings as extra inputs (capacity as lookups); adds parameters.
+4. Hashed previous-word / prefix embeddings as extra inputs (capacity as lookups); adds parameters. **Closed without a run** (2026-10-14, see "Hashed previous-word embeddings").
 5. Train with the tiers in mind: distil the stack into the model, or train on the residual the tiers leave (the 32M novels22 model
    gained 0.0155 alone but 0.0023 in the stack, so the two overlap). Earlier mutual distillation (same-size teacher) hurt.
 6. Context-dependent tier gating: **killed** (2026-10-07/08: kNN weight gate +0.001, words weight gate +0.0004 held-out; weights are within ~0.001 of optimal; see "Verdict" under `gate_fit`).
@@ -1707,3 +1707,7 @@ Word-initial letters hold ~45% of the CE and the stack removes only 1.9% of it t
 Coarse classes (`sep`, `suf3`) and one word hurt, and the damage grows with lambda: the model's hidden state already carries that information. Only the sparse, specific contexts (`w2`, `w3`) help, by at most 0.0007 (applied at 34k of ~250k positions for `w2`). That is below the 0.002 bar and close to run noise, so the tier is not kept; the code is reverted. Closes first-letter count tiers: the remaining word-start residual is not recoverable from train-text context counts.
 
 **Transformer-XL falsifier: already answered, not run (2026-10-14).** The "Context length under the tiers" table above is this test with a stronger variant: a 256-byte window with gradients through all of it reaches further back than one cached stop-gradient previous window at seq 128. It gained -0.0086 on the model and only -0.0021 on the stack (novels6, static stack), under the 0.003 bar, so in-model retrieval through longer reach is closed on that evidence. Caveat: measured on the older static stack, not the current dynamic-evaluation one; a re-measure would be a 64M-window retrain at seq 256 (~2x step cost) and is not planned.
+
+### Hashed previous-word embeddings: closed without a run (2026-10-14)
+
+Idea 4 of the list (hashed previous-word / prefix embeddings as extra inputs) is a trained lookup of "what follows this word". The first-letter probe measured the same lookup with exact train-text counts (`fl:w1`, `fl:w2`, `fl:w3`): at most -0.0007 on the stack, and `w1` hurt, because the model already sees the previous words in its 128-byte window. A hash table holds no more than those counts. The word bigram tier only acts inside words ("between words at 0 positions"), so word starts were the case that mattered, and the counts show nothing there. Budget also bites: 8192 buckets x 256 = 2.1M parameters doubles the model against the ~2M constraint; a 1024-bucket table fits but holds little. Not run. Revisit only if a model-alone probe shows the hidden state lacks previous-word information at word starts.
