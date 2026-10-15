@@ -955,35 +955,52 @@ fn pooled(dev: &DeviceParams, cfg: &Config, train: &[usize], held_out: &[usize],
     while i < train.len() {
         if letter(train[i]) { let w = word_at(train, i); i += w.len(); *counts.entry(w).or_default() += 1; } else { i += 1; }
     }
+    // Capitalised words split by position: after . ! ? or a line break (sentence start), or inside a sentence (mostly names).
+    let sentence_start = |mut a: usize| -> bool {
+        while a > 0 {
+            a -= 1;
+            match held_out[a] as u8 {
+                b'.' | b'!' | b'?' | b'\n' => return true,
+                c if c.is_ascii_alphanumeric() || b",;:".contains(&c) => return false,
+                _ => {}
+            }
+        }
+        true
+    };
     let class = |at: usize| -> usize {
         if !letter(held_out[at]) { return 0; }
         let c = counts.get(&word_at(held_out, at)).copied().unwrap_or(0);
         let mut a = at;
         while a > 0 && letter(held_out[a - 1]) { a -= 1; }
-        1 + (c >= 1) as usize + (c >= 10) as usize + (c >= 100) as usize + 4 * (held_out[a] as u8).is_ascii_uppercase() as usize
+        let bucket = (c >= 1) as usize + (c >= 10) as usize + (c >= 100) as usize;
+        let kind = if !(held_out[a] as u8).is_ascii_uppercase() { 0 } else if sentence_start(a) { 1 } else { 2 };
+        1 + 4 * kind + bucket
     };
-    let names = ["non-letter", "lower/0", "lower/1-9", "lower/10-99", "lower/100+", "Cap/0", "Cap/1-9", "Cap/10-99", "Cap/100+"];
+    let names: Vec<String> = std::iter::once("non-letter".to_string())
+        .chain(["lower", "Cap-initial", "Cap-mid"].iter().flat_map(|k| ["/0", "/1-9", "/10-99", "/100+"].map(|b| format!("{k}{b}"))))
+        .collect();
+    let classes = names.len();
     let starts: Vec<usize> = (0..n).map(|k| 1000 + k * (held_out.len() - seq - len - 2000) / n).collect();
-    let mut cost = vec![vec![[0.0f64; 9]; 1]; 1 + specs.len()];
-    let mut bytes = [0usize; 9];
+    let mut cost = vec![vec![0.0f64; classes]; 1 + specs.len()];
+    let mut bytes = vec![0usize; classes];
     for (si, spec) in std::iter::once(None).chain(specs.iter().map(Some)).enumerate() {
         for &p in &starts {
             let mut tiers: Vec<Box<dyn Tier>> = spec.map_or(vec![], |s| build_tier(s, train, &None, false, false));
             for i in 0..len {
                 let c = class(p + seq + i);
                 if si == 0 { bytes[c] += 1; }
-                cost[si][0][c] -= next_probs(dev, cfg, &held_out[p..p + seq + i], &mut tiers)[held_out[p + seq + i]].ln();
+                cost[si][c] -= next_probs(dev, cfg, &held_out[p..p + seq + i], &mut tiers)[held_out[p + seq + i]].ln();
             }
         }
     }
     let total = bytes.iter().sum::<usize>() as f64;
-    println!("{} prompts x {len} bytes = {total} scored; model {:.4} nats/byte", n, cost[0][0].iter().sum::<f64>() / total);
+    println!("{} prompts x {len} bytes = {total} scored; model {:.4} nats/byte", n, cost[0].iter().sum::<f64>() / total);
     for (si, spec) in specs.iter().enumerate() {
-        let saved: f64 = (0..9).map(|c| cost[0][0][c] - cost[si + 1][0][c]).sum();
-        println!("{spec}: {:.4} nats/byte ({:+.4})", cost[si + 1][0].iter().sum::<f64>() / total, -saved / total);
-        for c in 0..9 {
-            let d = cost[0][0][c] - cost[si + 1][0][c];
-            println!("  {:<12} {:>6} bytes  model {:.3}  change {:+.4}/byte  share of saving {:>5.1}%", names[c], bytes[c], cost[0][0][c] / bytes[c].max(1) as f64, -d / bytes[c].max(1) as f64, 100.0 * d / saved);
+        let saved: f64 = (0..classes).map(|c| cost[0][c] - cost[si + 1][c]).sum();
+        println!("{spec}: {:.4} nats/byte ({:+.4})", cost[si + 1].iter().sum::<f64>() / total, -saved / total);
+        for c in 0..classes {
+            let d = cost[0][c] - cost[si + 1][c];
+            println!("  {:<14} {:>6} bytes  model {:.3}  change {:+.4}/byte  share of saving {:>5.1}%", names[c], bytes[c], cost[0][c] / bytes[c].max(1) as f64, -d / bytes[c].max(1) as f64, 100.0 * d / saved);
         }
     }
 }
