@@ -937,6 +937,57 @@ fn generate(dev: &DeviceParams, cfg: &Config, train: &[usize], held_out: &[usize
     }
 }
 
+/// `prompts=<n> generate=<len>`: the teacher-forced cost of `len` bytes after each of `n` evenly spaced held-out prompts, per tier
+/// spec against the model alone, pooled by what the byte belongs to: a non-letter, or a letter in a word that is capitalised or
+/// not and seen 0, 1-9, 10-99 or 100+ times in the train text. Prints bytes, model nats/byte, and each spec's change in nats/byte
+/// of that class and its share of the total saving.
+fn pooled(dev: &DeviceParams, cfg: &Config, train: &[usize], held_out: &[usize], specs: &[String], n: usize, len: usize) {
+    let seq = seq_len();
+    let letter = |b: usize| (b as u8).is_ascii_alphabetic();
+    let word_at = |text: &[usize], i: usize| -> Vec<u8> {
+        let (mut a, mut b) = (i, i + 1);
+        while a > 0 && letter(text[a - 1]) { a -= 1; }
+        while b < text.len() && letter(text[b]) { b += 1; }
+        text[a..b].iter().map(|&c| (c as u8).to_ascii_lowercase()).collect()
+    };
+    let mut counts = std::collections::HashMap::<Vec<u8>, u32>::new();
+    let mut i = 0;
+    while i < train.len() {
+        if letter(train[i]) { let w = word_at(train, i); i += w.len(); *counts.entry(w).or_default() += 1; } else { i += 1; }
+    }
+    let class = |at: usize| -> usize {
+        if !letter(held_out[at]) { return 0; }
+        let c = counts.get(&word_at(held_out, at)).copied().unwrap_or(0);
+        let mut a = at;
+        while a > 0 && letter(held_out[a - 1]) { a -= 1; }
+        1 + (c >= 1) as usize + (c >= 10) as usize + (c >= 100) as usize + 4 * (held_out[a] as u8).is_ascii_uppercase() as usize
+    };
+    let names = ["non-letter", "lower/0", "lower/1-9", "lower/10-99", "lower/100+", "Cap/0", "Cap/1-9", "Cap/10-99", "Cap/100+"];
+    let starts: Vec<usize> = (0..n).map(|k| 1000 + k * (held_out.len() - seq - len - 2000) / n).collect();
+    let mut cost = vec![vec![[0.0f64; 9]; 1]; 1 + specs.len()];
+    let mut bytes = [0usize; 9];
+    for (si, spec) in std::iter::once(None).chain(specs.iter().map(Some)).enumerate() {
+        for &p in &starts {
+            let mut tiers: Vec<Box<dyn Tier>> = spec.map_or(vec![], |s| build_tier(s, train, &None, false, false));
+            for i in 0..len {
+                let c = class(p + seq + i);
+                if si == 0 { bytes[c] += 1; }
+                cost[si][0][c] -= next_probs(dev, cfg, &held_out[p..p + seq + i], &mut tiers)[held_out[p + seq + i]].ln();
+            }
+        }
+    }
+    let total = bytes.iter().sum::<usize>() as f64;
+    println!("{} prompts x {len} bytes = {total} scored; model {:.4} nats/byte", n, cost[0][0].iter().sum::<f64>() / total);
+    for (si, spec) in specs.iter().enumerate() {
+        let saved: f64 = (0..9).map(|c| cost[0][0][c] - cost[si + 1][0][c]).sum();
+        println!("{spec}: {:.4} nats/byte ({:+.4})", cost[si + 1][0].iter().sum::<f64>() / total, -saved / total);
+        for c in 0..9 {
+            let d = cost[0][0][c] - cost[si + 1][0][c];
+            println!("  {:<12} {:>6} bytes  model {:.3}  change {:+.4}/byte  share of saving {:>5.1}%", names[c], bytes[c], cost[0][0][c] / bytes[c].max(1) as f64, -d / bytes[c].max(1) as f64, 100.0 * d / saved);
+        }
+    }
+}
+
 /// The next-byte distribution after `text` (its last `seq_len()` bytes are the window), through `tiers`.
 fn next_probs(dev: &DeviceParams, cfg: &Config, text: &[usize], tiers: &mut [Box<dyn Tier>]) -> Vec<f64> {
     let seq = seq_len();
@@ -1259,7 +1310,7 @@ fn main() {
         let (k, v) = a.split_once('=').unwrap_or_else(|| panic!("expected key=value, got {a}"));
         match k {
             "tier" => specs.push(v.to_string()),
-            "generate" | "prompt" | "temp" | "seed" | "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
+            "generate" | "prompts" | "prompt" | "temp" | "seed" | "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
             | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dyn_nn" | "dyn_nn_mode" | "dyn_nn_stride" | "dyn_nn_lr" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" | "keybits" | "rotate" | "memcache" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
@@ -1307,6 +1358,10 @@ fn main() {
     let memory_train: &[usize] = memory_train.as_deref().unwrap_or(&train);
     let _lease = gpu_lease::hold(Kind::Shared, "scratchtape tier_eval", Duration::from_secs(4 * 3600));
     let mut dev = DeviceParams::upload(&flat);
+    if let Some(n) = opt.get("prompts") {
+        pooled(&dev, &cfg, &train, &held_out, &specs, n.parse().unwrap(), size("generate", "600"));
+        return;
+    }
     if let Some(len) = opt.get("generate") {
         generate(&dev, &cfg, &train, &held_out, &specs, len.parse().unwrap(), size("prompt", "20000"), get("temp", "0.8").parse().unwrap(), size("seed", "7") as u64);
         return;
