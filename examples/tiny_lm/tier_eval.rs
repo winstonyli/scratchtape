@@ -937,72 +937,109 @@ fn generate(dev: &DeviceParams, cfg: &Config, train: &[usize], held_out: &[usize
     }
 }
 
-/// `prompts=<n> generate=<len>`: the teacher-forced cost of `len` bytes after each of `n` evenly spaced held-out prompts, per tier
-/// spec against the model alone, pooled by what the byte belongs to: a non-letter, or a letter in a word that is capitalised or
-/// not and seen 0, 1-9, 10-99 or 100+ times in the train text. Prints bytes, model nats/byte, and each spec's change in nats/byte
-/// of that class and its share of the total saving.
-fn pooled(dev: &DeviceParams, cfg: &Config, train: &[usize], held_out: &[usize], specs: &[String], n: usize, len: usize) {
-    let seq = seq_len();
-    let letter = |b: usize| (b as u8).is_ascii_alphabetic();
-    let word_at = |text: &[usize], i: usize| -> Vec<u8> {
-        let (mut a, mut b) = (i, i + 1);
-        while a > 0 && letter(text[a - 1]) { a -= 1; }
-        while b < text.len() && letter(text[b]) { b += 1; }
-        text[a..b].iter().map(|&c| (c as u8).to_ascii_lowercase()).collect()
-    };
-    let mut counts = std::collections::HashMap::<Vec<u8>, u32>::new();
-    let mut i = 0;
-    while i < train.len() {
-        if letter(train[i]) { let w = word_at(train, i); i += w.len(); *counts.entry(w).or_default() += 1; } else { i += 1; }
-    }
-    // Capitalised words split by position: after . ! ? or a line break (sentence start), or inside a sentence (mostly names).
-    let sentence_start = |mut a: usize| -> bool {
-        while a > 0 {
-            a -= 1;
-            match held_out[a] as u8 {
-                b'.' | b'!' | b'?' | b'\n' => return true,
-                c if c.is_ascii_alphanumeric() || b",;:".contains(&c) => return false,
-                _ => {}
+/// Word classes for the pooled breakdowns (`prompts=`, `classes=1`): a non-letter byte, or a letter of a word that is lowercase,
+/// Capitalised at a sentence start (after `. ! ?` or a line break) or Capitalised mid-sentence (mostly names), each split by how
+/// many times the word occurs in the train text (0, 1-9, 10-99, 100+).
+struct WordClasses {
+    counts: std::collections::HashMap<Vec<u8>, u32>,
+}
+
+impl WordClasses {
+    const COUNT: usize = 13;
+
+    fn new(train: &[usize]) -> Self {
+        let mut counts = std::collections::HashMap::<Vec<u8>, u32>::new();
+        let mut i = 0;
+        while i < train.len() {
+            if (train[i] as u8).is_ascii_alphabetic() {
+                let w = Self::word(train, i);
+                i += w.len();
+                *counts.entry(w).or_default() += 1;
+            } else {
+                i += 1;
             }
         }
-        true
-    };
-    let class = |at: usize| -> usize {
-        if !letter(held_out[at]) { return 0; }
-        let c = counts.get(&word_at(held_out, at)).copied().unwrap_or(0);
+        WordClasses { counts }
+    }
+
+    fn names() -> Vec<String> {
+        std::iter::once("non-letter".to_string())
+            .chain(["lower", "Cap-initial", "Cap-mid"].iter().flat_map(|k| ["/0", "/1-9", "/10-99", "/100+"].map(|b| format!("{k}{b}"))))
+            .collect()
+    }
+
+    /// The lowercased ASCII letters around `text[i]`.
+    fn word(text: &[usize], i: usize) -> Vec<u8> {
+        let letter = |b: usize| (b as u8).is_ascii_alphabetic();
+        let (mut a, mut b) = (i, i + 1);
+        while a > 0 && letter(text[a - 1]) {
+            a -= 1;
+        }
+        while b < text.len() && letter(text[b]) {
+            b += 1;
+        }
+        text[a..b].iter().map(|&c| (c as u8).to_ascii_lowercase()).collect()
+    }
+
+    /// The class of the byte `text[at]`.
+    fn class(&self, text: &[usize], at: usize) -> usize {
+        if !(text[at] as u8).is_ascii_alphabetic() {
+            return 0;
+        }
+        let c = self.counts.get(&Self::word(text, at)).copied().unwrap_or(0);
         let mut a = at;
-        while a > 0 && letter(held_out[a - 1]) { a -= 1; }
+        while a > 0 && (text[a - 1] as u8).is_ascii_alphabetic() {
+            a -= 1;
+        }
+        let sentence_start = (0..a).rev().find_map(|j| match text[j] as u8 {
+            b'.' | b'!' | b'?' | b'\n' => Some(true),
+            c if c.is_ascii_alphanumeric() || b",;:".contains(&c) => Some(false),
+            _ => None,
+        });
         let bucket = (c >= 1) as usize + (c >= 10) as usize + (c >= 100) as usize;
-        let kind = if !(held_out[a] as u8).is_ascii_uppercase() { 0 } else if sentence_start(a) { 1 } else { 2 };
+        let kind = if !(text[a] as u8).is_ascii_uppercase() { 0 } else if sentence_start.unwrap_or(true) { 1 } else { 2 };
         1 + 4 * kind + bucket
-    };
-    let names: Vec<String> = std::iter::once("non-letter".to_string())
-        .chain(["lower", "Cap-initial", "Cap-mid"].iter().flat_map(|k| ["/0", "/1-9", "/10-99", "/100+"].map(|b| format!("{k}{b}"))))
-        .collect();
-    let classes = names.len();
+    }
+}
+
+/// Prints each spec's saving against the model by word class: `bytes[c]` scored bytes, `cost[0][c]` the model's nats and
+/// `cost[i + 1][c]` spec i's.
+fn print_word_classes(bytes: &[usize], cost: &[Vec<f64>], specs: &[String]) {
+    let names = WordClasses::names();
+    let total = bytes.iter().sum::<usize>() as f64;
+    println!("{total} scored bytes; model {:.4} nats/byte", cost[0].iter().sum::<f64>() / total);
+    for (si, spec) in specs.iter().enumerate() {
+        let saved: f64 = (0..bytes.len()).map(|c| cost[0][c] - cost[si + 1][c]).sum();
+        println!("{spec}: {:.4} nats/byte ({:+.4})", cost[si + 1].iter().sum::<f64>() / total, -saved / total);
+        for c in 0..bytes.len() {
+            let (d, nc) = (cost[0][c] - cost[si + 1][c], bytes[c].max(1) as f64);
+            println!("  {:<18} {:>6} bytes  model {:.3}  change {:+.4}/byte  share of saving {:>5.1}%", names[c], bytes[c], cost[0][c] / nc, -d / nc, 100.0 * d / saved);
+        }
+    }
+}
+
+/// `prompts=<n> generate=<len>`: the teacher-forced cost of `len` bytes after each of `n` evenly spaced held-out prompts, per tier
+/// spec against the model alone, pooled by `WordClasses`.
+fn pooled(dev: &DeviceParams, cfg: &Config, train: &[usize], held_out: &[usize], specs: &[String], n: usize, len: usize) {
+    let seq = seq_len();
+    let wc = WordClasses::new(train);
     let starts: Vec<usize> = (0..n).map(|k| 1000 + k * (held_out.len() - seq - len - 2000) / n).collect();
-    let mut cost = vec![vec![0.0f64; classes]; 1 + specs.len()];
-    let mut bytes = vec![0usize; classes];
+    let mut cost = vec![vec![0.0f64; WordClasses::COUNT]; 1 + specs.len()];
+    let mut bytes = vec![0usize; WordClasses::COUNT];
     for (si, spec) in std::iter::once(None).chain(specs.iter().map(Some)).enumerate() {
         for &p in &starts {
             let mut tiers: Vec<Box<dyn Tier>> = spec.map_or(vec![], |s| build_tier(s, train, &None, false, false));
             for i in 0..len {
-                let c = class(p + seq + i);
-                if si == 0 { bytes[c] += 1; }
+                let c = wc.class(held_out, p + seq + i);
+                if si == 0 {
+                    bytes[c] += 1;
+                }
                 cost[si][c] -= next_probs(dev, cfg, &held_out[p..p + seq + i], &mut tiers)[held_out[p + seq + i]].ln();
             }
         }
     }
-    let total = bytes.iter().sum::<usize>() as f64;
-    println!("{} prompts x {len} bytes = {total} scored; model {:.4} nats/byte", n, cost[0].iter().sum::<f64>() / total);
-    for (si, spec) in specs.iter().enumerate() {
-        let saved: f64 = (0..classes).map(|c| cost[0][c] - cost[si + 1][c]).sum();
-        println!("{spec}: {:.4} nats/byte ({:+.4})", cost[si + 1].iter().sum::<f64>() / total, -saved / total);
-        for c in 0..classes {
-            let d = cost[0][c] - cost[si + 1][c];
-            println!("  {:<14} {:>6} bytes  model {:.3}  change {:+.4}/byte  share of saving {:>5.1}%", names[c], bytes[c], cost[0][c] / bytes[c].max(1) as f64, -d / bytes[c].max(1) as f64, 100.0 * d / saved);
-        }
-    }
+    println!("{n} prompts x {len} bytes");
+    print_word_classes(&bytes, &cost, specs);
 }
 
 /// The next-byte distribution after `text` (its last `seq_len()` bytes are the window), through `tiers`.
@@ -1576,6 +1613,9 @@ fn main() {
     assert!(!survey || !specs.is_empty(), "survey=1 needs a tier spec");
     let mut survey_rows: Vec<SurveyRow> = vec![]; // (position of the input byte, model CE, last spec's CE, its three likeliest bytes)
     let mut cls_n = [0usize; 10];
+    let word_classes = WordClasses::new(&train);
+    let mut wc_bytes = vec![0usize; WordClasses::COUNT];
+    let mut wc_cost = vec![vec![0.0f64; WordClasses::COUNT]; 1 + tiers.len()];
     let mut cls_model = [0.0f64; 10];
     let mut cls_tier = vec![[0.0f64; 10]; tiers.len()];
     // `classes=1`, line ends: [target is a newline or a space][a newline in the 64-byte window][column bucket] -> (count, model CE sum).
@@ -1694,6 +1734,9 @@ fn main() {
             let cls = class_of(*window.last().unwrap(), f.targets[r]);
             cls_n[cls] += 1;
             cls_model[cls] -= probs[f.targets[r]].ln();
+            let wcls = word_classes.class(&held_out, abs + 1);
+            wc_bytes[wcls] += 1;
+            wc_cost[0][wcls] -= probs[f.targets[r]].ln();
             if let Some(kind) = [b'\n', b' '].iter().position(|&b| b as usize == f.targets[r]) {
                 let column = context.iter().rposition(|&b| b == b'\n' as usize).map_or(usize::MAX, |i| context.len() - 1 - i);
                 let cell = &mut col[kind][window.contains(&(b'\n' as usize)) as usize][COLUMN_EDGES.iter().filter(|&&e| column >= e).count()];
@@ -1710,6 +1753,7 @@ fn main() {
                 }
                 ce_tier[i] -= p[f.targets[r]].max(1e-300).ln();
                 cls_tier[i][cls] -= p[f.targets[r]].max(1e-300).ln();
+                wc_cost[i + 1][wcls] -= p[f.targets[r]].max(1e-300).ln();
                 if survey && i + 1 == specs.len() {
                     let mut top = [(0u8, 0f32); 3];
                     for (b, &q) in p.iter().enumerate() {
@@ -1782,6 +1826,9 @@ fn main() {
             }
             println!();
         }
+    }
+    if opt.contains_key("classes") {
+        print_word_classes(&wc_bytes, &wc_cost, &specs);
     }
     if survey {
         let _ = survey_report(&held_out, &held_out_docs(&corpus), &train_words, &survey_rows, n);
