@@ -1373,7 +1373,7 @@ fn main() {
         let (k, v) = a.split_once('=').unwrap_or_else(|| panic!("expected key=value, got {a}"));
         match k {
             "tier" => specs.push(v.to_string()),
-            "generate" | "prompts" | "prompt" | "temp" | "seed" | "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
+            "generate" | "prompts" | "byte_gap" | "prompt" | "temp" | "seed" | "corpus" | "d_model" | "heads" | "d_ff" | "blocks" | "tap" | "expect" | "stride" | "offset" | "store" | "store_from" | "part" | "store_part" | "memory" | "warm" | "seq" | "memory_corpus"
             | "recent" | "whiten" | "whiten_rank" | "classes" | "survey" | "dyn" | "dyn_control" | "dyn_every" | "dyn_steps" | "dyn_rms" | "dyn_pull" | "dyn_keys" | "dyn_layers" | "dyn_nn" | "dyn_nn_mode" | "dyn_nn_stride" | "dyn_nn_lr" | "dump" | "wdump" | "batch" | "ivf" | "ivf_check" | "keybits" | "rotate" | "memcache" => {
                 assert!(opt.insert(k, v.to_string()).is_none(), "{k} given twice")
             }
@@ -1421,6 +1421,18 @@ fn main() {
     let memory_train: &[usize] = memory_train.as_deref().unwrap_or(&train);
     let _lease = gpu_lease::hold(Kind::Shared, "scratchtape tier_eval", Duration::from_secs(4 * 3600));
     let mut dev = DeviceParams::upload(&flat);
+    if opt.contains_key("byte_gap") {
+        // Bytes whose held-out frequency far exceeds their train frequency (or that train never has): the model has seen too few.
+        let (mut tr, mut ho) = ([0usize; VOCAB], [0usize; VOCAB]);
+        train.iter().for_each(|&b| tr[b] += 1);
+        held_out.iter().for_each(|&b| ho[b] += 1);
+        let (nt, nh) = (train.len() as f64, held_out.len() as f64);
+        println!("byte_gap: held-out vs train frequency per byte (shown: >= 50 held-out and 4x over-represented)");
+        for b in (0..VOCAB).filter(|&b| ho[b] >= 50 && ho[b] as f64 / nh > 4.0 * tr[b] as f64 / nt) {
+            println!("  byte {b:#04x}: held-out {} ({:.4}%), train {} ({:.4}%)", ho[b], 100.0 * ho[b] as f64 / nh, tr[b], 100.0 * tr[b] as f64 / nt);
+        }
+        return;
+    }
     if let Some(n) = opt.get("prompts") {
         pooled(&dev, &cfg, &train, &held_out, &specs, n.parse().unwrap(), size("generate", "600"));
         return;
