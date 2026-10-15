@@ -301,6 +301,9 @@ pub fn corpus(name: &str) -> &'static str {
     }
 }
 
+/// Memory-only books held out by `fresh22` / `fresh150` (the third held-out set).
+const FRESH: [&str; 7] = ["far_from_the_madding", "evelina_or_the_history", "madame_bovary", "allan_quatermain", "house_of_mirth", "jungle", "lost_world"];
+
 /// The texts of a bundled corpus, one per book, with the fraction of each that is training text (the rest, from the
 /// end, is held out).
 fn books(name: &str) -> Vec<(String, f32)> {
@@ -326,10 +329,13 @@ fn books(name: &str) -> Vec<(String, f32)> {
             books("novels40").into_iter().chain(extra.iter().map(|n| (read("gutenberg_memory2", n, "fetch_gutenberg_memory2.sh"), 1.0))).collect()
         }
         // novels90 plus fifty-eight more novels (scripts/fetch_gutenberg_memory3.sh), training text only; same held-out as novels22.
-        "novels150" => {
+        "novels150" | "fresh150" => {
             let extra = ["a_christmas_carol_in", "martin_chuzzlewit", "sketches_by_boz_illustrative", "barchester_towers", "warden", "mill_on_the", "daniel_deronda", "far_from_the_madding", "return_of_the", "woodlanders", "evelina_or_the_history", "life_and_opinions", "waverley_or_tis_sixty", "rob_roy_complete", "typee_a_romance_of", "portrait_of_a", "turn_of_the", "daisy_miller_a_study", "ambassadors", "house_of_mirth", "age_of_innocence", "ethan_frome", "o_pioneers", "my_ntonia", "sister_carrie_a_novel", "jungle", "seawolf", "martin_eden", "red_badge_of", "tragedy_of_puddnhead", "life_on_the_mississippi", "roughing_it", "black_arrow_a", "catriona", "master_of_ballantrae", "typhoon", "under_western_eyes", "tonobungay", "a_room_with_a", "howards_end", "a_portrait_of_the", "man_who_was", "innocence_of_father", "lost_world", "memoirs_of_sherlock", "white_company", "allan_quatermain", "thirtynine_steps", "twenty_years_after", "notredame_de_paris", "mysterious_island", "fathers_and_children", "notes_from_the_underground", "dead_souls", "don_quixote", "candide", "madame_bovary", "father_goriot"];
-            books("novels90").into_iter().chain(extra.iter().map(|n| (read("gutenberg_memory3", n, "fetch_gutenberg_memory3.sh"), 1.0))).collect()
+            let fresh = name == "fresh150";
+            books("novels90").into_iter().enumerate().map(|(i, (t, s))| (t, if fresh && i < 6 { 1.0 } else { s })).chain(extra.iter().map(|n| (read("gutenberg_memory3", n, "fetch_gutenberg_memory3.sh"), if fresh && FRESH.contains(n) { 0.9 } else { 1.0 }))).collect()
         }
+        // novels22 with a third held-out set: the last 10% of seven memory-only books the model never trained on (FRESH). The novels6 tails become training text (lexicon, words, memory), the model checkpoint is unchanged.
+        "fresh22" => books("novels22").into_iter().enumerate().map(|(i, (t, s))| (t, if i < 6 { 1.0 } else { s })).chain(FRESH.iter().map(|n| (read("gutenberg_memory3", n, "fetch_gutenberg_memory3.sh"), 0.9))).collect(),
         _ => vec![(corpus(name).to_string(), 0.9)],
     }
 }

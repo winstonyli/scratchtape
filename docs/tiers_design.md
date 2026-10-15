@@ -1793,3 +1793,13 @@ Bracketing dynamic evaluation with `dyn_nn=16` (`runs/t64.sh`, `t65.sh`; lexicon
 The optimum is a narrow ridge in step size x steps per byte, not an open slope: past chunk 2 / lr 0.05 the CE rises and large steps blow up (chunk 1 at lr 0.08, chunk 2 at lr 0.12). Half 0 favours chunk 2 (-0.0013 at lr 0.05, -0.0019 at lr 0.04), but half 1 does not confirm it (1.0631 against 1.0626 at chunk 4), so the README keeps chunk 4, lr 0.05 (0.9678 / 1.0626). Chunk 2 also costs about 25% more loop time (~0.088 s per chunk at twice the chunks, from the per-chunk speed lines, not a wall-clock total). Unchecked: chunk 2 at lr 0.04 on half 1.
 
 Half 1 check of chunk 2 / lr 0.04 (`runs/t66.sh`): 1.0620 (against 1.0626 at chunk 4 / lr 0.05, 1.0631 at chunk 2 / lr 0.05). It improves on both halves (0.9659 / 1.0620), so it is adopted as the best stack, at about 25% more loop time; the half-1 gain (-0.0006) is small, and lr 0.04 was chosen on half 0 only.
+
+**Third held-out split (2026-10-15, `runs/t67.sh`, logs in `runs/fresh/`).** The tuning so far used only the two halves of one held-out set, so the final stack was re-scored on a set it never saw: the last 10% of seven memory-only books (far_from_the_madding, evelina, madame_bovary, allan_quatermain, house_of_mirth, jungle, lost_world; 0.49 MB, same size as the old set) that the model never trained on. Corpora `fresh22` / `fresh150` (`FRESH` in `examples/common/mod.rs`): the memory (125.6M keys, cold rebuild) and lexicon/words hold the first 90% of those books and, unlike before, the novels6 tails. Same checkpoint, nothing retuned. Half 0 / half 1 (model alone 1.0796 / 1.0906):
+
+| setting | half 0 | half 1 |
+|---|---|---|
+| current best: chunk 2, lr 0.04, `dyn_nn=16` | **1.0045** | **1.0140** |
+| chunk 4, lr 0.05, `dyn_nn=16` | 1.0078 | 1.0171 |
+| chunk 2, lr 0.04, no `dyn_nn` | 1.0138 | 1.0203 |
+
+The ordering and size of both gains carry over: the chunk-2 retune gives -0.0033 / -0.0031 (it was -0.0019 / -0.0006 on the tuning set), `dyn_nn` gives -0.0093 / -0.0063. Model alone is worse here (1.0796 vs 1.0165), as the model never saw the first 90% of these books, yet the tiers recover more (-0.075 vs -0.05), so the stack gain is not an artefact of the tuning halves. Contention: CPU was ~30% busy from another session at launch (timings not used).
