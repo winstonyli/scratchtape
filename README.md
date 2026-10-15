@@ -85,7 +85,7 @@ exact top-128 ~0.99). With 4-bit keys the 83M-key memory of 91 novels gives 0.97
 Where the rest sits: word-initial letters carry 45% of the model's CE and the tiers remove only 1.9% of it there (6.5% inside words).
 Tried and closed on that front (all negative, `docs/tiers_design.md`): a recency prior for rare words, tier-weight gating, auxiliary
 word-start heads, word-start loss weighting, 16384 cells, first-letter count tiers, and (by the evidence, without a run) hashed
-previous-word inputs and in-model kNN attention. The one open line is more memory text (about -0.005 per 2.5x), VRAM-bound at 125M keys.
+previous-word inputs and in-model kNN attention. The one open line is more memory text (about -0.005 per 2.5x on the tuning halves, -0.02 for 6x on the fresh split), VRAM-bound near 180M keys; a 28-book (+10%) fetch was drafted and dropped 2026-10-15 as worth only about -0.001 to -0.002.
 
 ## Quick start
 
