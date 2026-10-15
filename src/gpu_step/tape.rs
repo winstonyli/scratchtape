@@ -621,6 +621,45 @@ mod tests {
         assert_eq!(gains, (2 * cfg.n_blocks + 1) * cfg.d);
     }
 
+    /// Rows whose target is >= vocab are ignored (zero loss, zero gradient, same divisor): masking the first half of every
+    /// window and masking the second half give gradients that add up to the unmasked gradient.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn ignored_target_rows_split_the_gradient() {
+        let cfg = Config { vocab: 21, d: 16, heads: 4, d_ff: 24, t: 6, n_blocks: 2, softmax1: false };
+        let mut rng = Rng::new(7);
+        let tok = Embedding::new(&mut rng, cfg.vocab, cfg.d);
+        let pos = Embedding::new(&mut rng, cfg.t, cfg.d);
+        let blocks: Vec<_> = (0..cfg.n_blocks).map(|_| TransformerBlock::new(&mut rng, cfg.d, cfg.heads, cfg.d_ff)).collect();
+        let flat = pack(&tok, &pos, &blocks, &LayerNorm::new(cfg.d), &Linear::new(&mut rng, cfg.d, cfg.vocab));
+        let (batch, rows) = (2, 2 * cfg.t);
+        let ids: Vec<usize> = (0..rows).map(|_| (rng.next_gaussian().abs() * 1e4) as usize % cfg.vocab).collect();
+        let targets: Vec<usize> = (0..rows).map(|_| (rng.next_gaussian().abs() * 1e4) as usize % cfg.vocab).collect();
+        let grads = |mask: &dyn Fn(usize) -> bool| {
+            let dev = DeviceParams::upload(&flat);
+            let masked: Vec<usize> = targets.iter().enumerate().map(|(r, &t)| if mask(r % cfg.t) { cfg.vocab } else { t }).collect();
+            let mut dt = DeviceTape::new(&dev);
+            let (_, _, loss) = model_forward(&mut dt, &cfg, &ids, &masked, batch);
+            let row_loss = read(dt.row_losses(loss));
+            dt.backward(loss);
+            drop(dt);
+            (dev.read(&dev.grads), row_loss)
+        };
+        let (full, full_rows) = grads(&|_| false);
+        let (first, first_rows) = grads(&|p| p < cfg.t / 2);
+        let (second, _) = grads(&|p| p >= cfg.t / 2);
+        for (r, (m, f)) in first_rows.iter().zip(&full_rows).enumerate() {
+            if r % cfg.t < cfg.t / 2 {
+                assert_eq!(*m, 0.0, "ignored row {r} has loss {m}");
+            } else {
+                assert!((m - f).abs() < 1e-5, "kept row {r}: {m} vs {f}");
+            }
+        }
+        let sum: Vec<f32> = first.iter().zip(&second).map(|(a, b)| a + b).collect();
+        let e = rel_err(&sum, &full);
+        assert!(e < 1e-4, "complementary masked gradients differ from the full gradient by {e}");
+    }
+
     /// Dropout's mask: about `rate` of the elements zeroed and the rest
     /// scaled exactly; the same elements for dy (the backward pass) as for
     /// x under one seed, and different ones under another seed.

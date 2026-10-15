@@ -290,3 +290,7 @@ path = "examples/tiny_lm/gate_fit.rs"
 [[example]]
 name = "words_gate_fit"
 path = "examples/tiny_lm/words_gate_fit.rs"
+
+[[example]]
+name = "meta_finetune"
+path = "examples/tiny_lm/meta_finetune.rs"
