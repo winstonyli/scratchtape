@@ -1791,3 +1791,5 @@ Bracketing dynamic evaluation with `dyn_nn=16` (`runs/t64.sh`, `t65.sh`; lexicon
 | 1 | | 0.9740 | | 1.0031 | |
 
 The optimum is a narrow ridge in step size x steps per byte, not an open slope: past chunk 2 / lr 0.05 the CE rises and large steps blow up (chunk 1 at lr 0.08, chunk 2 at lr 0.12). Half 0 favours chunk 2 (-0.0013 at lr 0.05, -0.0019 at lr 0.04), but half 1 does not confirm it (1.0631 against 1.0626 at chunk 4), so the README keeps chunk 4, lr 0.05 (0.9678 / 1.0626). Chunk 2 also costs about 25% more loop time (~0.088 s per chunk at twice the chunks, from the per-chunk speed lines, not a wall-clock total). Unchecked: chunk 2 at lr 0.04 on half 1.
+
+Half 1 check of chunk 2 / lr 0.04 (`runs/t66.sh`): 1.0620 (against 1.0626 at chunk 4 / lr 0.05, 1.0631 at chunk 2 / lr 0.05). It improves on both halves (0.9659 / 1.0620), so it is adopted as the best stack, at about 25% more loop time; the half-1 gain (-0.0006) is small, and lr 0.04 was chosen on half 0 only.
