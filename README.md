@@ -338,6 +338,15 @@ paper sections re-fetched, the Nature paper via the DeepMind post)
   outer step found nothing reliably better than the plain mean (best
   1.640 at lr 0.5 / mu 0.5, within ~2× the 0.005 rounding noise).
 
+**Retrieval-driven test-time training** (read 2026-10-14, arXiv HTML of v3). Hardt & Sun, "Test-Time Training on Nearest Neighbors for Large
+Language Models" (ICLR 2024, arXiv:2305.18466; reproduced in arXiv:2511.16691): for each test sequence, embed it, retrieve its nearest
+Pile training sequences (RoBERTa-based 1024-d embeddings, exact L2 index of ~210M sequences), take one Adam step per neighbour chunk
+(20 neighbours already give most of the gain; the main setting uses 50), closest first (farthest first is reported significantly worse),
+then reset to the pretrained weights; it does not train on the test input itself. Dynamic evaluation (Krause et al. 2018, arXiv:1709.07432;
+2019 for Transformers, arXiv:1904.08378) is the same idea with the recent history of the same text as the training signal. This project's
+dynamic evaluation (SGD on the chunk just scored, reset per book) is the second; the first is untried here, where the kNN memory could supply
+the neighbours (`docs/tiers_design.md`).
+
 **Sibling project: `humble-cortex`** (`../humble-cortex`, predictive
 coding in Rust). Its 95 checks overlap here in three places. First, every
 model is benchmarked against the simplest baseline for the task
