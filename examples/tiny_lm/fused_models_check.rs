@@ -46,7 +46,7 @@
 // (K = 1 on the device) and must match its fused score to 1e-4; parameters
 // go to runs/<name>_m<m>.ckpt (flatten_all order).
 use scratchtape::gpu_lease::{self, Kind};
-use scratchtape::gpu_step::tape::{Config, DeviceTape, MemoryBatch, model_forward, model_forward_memory};
+use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::{DeviceParams, host_profile_cut, host_profile_start, host_profile_take, pack, profile_start, profile_take, read, upload_f32};
 use scratchtape::nn::{Embedding, LayerNorm, Linear, Rng, TransformerBlock};
 use std::io::Write;
@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{sample_window, split_corpus, train_docs};
+use common::{sample_window, split_corpus};
 
 /// Longest `seq`: scored-tail windows start at MAX_SEQ - seq so every seq scores the same target bytes.
 const MAX_SEQ: usize = 256;
@@ -111,7 +111,7 @@ fn device_ce(dev: &DeviceParams, cfg: &Config, corpus: &[usize], tail: usize) ->
 const PROFILE_WARM: usize = 20;
 const PROFILE_STEPS: usize = 50;
 
-const PARAMS: [(&str, &str); 32] = [
+const PARAMS: [(&str, &str); 28] = [
     ("name", ""),
     ("k", ""),
     ("batch", ""),
@@ -140,10 +140,6 @@ const PARAMS: [(&str, &str); 32] = [
     ("seq", "64"),
     ("score_tail", "0"),
     ("init", "-"),
-    ("memory", "0"),
-    ("group_windows", "8"),
-    ("memory_drop", "0.9"),
-    ("memory_warm_frac", "0.05"),
 ];
 
 /// Arguments after the program name: bare values fill PARAMS in order, `key=value` sets one by name
@@ -242,14 +238,6 @@ fn main() {
 
     let (train, held_out) = split_corpus(&corpus_name);
     let (train, held_out) = (&train[..], &held_out[..]);
-    // TRIME-style memory-augmented loss (docs/tiers_design.md): batches of groups of `group_windows` windows, half
-    // consecutive windows of one book, half random; the model's own memory is the group's other positions.
-    let memory = p.get::<String>("memory") == "1";
-    let (group_windows, memory_drop): (usize, f32) = (p.get("group_windows"), p.get("memory_drop"));
-    let memory_warm = (p.get::<f32>("memory_warm_frac") * (windows / batch) as f32) as usize;
-    assert!(!memory || (k == 1 && batch % group_windows == 0 && group_windows % 2 == 0 && sync_every == 0), "memory=1 needs k = 1, batch % group_windows = 0, even group_windows, no averaging");
-    let docs = train_docs(&corpus_name);
-    let book_of = |at: usize| docs.partition_point(|&s| s <= at) - 1;
 
     // Model m's generator: its init, then its batches (training_recipe_check's order).
     let mut rngs: Vec<Rng> = (0..k as u64).map(|m| Rng::new(seed + m)).collect();
@@ -268,7 +256,7 @@ fn main() {
         }
     };
     let config = format!(
-        "k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu} corpus={corpus_name} lr_decay_frac={lr_decay_frac} model d={} heads={} d_ff={} blocks={} groups={groups} memory={memory} group_windows={group_windows} memory_drop={memory_drop} memory_warm={memory_warm}",
+        "k={k} batch={batch} lr={lr} windows={windows} seeds={seed}..{} wd={weight_decay} dropout={dropout} warmup={warmup_windows} momentum={momentum} alpha={alpha} ramp={ramp} sync_every={sync_every} shared_init={shared_init} outer_lr={outer_lr} outer_mu={outer_mu} corpus={corpus_name} lr_decay_frac={lr_decay_frac} model d={} heads={} d_ff={} blocks={} groups={groups}",
         seed + k as u64 - 1,
         cfg.d,
         cfg.heads,
@@ -379,44 +367,17 @@ fn main() {
             lr *= ((steps - step) as f32 / (lr_decay_frac * steps as f32)).min(1.0);
         }
         let (mut input, mut target) = (Vec::with_capacity(k * batch * seq), Vec::with_capacity(k * batch * seq));
-        // memory=1: each row's (book, byte position), for the memory's visibility rule.
-        let (mut row_book, mut row_pos) = (vec![], vec![]);
-        let tail = |start: usize| (start, book_of(start));
         for rng in &mut rngs {
-            if memory {
-                // per group: half consecutive non-overlapping windows of one book, half random windows
-                for _ in 0..batch / group_windows {
-                    let book = (rng.next_f32() * docs.len() as f32) as usize;
-                    let end = docs.get(book + 1).copied().unwrap_or(train.len());
-                    let chain = group_windows / 2 * seq;
-                    let first = docs[book] + (rng.next_f32() * (end - docs[book]).saturating_sub(chain + 1) as f32) as usize;
-                    let mut starts: Vec<usize> = (0..group_windows / 2).map(|w| first + w * seq).collect();
-                    starts.extend((0..group_windows / 2).map(|_| (rng.next_f32() * (train.len() - seq - 1) as f32) as usize));
-                    for s in starts {
-                        let (s, b) = tail(s);
-                        input.extend(&train[s..s + seq]);
-                        target.extend(&train[s + 1..s + seq + 1]);
-                        row_book.extend(std::iter::repeat_n(b, seq));
-                        row_pos.extend(s..s + seq);
-                    }
-                }
-            } else {
-                for _ in 0..batch {
-                    let (i, t) = sample_window(rng, train, seq);
-                    input.extend(i);
-                    target.extend(t);
-                }
+            for _ in 0..batch {
+                let (i, t) = sample_window(rng, train, seq);
+                input.extend(i);
+                target.extend(t);
             }
         }
         dev.zero_grads();
         let dt = if dropout > 0.0 { DeviceTape::with_dropout(&dev, dropout, (seed as u32).wrapping_mul(0x85eb_ca6b) ^ step as u32) } else { DeviceTape::new(&dev) };
         let mut dt = dt.with_distill(alpha * ((step + 1) as f32 / ramp as f32).min(1.0));
-        let loss = if memory && step >= memory_warm {
-            let mem = MemoryBatch { book: &row_book, pos: &row_pos, group_windows, drop: memory_drop, seed: (seed as u32).wrapping_mul(0x2545_f491) ^ step as u32 };
-            model_forward_memory(&mut dt, &cfg, &input, &target, batch, &mem).1
-        } else {
-            model_forward(&mut dt, &cfg, &input, &target, k * batch).2
-        };
+        let (_, _, loss) = model_forward(&mut dt, &cfg, &input, &target, k * batch);
         dt.backward(loss);
         match &velocity {
             Some(v) => dev.momentum(lr, momentum, v, ones.as_ref().map(|m| (lr * weight_decay, m))),

@@ -62,7 +62,7 @@
 // turn, so parts 0/2 and 1/2 of novels6 are (mostly) different books: a memory from the other part is unseen by the model
 // AND from other documents, separating "never trained on" from "adjacent to the scored text".
 // `tap` picks which block's output the tiers get as the position's hidden state (default: the last block, i.e. the
-// final residual stream before the final LayerNorm; `tap=ffn`: the last block's feed-forward input, TRIME's key, `memory=1` training). With `stride` > 1 the model alone is scored on the same
+// final residual stream before the final LayerNorm). With `stride` > 1 the model alone is scored on the same
 // subsample, so tiers are always compared to the plain model on identical positions (Gate 0's `expect` needs stride 1). `offset` picks which of the `stride` interleaved subsamples, so tuning and
 // testing can use disjoint windows.
 //
@@ -70,7 +70,7 @@
 // `expect=`, the number recorded for the checkpoint (to its 4 printed digits).
 use scratchtape::gpu_lease::{self, Kind};
 use scratchtape::gpu_step::knn::{DOC, KMAX, KnnStore};
-use scratchtape::gpu_step::tape::{Config, DeviceTape, forward_logits};
+use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::matmul::{Epilogue, MatRef, matmul_f32};
 use scratchtape::gpu_step::{DeviceParams, Handle, client, read_many, upload_f32};
 use std::cell::{Cell, RefCell};
@@ -1069,13 +1069,11 @@ fn window_ids(data: &[usize], starts: &[usize]) -> (Vec<usize>, Vec<usize>) {
 fn forward(dev: &DeviceParams, cfg: &Config, data: &[usize], starts: &[usize], tap: usize, want_hidden: bool, want_logits: bool) -> Forward {
     let (ids, targets) = window_ids(data, starts);
     let mut dt = DeviceTape::new(dev);
-    let (outs, ffn, logits) = forward_logits(&mut dt, cfg, &ids, starts.len());
-    let loss = dt.cross_entropy(logits, &targets);
-    let tapped = if tap == cfg.n_blocks { ffn } else { outs[tap] };
+    let (outs, logits, loss) = model_forward(&mut dt, cfg, &ids, &targets, starts.len());
     // Everything the host needs comes back in one read.
     let hidden_h = match (WHITEN.get(), want_hidden) {
-        (Some((mu, w)), true) => Some(whiten_device(dt.value(tapped), ids.len(), mu, w, cfg.d)),
-        (None, true) => Some(dt.value(tapped).clone()),
+        (Some((mu, w)), true) => Some(whiten_device(dt.value(outs[tap]), ids.len(), mu, w, cfg.d)),
+        (None, true) => Some(dt.value(outs[tap]).clone()),
         _ => None,
     };
     let mut handles = vec![];
@@ -1122,8 +1120,7 @@ impl Adapter {
         }
         dev.zero_grads();
         let mut dt = DeviceTape::new(dev);
-        let (_, _, logits) = forward_logits(&mut dt, cfg, &ids, starts.len());
-        let loss = dt.cross_entropy(logits, &targets);
+        let (_, _, loss) = model_forward(&mut dt, cfg, &ids, &targets, starts.len());
         dt.backward(loss);
         drop(dt);
         if self.rms_beta.is_none() && self.pull == 0.0 && self.mask.is_none() {
@@ -1301,10 +1298,10 @@ fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, a
     // 260 MB of hidden states never cross the link, only a d x d matrix per launch.
     let (mut n, mut sum, mut gram) = (0usize, vec![0f64; d], vec![0f64; d * d]);
     for chunk in starts.chunks(2 * chunk_windows()) {
-        let (ids, _) = window_ids(train, chunk);
+        let (ids, targets) = window_ids(train, chunk);
         let mut dt = DeviceTape::new(dev);
-        let (outs, ffn, _) = forward_logits(&mut dt, cfg, &ids, chunk.len());
-        let (x, rows) = (dt.value(if tap == cfg.n_blocks { ffn } else { outs[tap] }), ids.len());
+        let (outs, _, _) = model_forward(&mut dt, cfg, &ids, &targets, chunk.len());
+        let (x, rows) = (dt.value(outs[tap]), ids.len());
         let (g, s, ones) = (client().empty(d * d * 4), client().empty(d * 4), upload_f32(&vec![1.0; rows]));
         matmul_f32(MatRef { trans: true, ..MatRef::new(x) }, MatRef::new(x), MatRef::new(&g), 1, d, rows, d, Epilogue::default());
         matmul_f32(MatRef::new(&ones), MatRef::new(x), MatRef::new(&s), 1, 1, rows, d, Epilogue::default());
@@ -1362,9 +1359,8 @@ fn main() {
     let size = |k: &str, d: &str| -> usize { get(k, d).parse().unwrap() };
     SEQ.store(size("seq", "64"), std::sync::atomic::Ordering::Relaxed);
     let cfg = Config { vocab: VOCAB, d: size("d_model", "256"), heads: size("heads", "8"), d_ff: size("d_ff", "512"), t: seq_len(), n_blocks: size("blocks", "4"), softmax1: false };
-    // `tap=ffn` is index n_blocks: the last block's feed-forward input.
-    let tap = if opt.get("tap").map(String::as_str) == Some("ffn") { cfg.n_blocks } else { size("tap", &(cfg.n_blocks - 1).to_string()) };
-    assert!(tap <= cfg.n_blocks, "tap must be a block index below {} or ffn", cfg.n_blocks);
+    let tap = size("tap", &(cfg.n_blocks - 1).to_string());
+    assert!(tap < cfg.n_blocks, "tap must be a block index below {}", cfg.n_blocks);
     let stride = size("stride", "1");
     assert!(stride >= 1 && (stride == 1 || !opt.contains_key("expect")), "stride >= 1, and `expect` needs stride 1");
     let warm = size("warm", "0");

@@ -1919,3 +1919,20 @@ Design, from the code read (trainer = `fused_models_check.rs`, loss = `gpu_step`
 - **Checks left behind**: (a) `memory_ce` with all columns masked equals plain CE exactly; (b) forward and `dS`/`dlogits` against a CPU reference on random inputs; (c) a sampler test: groups have the stated structure and no window overlaps another in its book.
 - **Known weakness**: external windows are random, not BM25 neighbours; the paper's ablation says BM25 batching is worth 0.26 nats of the 0.34 total at 7M. If the random-batch arm is flat, that is not a clean negative; the next step then is a cheap lexical-neighbour batcher, not deletion.
 - **Costs/risks**: S is `groups * (G*T)^2` floats (G=8, T=128, 16 groups: 17M floats, small). The memory adds one matmul plus one row kernel per step, expected <15% step time. Positions/learned embeddings are untouched. The checkpoint init is the 64m checkpoint (fine-tune) or a from-scratch 4M-window run; from-scratch is the faithful arm (the warmup rule is about from-scratch training) at roughly the earlier 4M-window cost.
+
+### TRIME-style memory-augmented training: negative result (2026-10-15)
+
+Built (commit 284f10c, since removed; recover from git): a `memory_ce` GPU op (joint softmax over logits and in-group similarities `g gᵀ/√d`, g = last block's feed-forward input; visible = other book, or same book and earlier; own-window memory dropped w.p. 0.9; checked against an f64 reference, gradients by central differences, and it equals plain CE when nothing is visible), trainer `memory=1` (groups of 8 windows: 4 consecutive of one book, 4 random; first 5% of steps plain), and `tier_eval tap=ffn`. Cost: +23% step time (6.0 vs 4.9 ms).
+
+Pair: nov22 seq-128 recipe from scratch, 4M windows, same seed (`scripts/train_trime_pair.sh`, removed). Fresh split, `part=0/4`, no dyn, `lexicon:0.2+words:1:0.1+knn:128:0.5:30:15:100`, memory rebuilt per checkpoint:
+
+| arm | model alone | stack | stack saving |
+|---|---|---|---|
+| plain (tap = last block output) | 1.2778 | **1.0529** | -0.2248 |
+| TRIME (tap = ffn input) | 1.2987 | 1.0599 | -0.2388 |
+
+TRIME is **0.0070 worse** in the stack (bar was 0.003 better). Its model alone is 0.021 worse (held-out CE in the trainer is memory-off: 1.1495 plain vs ~1.16 TRIME at the end); the stack recovers two thirds of that gap but not all.
+
+Caveats, so this is a negative for *this* variant only: (1) external memory was random windows, not BM25 neighbours, which the paper's ablation says carries most of the gain (45.71 vs 41.50 at 7M); (2) the kNN parameters (`128:0.5:30:15:100`) were tuned on the plain arm's block-output keys and not retuned for the ffn tap (the distance scale differs: nearest-neighbour mean squared distance 48 vs 86); (3) one seed, 4M windows. A tap=ffn plain control and a retuned TRIME stack were not run. A neighbour batcher plus those two controls would be the full repeat; not pursued because our online memory already supplies same-book entries at test time, which is what the local and long-term memories teach the model to use, leaving only the external part for training to add.
+
+Disk note from the run: two memory caches are 9.5 GB each and the C: drive was full once (a failed 5.6 GB `.part`); the 64M model's fresh and original-split caches were deleted to make room and rebuild in ~11 min if needed.

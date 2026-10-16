@@ -355,17 +355,6 @@ pub fn split_corpus(name: &str) -> (Vec<usize>, Vec<usize>) {
     (train, held_out)
 }
 
-/// Where each book's training text starts inside `split_corpus`'s train vector (every book has some).
-#[allow(dead_code)]
-pub fn train_docs(name: &str) -> Vec<usize> {
-    let (mut starts, mut at) = (vec![], 0);
-    for (book, train_share) in books(name) {
-        starts.push(at);
-        at += (book.len() as f32 * train_share) as usize;
-    }
-    starts
-}
-
 /// Where each book's held-out text starts inside `split_corpus`'s held-out vector.
 #[allow(dead_code)]
 pub fn held_out_docs(name: &str) -> Vec<usize> {

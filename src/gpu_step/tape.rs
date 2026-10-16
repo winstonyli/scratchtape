@@ -15,7 +15,7 @@
 //!   matmul over the models' weights; ops without parameters don't care.
 use super::matmul::{Epilogue, MatRef, matmul, matmul_f32};
 use super::rows::{LnOut, layer_norm, layer_norm_backward, softmax, softmax_backward};
-use super::tokens::{CeOut, MemCeOut, MemMeta, cross_entropy, cross_entropy_backward, embed, embed_backward, memory_cross_entropy, memory_cross_entropy_backward, upload_ids};
+use super::tokens::{CeOut, cross_entropy, cross_entropy_backward, embed, embed_backward, upload_ids};
 use super::{DeviceParams, EW_DIM, buf, client, cubes, k_fill};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -75,21 +75,6 @@ enum Op {
         targets: Handle,
         fwd: CeOut,
         vocab: usize,
-    },
-    /// TRIME's memory-augmented loss over `logits` and the similarity block `scores` (`tokens::memory_cross_entropy`).
-    MemoryCe {
-        logits: usize,
-        scores: usize,
-        targets: Handle,
-        book: Handle,
-        pos: Handle,
-        fwd: MemCeOut,
-        vocab: usize,
-        t: usize,
-        gm: usize,
-        scale: f32,
-        thr: u32,
-        seed: u32,
     },
 }
 
@@ -151,7 +136,6 @@ impl<'p> DeviceTape<'p> {
     pub fn row_losses(&self, loss: DVar) -> &Handle {
         match &self.nodes[loss.0].op {
             Op::CrossEntropy { fwd, .. } => &fwd.row_loss,
-            Op::MemoryCe { fwd, .. } => &fwd.ce.row_loss,
             _ => panic!("row_losses of a non-cross_entropy node"),
         }
     }
@@ -254,23 +238,6 @@ impl<'p> DeviceTape<'p> {
         self.push(loss, 1, k, Op::CrossEntropy { logits: logits.0, targets, fwd, vocab })
     }
 
-    /// TRIME's loss (one model): -ln of the target's mass in softmax over [logits | scale·scores[r, j]] for the memory rows j
-    /// visible to r. `scores` [rows, gm] holds each row's similarities to its group of `gm` rows; `book`/`pos` give each row's
-    /// book and byte position, `t` the window length; `drop` the chance a row's own-window memory is dropped (`seed` per step).
-    #[allow(clippy::too_many_arguments)]
-    pub fn memory_cross_entropy(&mut self, logits: DVar, scores: DVar, targets: &[usize], book: &[usize], pos: &[usize], t: usize, scale: f32, drop: f32, seed: u32) -> DVar {
-        assert_eq!(self.params.models.k, 1, "memory cross-entropy is for one model");
-        let (rows, vocab) = self.shape(logits);
-        let gm = self.shape(scores).1;
-        assert_eq!(self.shape(scores).0, rows);
-        let (targets, book, pos) = (upload_ids(targets), upload_ids(book), upload_ids(pos));
-        let thr = (drop as f64 * 4294967296.0).min(4294967295.0) as u32;
-        let meta = MemMeta { book: &book, pos: &pos, t, gm, scale, thr, seed };
-        let fwd = memory_cross_entropy(self.value(logits), self.value(scores), &targets, &meta, rows, vocab);
-        let loss = fwd.ce.loss.clone();
-        self.push(loss, 1, 1, Op::MemoryCe { logits: logits.0, scores: scores.0, targets, book, pos, fwd, vocab, t, gm, scale, thr, seed })
-    }
-
     /// Where a gradient for node v goes: its existing buffer (accumulate),
     /// or a new one. `full_write`: the caller writes every element, so a
     /// new buffer needn't be zeroed first.
@@ -315,14 +282,14 @@ impl<'p> DeviceTape<'p> {
     /// Backpropagates from `loss` (a cross_entropy node, seed 1).
     /// Parameter gradients accumulate into the params' gradient buffer.
     pub fn backward(&mut self, loss: DVar) {
-        assert!(matches!(self.nodes[loss.0].op, Op::CrossEntropy { .. } | Op::MemoryCe { .. }), "backward starts at a cross_entropy node");
+        assert!(matches!(self.nodes[loss.0].op, Op::CrossEntropy { .. }), "backward starts at a cross_entropy node");
         let grads = self.params.grads.clone();
         let p = self.params.params.clone();
         let m = self.params.models;
         for i in (0..=loss.0).rev() {
             let (op, rows, cols) = (self.nodes[i].op.clone(), self.nodes[i].rows, self.nodes[i].cols);
             let dy = match (&op, &self.nodes[i].grad) {
-                (Op::CrossEntropy { .. } | Op::MemoryCe { .. }, _) => None,
+                (Op::CrossEntropy { .. }, _) => None,
                 (_, Some(g)) => Some(g.clone()),
                 (_, None) => continue, // nothing downstream used it
             };
@@ -331,13 +298,6 @@ impl<'p> DeviceTape<'p> {
                     let r = self.nodes[logits].rows;
                     let dl = cross_entropy_backward(&self.nodes[logits].value, &targets, &fwd, r, vocab, m.k, self.distill);
                     self.add_grad(logits, dl);
-                }
-                Op::MemoryCe { logits, scores, targets, book, pos, fwd, vocab, t, gm, scale, thr, seed } => {
-                    let r = self.nodes[logits].rows;
-                    let meta = MemMeta { book: &book, pos: &pos, t, gm, scale, thr, seed };
-                    let (dl, ds) = memory_cross_entropy_backward(&self.nodes[logits].value, &self.nodes[scores].value, &targets, &meta, &fwd, r, vocab);
-                    self.add_grad(logits, dl);
-                    self.add_grad(scores, ds);
                 }
                 Op::Embed { ids, t, vocab, tok_off, pos_off } => {
                     embed_backward(&dy.unwrap(), &ids, rows, cols, t, vocab, &grads, tok_off, pos_off, m);
@@ -513,11 +473,6 @@ struct BlockOffsets {
 /// views of the QKV output and writes its heads straight into the merged
 /// layout.
 pub fn block_forward(tape: &mut DeviceTape, cfg: &Config, x: DVar, off: usize, batch: usize) -> DVar {
-    block_forward_tap(tape, cfg, x, off, batch).0
-}
-
-/// `block_forward`, also returning its feed-forward's input (the second LayerNorm's output), the key/query TRIME's memory uses.
-pub fn block_forward_tap(tape: &mut DeviceTape, cfg: &Config, x: DVar, off: usize, batch: usize) -> (DVar, DVar) {
     let (d, h, f) = (cfg.d, cfg.heads, cfg.d_ff);
     let dk = d / h;
     let o = cfg.block_offsets(off);
@@ -532,50 +487,22 @@ pub fn block_forward_tap(tape: &mut DeviceTape, cfg: &Config, x: DVar, off: usiz
     let ln2 = tape.layer_norm(x1, o.ln2);
     let hidden = tape.linear(ln2, o.ffn1, f, true, None);
     let hidden = tape.dropout(hidden);
-    (tape.linear(hidden, o.ffn2, d, false, Some(x1)), ln2)
+    tape.linear(hidden, o.ffn2, d, false, Some(x1))
 }
 
 /// The whole model: embedding, blocks, final LayerNorm, output projection,
 /// cross-entropy. Returns (each block's output, logits, loss).
 pub fn model_forward(tape: &mut DeviceTape, cfg: &Config, ids: &[usize], targets: &[usize], batch: usize) -> (Vec<DVar>, DVar, DVar) {
-    let (outs, _, logits) = forward_logits(tape, cfg, ids, batch);
-    let loss = tape.cross_entropy(logits, targets);
-    (outs, logits, loss)
-}
-
-/// The model up to its logits. Returns (each block's output, the last block's feed-forward input, logits).
-pub fn forward_logits(tape: &mut DeviceTape, cfg: &Config, ids: &[usize], batch: usize) -> (Vec<DVar>, DVar, DVar) {
     let mut x = tape.embed(ids, cfg.d, cfg.t, cfg.vocab, cfg.tok_off(), cfg.pos_off());
     let mut outs = Vec::with_capacity(cfg.n_blocks);
-    let mut tap = x;
     for i in 0..cfg.n_blocks {
-        (x, tap) = block_forward_tap(tape, cfg, x, cfg.block_off(i), batch);
+        x = block_forward(tape, cfg, x, cfg.block_off(i), batch);
         outs.push(x);
     }
     let ln = tape.layer_norm(x, cfg.final_ln_off());
     let logits = tape.linear(ln, cfg.proj_off(), cfg.vocab, false, None);
-    (outs, tap, logits)
-}
-
-/// Rows of a TRIME batch (`model_forward_memory`): per row its book and absolute byte position, in windows of `cfg.t` rows,
-/// `group_windows` windows per memory group.
-pub struct MemoryBatch<'a> {
-    pub book: &'a [usize],
-    pub pos: &'a [usize],
-    pub group_windows: usize,
-    /// Chance a row's own-window memory is dropped.
-    pub drop: f32,
-    pub seed: u32,
-}
-
-/// `model_forward` with TRIME's loss: queries and keys are the last block's feed-forward input g, similarity g gᵀ / √d within
-/// each group of windows. Returns (logits, loss).
-pub fn model_forward_memory(tape: &mut DeviceTape, cfg: &Config, ids: &[usize], targets: &[usize], batch: usize, mem: &MemoryBatch) -> (DVar, DVar) {
-    assert!(batch % mem.group_windows == 0);
-    let (_, tap, logits) = forward_logits(tape, cfg, ids, batch);
-    let scores = tape.batched_matmul(tap, Layout::Stacked, tap, Layout::Stacked, batch / mem.group_windows, true, Layout::Stacked);
-    let loss = tape.memory_cross_entropy(logits, scores, targets, mem.book, mem.pos, cfg.t, 1.0 / (cfg.d as f32).sqrt(), mem.drop, mem.seed);
-    (logits, loss)
+    let loss = tape.cross_entropy(logits, targets);
+    (outs, logits, loss)
 }
 
 /// Node matrix z, under `lay`, of a buffer h shaped like its node (width
@@ -618,7 +545,7 @@ pub fn dropout_relu_backward(dy: &Handle, relu_y: &Handle, len: usize, rate: f32
 /// The mask bits of `k_dropout`: lowbias32 (Wellons) of i + seed·golden ratio, an independent-looking 32-bit
 /// value per (seed, i).
 #[cube]
-pub(super) fn dropout_bits(i: u32, seed: u32) -> u32 {
+fn dropout_bits(i: u32, seed: u32) -> u32 {
     let mut h = i + seed * 0x9e37_79b9u32;
     h ^= h >> 16;
     h *= 0x7feb_352du32;
