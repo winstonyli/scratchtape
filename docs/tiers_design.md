@@ -1976,3 +1976,14 @@ Validation on `part=0/4` (not used for tuning), stack CE old weights -> `128:0.8
 Retuning is worth ~0.01 on every 4M model. It also dissolves most of the 40-vs-90 gap: on the tuning part novels90 is 0.0014 *better*, on part 0 novels40 is 0.0045 better, so the two are a tie within part-to-part noise; the data gain over novels22 stays (-0.0145 on part 0, -0.0277 on part 1). The earlier "more data stops helping at 90" reading and the overlap story both rested on weights tuned for the wrong model.
 
 Still untested: lambda between 0.65 and 0.9 more finely, temp_doc above 22, k, shift, and the same retune for the 64M-window model (whose current best stack is 1.0299 on this part without dyn, above the 4M novels40's 1.0253 here).
+
+### The 64M-window model retuned (2026-10-16)
+
+The `nov22_s128_k1_d0.1_64m_f16` checkpoint (novels22, 64M "windows" in the run name), one memory build for both parts, fresh split, no dyn, lexicon+words fixed:
+
+| part | old weights `128:0.5:30:15:100` | `128:0.8:30:22:100` | `128:0.8:30:15:100` | `128:0.65:30:22:100` | `128:0.8:30:30:100` |
+|---|---|---|---|---|---|
+| 1/4 (tuning) | 1.0814 | 1.0706 | **1.0704** | 1.0722 | 1.0748 |
+| 0/4 (validation) | 1.0299 | **1.0226** | | | |
+
+The same weights win for the 64M model (-0.0073 on part 0, -0.0108 on part 1): the old setting was off for it too, and the project's best no-dyn stack is now **1.0226** (part 0). Against the 4M novels40 model with the same tuned weights (part 0 1.0253, part 1 1.0571): the 64M-window novels22 model is 0.0027 better on part 0 but 0.0135 *worse* on part 1. The two parts disagree on which wins, so at ~1/8 the training compute novels40 matches the long-trained model within part noise, and the two levers (long training, more books) are probably additive: untested.
