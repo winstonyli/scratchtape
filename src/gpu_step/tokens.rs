@@ -1,6 +1,7 @@
 //! The two ops indexed by token id (milestone 2): Embed (token + position,
 //! summed) and CrossEntropy (fused softmax + NLL, mean over rows). Their
 //! reductions are ordered loops, not atomics, so they're deterministic.
+use super::tape::dropout_bits;
 use super::{EW_DIM, Models, buf, client, cubes};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -252,6 +253,197 @@ fn k_ce_bwd(x: &[f32], targets: &[u32], lse: &[f32], dl: &mut [f32], rows: u32, 
     }
 }
 
+/// What `memory_cross_entropy`'s backward needs (the plain `CeOut` plus the numerator's log-mass per row).
+#[derive(Clone)]
+pub struct MemCeOut {
+    pub ce: CeOut,
+    pub lnum: Handle,
+}
+
+/// Where a memory-augmented row sits: `book` ids and absolute byte `pos` per row, windows of `t` rows, groups of `gm` rows
+/// (the memory is the group's rows), `thr`/`seed` the local-memory drop (`mem_visible`).
+pub struct MemMeta<'a> {
+    pub book: &'a Handle,
+    pub pos: &'a Handle,
+    pub t: usize,
+    pub gm: usize,
+    pub scale: f32,
+    pub thr: u32,
+    pub seed: u32,
+}
+
+/// TRIME's loss (Zhong et al. 2022): -ln of the target's mass in softmax over [logits | scale·scores[r, j] for visible j], where
+/// column j is a memory entry whose token is targets[j] and the target's mass is its logit plus every visible entry with the same
+/// token. `scores` [rows, gm]: row r's similarities to its group's gm rows. One model only.
+pub fn memory_cross_entropy(logits: &Handle, scores: &Handle, targets: &Handle, m: &MemMeta, rows: usize, vocab: usize) -> MemCeOut {
+    let c = client();
+    let out = MemCeOut { ce: CeOut { loss: c.empty(4), lse: c.empty(rows * 4), row_loss: c.empty(rows * 4) }, lnum: c.empty(rows * 4) };
+    super::count_launch();
+    k_mce_rows::launch(
+        c,
+        cubes(rows),
+        CubeDim::new_1d(EW_DIM),
+        whole(logits),
+        whole(scores),
+        whole(targets),
+        whole(m.book),
+        whole(m.pos),
+        whole(&out.ce.lse),
+        whole(&out.lnum),
+        whole(&out.ce.row_loss),
+        rows as u32,
+        vocab as u32,
+        m.gm as u32,
+        m.t as u32,
+        m.scale,
+        m.thr,
+        m.seed,
+    );
+    super::count_launch();
+    k_mean::launch(c, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1), whole(&out.ce.row_loss), whole(&out.ce.loss), rows as u32);
+    out
+}
+
+/// (dlogits, dscores) of the mean loss: dlogits = (p - onehot(target)·w) / rows, with w the target logit's share of the
+/// numerator; dscores[r, j] = scale · (p_j - [targets[j] = targets[r]]·share_j) / rows for visible j, else 0.
+pub fn memory_cross_entropy_backward(logits: &Handle, scores: &Handle, targets: &Handle, m: &MemMeta, fwd: &MemCeOut, rows: usize, vocab: usize) -> (Handle, Handle) {
+    let c = client();
+    let (dl, ds) = (c.empty(rows * vocab * 4), c.empty(rows * m.gm * 4));
+    super::count_launch();
+    k_mce_bwd_logits::launch(c, cubes(rows * vocab), CubeDim::new_1d(EW_DIM), whole(logits), whole(targets), whole(&fwd.ce.lse), whole(&fwd.lnum), whole(&dl), rows as u32, vocab as u32);
+    super::count_launch();
+    k_mce_bwd_scores::launch(
+        c,
+        cubes(rows * m.gm),
+        CubeDim::new_1d(EW_DIM),
+        whole(scores),
+        whole(targets),
+        whole(m.book),
+        whole(m.pos),
+        whole(&fwd.ce.lse),
+        whole(&fwd.lnum),
+        whole(&ds),
+        rows as u32,
+        m.gm as u32,
+        m.t as u32,
+        m.scale,
+        m.thr,
+        m.seed,
+    );
+    (dl, ds)
+}
+
+/// 1 if memory row `j` is visible to row `r`: another book always is; the same book if the entry is earlier in the text
+/// (so its token, the byte after it, is no later than r's own input), except that for the same window the whole local memory
+/// is dropped with probability thr / 2³² (TRIME drops local memory so the model learns to use the long-term and external one).
+#[cube]
+fn mem_visible(r: u32, j: u32, book: &[u32], pos: &[u32], t: u32, thr: u32, seed: u32) -> u32 {
+    let mut v = 0u32;
+    if book[j as usize] != book[r as usize] {
+        v = 1u32;
+    } else if pos[j as usize] < pos[r as usize] {
+        v = 1u32;
+        if j / t == r / t && dropout_bits(r, seed) < thr {
+            v = 0u32;
+        }
+    }
+    v
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cube(launch)]
+fn k_mce_rows(
+    x: &[f32],
+    s: &[f32],
+    targets: &[u32],
+    book: &[u32],
+    pos: &[u32],
+    lse: &mut [f32],
+    lnum: &mut [f32],
+    loss: &mut [f32],
+    rows: u32,
+    vocab: u32,
+    gm: u32,
+    t: u32,
+    scale: f32,
+    thr: u32,
+    seed: u32,
+) {
+    let r = ABSOLUTE_POS as u32;
+    if r < rows {
+        let base = r * vocab;
+        let g0 = (r / gm) * gm;
+        let tg = targets[r as usize];
+        let mut m = x[base as usize];
+        for c in 1..vocab {
+            let v = x[(base + c) as usize];
+            if v > m {
+                m = v;
+            }
+        }
+        for j in 0..gm {
+            if mem_visible(r, g0 + j, book, pos, t, thr, seed) == 1u32 {
+                let v = s[(r * gm + j) as usize] * scale;
+                if v > m {
+                    m = v;
+                }
+            }
+        }
+        let mut z = 0.0f32;
+        for c in 0..vocab {
+            z += f32::exp(x[(base + c) as usize] - m);
+        }
+        let mut n = f32::exp(x[(base + tg) as usize] - m);
+        for j in 0..gm {
+            if mem_visible(r, g0 + j, book, pos, t, thr, seed) == 1u32 {
+                let e = f32::exp(s[(r * gm + j) as usize] * scale - m);
+                z += e;
+                if targets[(g0 + j) as usize] == tg {
+                    n += e;
+                }
+            }
+        }
+        let l = m + f32::ln(z);
+        let ln = m + f32::ln(n);
+        lse[r as usize] = l;
+        lnum[r as usize] = ln;
+        loss[r as usize] = l - ln;
+    }
+}
+
+#[cube(launch)]
+fn k_mce_bwd_logits(x: &[f32], targets: &[u32], lse: &[f32], lnum: &[f32], dl: &mut [f32], rows: u32, vocab: u32) {
+    let i = ABSOLUTE_POS as u32;
+    if i < rows * vocab {
+        let r = i / vocab;
+        let mut v = f32::exp(x[i as usize] - lse[r as usize]);
+        if i % vocab == targets[r as usize] {
+            v -= f32::exp(x[i as usize] - lnum[r as usize]);
+        }
+        dl[i as usize] = v / f32::cast_from(rows);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cube(launch)]
+fn k_mce_bwd_scores(s: &[f32], targets: &[u32], book: &[u32], pos: &[u32], lse: &[f32], lnum: &[f32], ds: &mut [f32], rows: u32, gm: u32, t: u32, scale: f32, thr: u32, seed: u32) {
+    let i = ABSOLUTE_POS as u32;
+    if i < rows * gm {
+        let r = i / gm;
+        let jr = (r / gm) * gm + i % gm;
+        let mut v = 0.0f32;
+        if mem_visible(r, jr, book, pos, t, thr, seed) == 1u32 {
+            let sc = s[i as usize] * scale;
+            v = f32::exp(sc - lse[r as usize]);
+            if targets[jr as usize] == targets[r as usize] {
+                v -= f32::exp(sc - lnum[r as usize]);
+            }
+            v = v * scale / f32::cast_from(rows);
+        }
+        ds[i as usize] = v;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +551,88 @@ mod tests {
             let num = (gpu_loss(&xp) - gpu_loss(&xm)) / (2.0 * h);
             assert!((num - dl[i]).abs() <= 2e-2 * scale, "finite difference at {i}: {num} vs gpu {}", dl[i]);
         }
+    }
+
+    /// f64 reference of `memory_cross_entropy`'s mean loss, written from the definition.
+    #[allow(clippy::too_many_arguments)]
+    fn mce_reference(x: &[f64], s: &[f64], targets: &[usize], book: &[usize], pos: &[usize], t: usize, gm: usize, scale: f64, vocab: usize, visible: &dyn Fn(usize, usize) -> bool) -> f64 {
+        let rows = targets.len();
+        let _ = (book, pos, t);
+        let mut total = 0.0;
+        for r in 0..rows {
+            let g0 = r / gm * gm;
+            let mut z: f64 = (0..vocab).map(|c| x[r * vocab + c].exp()).sum();
+            let mut num = x[r * vocab + targets[r]].exp();
+            for j in 0..gm {
+                if visible(r, g0 + j) {
+                    let e = (s[r * gm + j] * scale).exp();
+                    z += e;
+                    if targets[g0 + j] == targets[r] {
+                        num += e;
+                    }
+                }
+            }
+            total += z.ln() - num.ln();
+        }
+        total / rows as f64
+    }
+
+    /// Needs the discrete GPU. TRIME's memory loss and its two gradients against an f64 reference (forward, and central
+    /// differences through the reference for dlogits and dscores), and with no memory visible, plain cross-entropy exactly.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn memory_cross_entropy_matches_reference() {
+        let (t, gm, groups, vocab) = (4, 12, 2, 9);
+        let rows = gm * groups;
+        let mut rng = Rng::new(12);
+        let x: Vec<f32> = (0..rows * vocab).map(|_| rng.next_gaussian()).collect();
+        let s: Vec<f32> = (0..rows * gm).map(|_| 2.0 * rng.next_gaussian()).collect();
+        // three windows per group: windows 0 and 1 of book 0 (consecutive), window 2 of book 1
+        let book: Vec<usize> = (0..rows).map(|r| if (r % gm) / t == 2 { 1 } else { 0 }).collect();
+        let pos: Vec<usize> = (0..rows).map(|r| 100 * (r / gm) + (r % gm) % (2 * t) + if (r % gm) / t == 2 { 7 } else { 0 }).collect();
+        let targets: Vec<usize> = (0..rows).map(|r| (r * 5 + r / 3) % vocab).collect();
+        let (bh, ph, th, xh, sh) = (upload_ids(&book), upload_ids(&pos), upload_ids(&targets), upload(&x), upload(&s));
+        let scale = 0.35f32;
+        // drop = 0 (thr 0): local memory kept. Visible: other book, or same book and earlier position.
+        let visible = |r: usize, j: usize| book[j] != book[r] || pos[j] < pos[r];
+        let meta = MemMeta { book: &bh, pos: &ph, t, gm, scale, thr: 0, seed: 1 };
+        let fwd = memory_cross_entropy(&xh, &sh, &th, &meta, rows, vocab);
+        let (xd, sd): (Vec<f64>, Vec<f64>) = (x.iter().map(|&v| v as f64).collect(), s.iter().map(|&v| v as f64).collect());
+        let f = |xs: &[f64], ss: &[f64]| mce_reference(xs, ss, &targets, &book, &pos, t, gm, scale as f64, vocab, &visible);
+        let want = f(&xd, &sd);
+        let got = read(&fwd.ce.loss)[0] as f64;
+        assert!((got - want).abs() < 1e-5 * want.abs(), "loss {got} vs {want}");
+        let (dl, ds) = memory_cross_entropy_backward(&xh, &sh, &th, &meta, &fwd, rows, vocab);
+        let (dl, ds) = (read(&dl), read(&ds));
+        let h = 1e-5;
+        for i in (0..x.len()).step_by(7) {
+            let (mut p, mut m) = (xd.clone(), xd.clone());
+            p[i] += h;
+            m[i] -= h;
+            let num = (f(&p, &sd) - f(&m, &sd)) / (2.0 * h);
+            assert!((num - dl[i] as f64).abs() < 1e-5, "dlogits[{i}]: {num} vs {}", dl[i]);
+        }
+        let mut nonzero = 0;
+        for i in (0..s.len()).step_by(5) {
+            let (mut p, mut m) = (sd.clone(), sd.clone());
+            p[i] += h;
+            m[i] -= h;
+            let num = (f(&xd, &p) - f(&xd, &m)) / (2.0 * h);
+            assert!((num - ds[i] as f64).abs() < 1e-5, "dscores[{i}]: {num} vs {}", ds[i]);
+            nonzero += (ds[i] != 0.0) as usize;
+        }
+        assert!(nonzero > 5, "the test should exercise visible entries");
+
+        // Nothing visible (one book, equal positions): plain cross-entropy.
+        let (one, same) = (upload_ids(&vec![0; rows]), upload_ids(&vec![5; rows]));
+        let none = MemMeta { book: &one, pos: &same, t, gm, scale, thr: 0, seed: 1 };
+        let m0 = memory_cross_entropy(&xh, &sh, &th, &none, rows, vocab);
+        let plain = cross_entropy(&xh, &th, rows, vocab, 1);
+        assert_eq!(read(&m0.ce.loss), read(&plain.loss), "no memory: loss is plain CE");
+        let (dl0, ds0) = memory_cross_entropy_backward(&xh, &sh, &th, &none, &m0, rows, vocab);
+        let dplain = read(&cross_entropy_backward(&xh, &th, &plain, rows, vocab, 1, 0.0));
+        assert!(rel_err(&read(&dl0), &dplain) < 1e-6, "no memory: dlogits is plain CE's");
+        assert!(read(&ds0).iter().all(|&v| v == 0.0));
     }
 
     /// Needs the discrete GPU. Fused models' CE: one mean per model, and
