@@ -2000,3 +2000,17 @@ Full stack with `dyn=0.04 dyn_every=2 dyn_nn=16 dyn_nn_lr=0.05` (`scripts/train_
 With dyn the old weights are the best of the three for both models; the tuned ones are 0.007-0.010 worse. The no-dyn retune (-0.007 to -0.013) fixed a calibration of the *frozen* model's kNN mix; dyn adapts the model to the document, which makes its own prediction sharper and leaves less room for a heavy kNN weight (lambda 0.8). So the headline stack with dyn stays **0.9889** (64M model, unchanged), and the weights are a per-configuration choice: no-dyn 0.8:30:22, dyn 0.5:30:15. The no-dyn figures above (1.0226 for the 64M model, 1.0253 for novels40 4M) are right for a no-dyn deployment only.
 
 The data lever also shrinks under dyn: novels40 4M trails the 64M novels22 model by 0.0142 with dyn (1.0031 vs 0.9889), against a 0.0027 *deficit for the 64M model without dyn*... i.e. without dyn the two were within noise (64M ahead by 0.0027 on part 0, behind by 0.0135 on part 1), with dyn the long-trained model is clearly ahead on part 0. Dyn and extra training text partly do the same job (adapting to unseen text), as the overlap rule predicts. The 16M-window novels40 run (training now) tests whether the two kinds of training add up.
+
+### novels40 at 16M windows (2026-10-16; `scripts/train_novels40_16m.sh`, 5181 s training, `runs/novels40_s128_16m_m0.ckpt`)
+
+Fresh split, `part=0/4`, lexicon+words fixed; model alone, then stack by kNN weights:
+
+| model | no dyn, old weights | no dyn, `0.8:30:22` | dyn model alone | dyn, old weights | dyn, `0.65:30:22` |
+|---|---|---|---|---|---|
+| 64M-window novels22 | 1.0299 | 1.0226 | 1.0539 | 0.9889 | 0.9914 |
+| novels40, 4M windows | 1.0343 | 1.0253 | 1.0689 | 1.0031 | 1.0035 |
+| novels40, 16M windows | 1.0173 | **1.0094** | 1.0392 | **0.9829** | 0.9844 |
+
+Training length and book count add: 4M -> 16M windows on novels40 is worth -0.0159 (no dyn) and -0.0202 (dyn), and the 16M novels40 model beats the 64M-window novels22 model by 0.0132 without dyn and 0.0060 with dyn. New best full stack: **0.9829** (dyn 0.04 x 2 windows, `dyn_nn=16`, lexicon 0.2, words 0.1, kNN `128:0.5:30:15:100`). The advantage from extra books shrinks under dyn (0.0132 -> 0.0060), consistent with dyn and extra text both adapting the model to unseen text. The 4M model's dyn deficit to the 64M model (0.0142) is therefore a training-length effect, not a data one: at equal 16M windows the 40-book model wins.
+
+Correction to the previous section: its last paragraph's comparison was muddled; the clean statement is the table above. Untested: 16M windows on novels90 (the 4M comparison of 40 vs 90 was a tie within noise); longer than 16M; the part-1 and original-split numbers for the 16M model; dyn on part 1.
