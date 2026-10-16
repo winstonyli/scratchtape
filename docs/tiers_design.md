@@ -1936,3 +1936,15 @@ TRIME is **0.0070 worse** in the stack (bar was 0.003 better). Its model alone i
 Caveats, so this is a negative for *this* variant only: (1) external memory was random windows, not BM25 neighbours, which the paper's ablation says carries most of the gain (45.71 vs 41.50 at 7M); (2) the kNN parameters (`128:0.5:30:15:100`) were tuned on the plain arm's block-output keys and not retuned for the ffn tap (the distance scale differs: nearest-neighbour mean squared distance 48 vs 86); (3) one seed, 4M windows. A tap=ffn plain control and a retuned TRIME stack were not run. A neighbour batcher plus those two controls would be the full repeat; not pursued because our online memory already supplies same-book entries at test time, which is what the local and long-term memories teach the model to use, leaving only the external part for training to add.
 
 Disk note from the run: two memory caches are 9.5 GB each and the C: drive was full once (a failed 5.6 GB `.part`); the 64M model's fresh and original-split caches were deleted to make room and rebuild in ~11 min if needed.
+
+## Model-training data probe (2026-10-16)
+
+Question: at fixed model size (d=256, 4 blocks, ~2M parameters) and 4M windows, does the model gain from training on more distinct books (the 4M run is ~100 passes over novels22's 4.5 MB)? `scripts/train_data_probe.sh`: the nov22 seq-128 plain recipe on novels40 and novels90 (neither contains the fresh books), then the fresh-split stack (`part=0/4`, no dyn, `lexicon:0.2+words:1:0.1+knn:128:0.5:30:15:100`, tap = last block, memory rebuilt per checkpoint). One seed each.
+
+| model-training corpus | model alone | stack | stack saving |
+|---|---|---|---|
+| novels22 (plain arm above) | 1.2778 | 1.0529 | -0.2248 |
+| novels40 | 1.2045 | **1.0343** | -0.1702 |
+| novels90 | 1.1971 | 1.0395 | -0.1576 |
+
+More model-training text is the first lever in a while above the 0.003 bar: novels40 gains **-0.0186** on the stack (-0.073 model alone). Going on to novels90 improves the model alone a further 0.007 but the stack is 0.005 *worse* than novels40. The stack saving falls as the model trains on more of the memory's books (0.2248 -> 0.1702 -> 0.1576): the memory holds all 149 books, so a model that already trained on them leaves less for the memory to add. So the two tiers overlap exactly where the model's training text coincides with the memory's text. Caveats: one seed (the 40-vs-90 gap of 0.005 is above the bar but seed noise is unmeasured), 4M windows may undertrain novels90 (more distinct text per window; the model alone still improved), and the original-split held-out CE of the trainer log is not the decision metric.
