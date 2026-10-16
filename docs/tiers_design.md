@@ -1987,3 +1987,16 @@ The `nov22_s128_k1_d0.1_64m_f16` checkpoint (novels22, 64M "windows" in the run 
 | 0/4 (validation) | 1.0299 | **1.0226** | | | |
 
 The same weights win for the 64M model (-0.0073 on part 0, -0.0108 on part 1): the old setting was off for it too, and the project's best no-dyn stack is now **1.0226** (part 0). Against the 4M novels40 model with the same tuned weights (part 0 1.0253, part 1 1.0571): the 64M-window novels22 model is 0.0027 better on part 0 but 0.0135 *worse* on part 1. The two parts disagree on which wins, so at ~1/8 the training compute novels40 matches the long-trained model within part noise, and the two levers (long training, more books) are probably additive: untested.
+
+### Tuned kNN weights under dyn: the gain does not carry over (2026-10-16)
+
+Full stack with `dyn=0.04 dyn_every=2 dyn_nn=16 dyn_nn_lr=0.05` (`scripts/train_novels40_16m.sh`), fresh split, `part=0/4`, lexicon+words fixed, kNN weights old (`128:0.5:30:15:100`) vs tuned (`128:0.8:30:22:100`) vs `128:0.65:30:22:100`:
+
+| model | adapted model alone | old | tuned | 0.65 |
+|---|---|---|---|---|
+| 64M-window novels22 | 1.0539 | **0.9889** | 0.9988 | 0.9914 |
+| 4M novels40 | 1.0689 | **1.0031** | 1.0105 | 1.0035 |
+
+With dyn the old weights are the best of the three for both models; the tuned ones are 0.007-0.010 worse. The no-dyn retune (-0.007 to -0.013) fixed a calibration of the *frozen* model's kNN mix; dyn adapts the model to the document, which makes its own prediction sharper and leaves less room for a heavy kNN weight (lambda 0.8). So the headline stack with dyn stays **0.9889** (64M model, unchanged), and the weights are a per-configuration choice: no-dyn 0.8:30:22, dyn 0.5:30:15. The no-dyn figures above (1.0226 for the 64M model, 1.0253 for novels40 4M) are right for a no-dyn deployment only.
+
+The data lever also shrinks under dyn: novels40 4M trails the 64M novels22 model by 0.0142 with dyn (1.0031 vs 0.9889), against a 0.0027 *deficit for the 64M model without dyn*... i.e. without dyn the two were within noise (64M ahead by 0.0027 on part 0, behind by 0.0135 on part 1), with dyn the long-trained model is clearly ahead on part 0. Dyn and extra training text partly do the same job (adapting to unseen text), as the overlap rule predicts. The 16M-window novels40 run (training now) tests whether the two kinds of training add up.
