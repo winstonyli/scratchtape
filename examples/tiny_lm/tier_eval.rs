@@ -74,7 +74,6 @@ use scratchtape::gpu_step::tape::{Config, DeviceTape, model_forward};
 use scratchtape::gpu_step::matmul::{Epilogue, MatRef, matmul_f32};
 use scratchtape::gpu_step::{DeviceParams, Handle, client, read_many, upload_f32};
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -287,10 +286,33 @@ fn word_list(data: &[usize]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Word list from the train split; masks next bytes that cannot continue or end a known word.
+/// The train split's words with counts, as sorted lists for prefix lookup: all words, and the words after each word (for the bigram).
+struct WordLists {
+    unigram: Vec<(Vec<u8>, u32)>,
+    after: std::collections::HashMap<Vec<u8>, Vec<(Vec<u8>, u32)>>,
+}
+
+impl WordLists {
+    fn new(train: &[usize], bigrams: bool) -> WordLists {
+        use std::collections::HashMap;
+        let list = word_list(train);
+        let mut uni: HashMap<Vec<u8>, u32> = HashMap::new();
+        for w in &list {
+            *uni.entry(w.clone()).or_default() += 1;
+        }
+        let mut bi: HashMap<Vec<u8>, HashMap<Vec<u8>, u32>> = HashMap::new();
+        if bigrams {
+            for pair in list.windows(2) {
+                *bi.entry(pair[0].clone()).or_default().entry(pair[1].clone()).or_default() += 1;
+            }
+        }
+        WordLists { unigram: sorted_counts(uni), after: bi.into_iter().map(|(k, v)| (k, sorted_counts(v))).collect() }
+    }
+}
+
+/// The word list masks next bytes that cannot continue or end a known word.
 struct Lexicon {
-    prefixes: HashSet<Vec<u8>>,
-    words: HashSet<Vec<u8>>,
+    lists: Rc<WordLists>,
     eps: f64,
     hist: bool,
     positions: usize,
@@ -300,18 +322,8 @@ struct Lexicon {
 }
 
 impl Lexicon {
-    fn new(train: &[usize], eps: f64, hist: bool) -> Lexicon {
-        let (mut prefixes, mut words) = (HashSet::new(), HashSet::new());
-        // Most tokens repeat an earlier word: only a new word adds prefixes.
-        for word in word_list(train) {
-            if !words.contains(&word) {
-                for n in 1..=word.len() {
-                    prefixes.insert(word[..n].to_vec());
-                }
-                words.insert(word);
-            }
-        }
-        Lexicon { prefixes, words, eps, hist, positions: 0, constrained: 0, top1_rejected: 0, top1_fixed: 0 }
+    fn new(lists: Rc<WordLists>, eps: f64, hist: bool) -> Lexicon {
+        Lexicon { lists, eps, hist, positions: 0, constrained: 0, top1_rejected: 0, top1_fixed: 0 }
     }
 }
 
@@ -325,19 +337,9 @@ impl Tier for Lexicon {
         if word.is_empty() {
             return;
         }
-        let complete = self.words.contains(&word);
-        let mut buf = word.clone();
-        let allowed = |b: usize, buf: &mut Vec<u8>| -> bool {
-            if is_letter(b) {
-                buf.push(b as u8);
-                let ok = self.prefixes.contains(buf.as_slice());
-                buf.pop();
-                ok
-            } else {
-                complete
-            }
-        };
-        let mask: Vec<bool> = (0..VOCAB).map(|b| allowed(b, &mut buf)).collect();
+        // A letter may follow if some word extends the prefix by it; any other byte only if the prefix is a whole word.
+        let (letters, end, _) = Words::extend(&self.lists.unigram, &word);
+        let mask: Vec<bool> = (0..VOCAB).map(|b| if is_letter(b) { letters[b] > 0.0 } else { end > 0.0 }).collect();
         let mass: f64 = (0..VOCAB).filter(|&b| mask[b]).map(|b| probs[b]).sum();
         if mass <= 0.0 {
             return;
@@ -360,7 +362,7 @@ impl Tier for Lexicon {
     fn report(&self) -> String {
         format!(
             "lexicon ({} words): constrained {}/{} positions; model's top-1 rejected at {} of them, the next-best allowed byte was then right {} times",
-            self.words.len(),
+            self.lists.unigram.len(),
             self.constrained,
             self.positions,
             self.top1_rejected,
@@ -375,8 +377,7 @@ struct Words {
     lambda: f64,
     hist: bool,
     first: bool,
-    unigram: Vec<(Vec<u8>, u32)>,
-    after: std::collections::HashMap<Vec<u8>, Vec<(Vec<u8>, u32)>>,
+    lists: Rc<WordLists>,
     positions: usize,
     applied: usize,
     applied_bigram: usize,
@@ -392,39 +393,9 @@ fn sorted_counts(m: std::collections::HashMap<Vec<u8>, u32>) -> Vec<(Vec<u8>, u3
 }
 
 impl Words {
-    fn new(train: &[usize], order: usize, lambda: f64, hist: bool, first: bool) -> Words {
-        use std::collections::HashMap;
+    fn new(lists: Rc<WordLists>, order: usize, lambda: f64, hist: bool, first: bool) -> Words {
         assert!(order <= 1, "words:<order 0|1>:<lambda>");
-        let list = word_list(train);
-        let mut uni: HashMap<Vec<u8>, u32> = HashMap::new();
-        for w in &list {
-            match uni.get_mut(w) {
-                Some(c) => *c += 1,
-                None => {
-                    uni.insert(w.clone(), 1);
-                }
-            }
-        }
-        let mut bi: HashMap<Vec<u8>, HashMap<Vec<u8>, u32>> = HashMap::new();
-        if order == 1 {
-            for pair in list.windows(2) {
-                *bi.entry(pair[0].clone()).or_default().entry(pair[1].clone()).or_default() += 1;
-            }
-        }
-        Words {
-            order,
-            lambda,
-            hist,
-            first,
-            unigram: sorted_counts(uni),
-            after: bi.into_iter().map(|(k, v)| (k, sorted_counts(v))).collect(),
-            positions: 0,
-            applied: 0,
-            applied_bigram: 0,
-            applied_first: 0,
-            dump: None,
-            chunk: 0,
-        }
+        Words { order, lambda, hist, first, lists, positions: 0, applied: 0, applied_bigram: 0, applied_first: 0, dump: None, chunk: 0 }
     }
 
     /// Over the list's words that extend `prefix`: counts of the next letter, of words ending exactly there, and
@@ -465,7 +436,7 @@ impl Words {
         };
         let mut found = None;
         if self.order == 1 && !prev.is_empty() {
-            if let Some(list) = self.after.get(&prev) {
+            if let Some(list) = self.lists.after.get(&prev) {
                 let e = Words::extend(list, &prefix);
                 if e.2 > 0.0 {
                     found = Some(e);
@@ -474,7 +445,7 @@ impl Words {
             }
         }
         let bigram_found = found.is_some();
-        let (letters, end, total) = found.unwrap_or_else(|| Words::extend(&self.unigram, &prefix));
+        let (letters, end, total) = found.unwrap_or_else(|| Words::extend(&self.lists.unigram, &prefix));
         if prefix.is_empty() {
             // Between words: the model keeps its split between letters and other bytes; the words that followed the
             // previous word redistribute the letter part over first letters.
@@ -857,6 +828,9 @@ impl Tier for Knn {
 
 /// One spec, e.g. `lexicon:0.05` or `lexicon:0.05+knn:16:0.2:50`, into its tiers.
 fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>, dump: bool, wdump: bool) -> Vec<Box<dyn Tier>> {
+    // One word table for the lexicon and words parts; bigrams only if a words part asks for them.
+    let bigrams = spec.split('+').any(|p| p.strip_prefix("words:").map_or(false, |a| a.starts_with('1')));
+    let lists = spec.split('+').any(|p| p.starts_with("lexicon") || p.starts_with("words")).then(|| Rc::new(WordLists::new(train, bigrams)));
     spec.split('+')
         .map(|part| {
             let (kind, arg) = part.split_once(':').unwrap_or((part, ""));
@@ -865,14 +839,14 @@ fn build_tier(spec: &str, train: &[usize], store: &Option<Rc<Store>>, dump: bool
                 "lexicon" => {
                     let (eps, flags) = arg.split_once(':').unwrap_or((arg, ""));
                     let eps = eps.parse().unwrap_or_else(|_| panic!("lexicon:<eps>[:h], got {part}"));
-                    Box::new(Lexicon::new(train, eps, flags.contains('h'))) as Box<dyn Tier>
+                    Box::new(Lexicon::new(lists.clone().unwrap(), eps, flags.contains('h'))) as Box<dyn Tier>
                 }
                 "words" => {
                     let a: Vec<&str> = arg.split(':').collect();
                     assert!(a.len() >= 2 && a.len() <= 3, "words:<order>:<lambda>[:<flags h f>], got {part}");
                     let flags = a.get(2).copied().unwrap_or("");
                     assert!(!(wdump && flags.contains('f')), "wdump does not support first letters");
-                    let mut w = Words::new(train, a[0].parse().unwrap(), a[1].parse().unwrap(), flags.contains('h'), flags.contains('f'));
+                    let mut w = Words::new(lists.clone().unwrap(), a[0].parse().unwrap(), a[1].parse().unwrap(), flags.contains('h'), flags.contains('f'));
                     w.dump = wdump.then(Vec::new);
                     Box::new(w) as Box<dyn Tier>
                 }
