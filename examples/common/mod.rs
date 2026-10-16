@@ -336,6 +336,8 @@ fn books(name: &str) -> Vec<(String, f32)> {
         }
         // novels22 with a third held-out set: the last 10% of seven memory-only books the model never trained on (FRESH). The novels6 tails become training text (lexicon, words, memory), the model checkpoint is unchanged.
         "fresh22" => books("novels22").into_iter().enumerate().map(|(i, (t, s))| (t, if i < 6 { 1.0 } else { s })).chain(FRESH.iter().map(|n| (read("gutenberg_memory3", n, "fetch_gutenberg_memory3.sh"), 0.9))).collect(),
+        // fresh150 without its first n books (the model-training corpora novels22/40/90 are prefixes of it), as a memory corpus that does not overlap a model trained on them.
+        _ if name.starts_with("fresh150_skip") => books("fresh150").into_iter().skip(name["fresh150_skip".len()..].parse().expect("fresh150_skip<n>")).collect(),
         _ => vec![(corpus(name).to_string(), 0.9)],
     }
 }

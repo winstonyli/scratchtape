@@ -1948,3 +1948,15 @@ Question: at fixed model size (d=256, 4 blocks, ~2M parameters) and 4M windows, 
 | novels90 | 1.1971 | 1.0395 | -0.1576 |
 
 More model-training text is the first lever in a while above the 0.003 bar: novels40 gains **-0.0186** on the stack (-0.073 model alone). Going on to novels90 improves the model alone a further 0.007 but the stack is 0.005 *worse* than novels40. The stack saving falls as the model trains on more of the memory's books (0.2248 -> 0.1702 -> 0.1576): the memory holds all 149 books, so a model that already trained on them leaves less for the memory to add. So the two tiers overlap exactly where the model's training text coincides with the memory's text. Caveats: one seed (the 40-vs-90 gap of 0.005 is above the bar but seed noise is unmeasured), 4M windows may undertrain novels90 (more distinct text per window; the model alone still improved), and the original-split held-out CE of the trainer log is not the decision metric.
+
+### Overlap test: memory without the model's own books (2026-10-16)
+
+Same three checkpoints, same tiers, memory corpus `fresh150_skip<n>` (fresh150 without its first n books = the model's training books; new corpus names in `common::books`), `part=0/4`, fresh split:
+
+| model (books) | full memory (149 books) | memory without the model's books | cost of dropping them |
+|---|---|---|---|
+| novels22 | 1.0529 | 1.0534 (127 books) | +0.0005 |
+| novels40 | 1.0343 | 1.0363 (109 books) | +0.0020 |
+| novels90 | 1.0395 | 1.0484 (59 books) | +0.0089 |
+
+The overlap explanation from the data probe is **not supported**: if the memory were redundant where it repeats the model's own text, dropping those books would cost nothing or help, but it never helps, and the 90-book model loses 0.0089 when 90 of 149 books go. (Dropping books is confounded with a smaller memory, so the costs bound the redundancy from above: novels40 shows at most 0.002 of loss from a 27% smaller memory, i.e. the overlap books are worth little, but they are not harmful.) So why novels90's stack (1.0395) trails novels40's (1.0343) despite the better model alone (1.1971 vs 1.2045) is open. Untested candidates: the kNN weights (`128:0.5:30:15:100`, tuned on the novels22 model) no longer fit a stronger model, whose predictions the memory should be weighted against differently; seed noise; novels90 undertrained at 4M windows. The first is an eval-only check.
