@@ -1960,3 +1960,19 @@ Same three checkpoints, same tiers, memory corpus `fresh150_skip<n>` (fresh150 w
 | novels90 | 1.0395 | 1.0484 (59 books) | +0.0089 |
 
 The overlap explanation from the data probe is **not supported**: if the memory were redundant where it repeats the model's own text, dropping those books would cost nothing or help, but it never helps, and the 90-book model loses 0.0089 when 90 of 149 books go. (Dropping books is confounded with a smaller memory, so the costs bound the redundancy from above: novels40 shows at most 0.002 of loss from a 27% smaller memory, i.e. the overlap books are worth little, but they are not harmful.) So why novels90's stack (1.0395) trails novels40's (1.0343) despite the better model alone (1.1971 vs 1.2045) is open. Untested candidates: the kNN weights (`128:0.5:30:15:100`, tuned on the novels22 model) no longer fit a stronger model, whose predictions the memory should be weighted against differently; seed noise; novels90 undertrained at 4M windows. The first is an eval-only check.
+
+### kNN weights retuned per model (2026-10-16)
+
+The kNN tier's weights (`knn:128:0.5:30:15:100`: k, lambda, temp, temp_doc, shift) were tuned long ago on a different (64M-window) model. Re-tuned for the 4M-window models by coordinate sweeps on `part=1/4`, then validated on the unseen `part=0/4`, fresh split, lexicon+words fixed. Round 1 (one coordinate at a time, novels40/90): lambda 0.5 -> 0.65 gained 0.008-0.009; temp 22 gained 0.003, temp 45 lost 0.010, temp_doc 10 lost 0.002. Round 2 (all three models, `part=1/4`): best is lambda 0.8 with temp_doc 22 (`128:0.8:30:22:100`); lambda 0.9 or temp 22 at lambda 0.8 are worse. Part 1/4 (tuning part), old -> tuned: novels22 1.1012 -> 1.0834, novels40 1.0698 -> 1.0571, novels90 1.0666 -> 1.0557.
+
+Validation on `part=0/4` (not used for tuning), stack CE old weights -> `128:0.8:30:22:100`:
+
+| model-training corpus | old weights | tuned | change |
+|---|---|---|---|
+| novels22 | 1.0529 | 1.0398 | -0.0131 |
+| novels40 | 1.0343 | **1.0253** | -0.0090 |
+| novels90 | 1.0395 | 1.0298 | -0.0097 |
+
+Retuning is worth ~0.01 on every 4M model. It also dissolves most of the 40-vs-90 gap: on the tuning part novels90 is 0.0014 *better*, on part 0 novels40 is 0.0045 better, so the two are a tie within part-to-part noise; the data gain over novels22 stays (-0.0145 on part 0, -0.0277 on part 1). The earlier "more data stops helping at 90" reading and the overlap story both rested on weights tuned for the wrong model.
+
+Still untested: lambda between 0.65 and 0.9 more finely, temp_doc above 22, k, shift, and the same retune for the 64M-window model (whose current best stack is 1.0299 on this part without dyn, above the 4M novels40's 1.0253 here).
