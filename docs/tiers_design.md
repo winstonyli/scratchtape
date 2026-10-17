@@ -2053,3 +2053,29 @@ Fresh split, lexicon+words fixed. "tuned" = kNN `0.8:30:22`, dyn uses the old we
 - Reading, untested: a longer-trained model gets sharper in ways the kNN mix already covers, so the memory adds less (kNN saving without dyn 0.1666 vs 0.1717 at 16M on part 0), while dyn can still use the extra capacity. Weights were not retuned for 32M, and the old/tuned gap is similar to 16M, so retuning is unlikely to flip the no-dyn sign.
 - Cross-model on part 1: novels40 16M beats the 64M novels22 model by 0.0300 without dyn (tuned) and 0.0111 with dyn (part 0: 0.0132 / 0.0060), so that lead is not a part-0 artefact.
 - Not repeated by seed: the 32M vs 16M differences (0.003-0.005) are about the size of the 40-vs-90 gap, so treat the sign as suggestive, but both parts agree.
+
+### Seed repeat of novels40 16M, and a kNN retune of the 32M model (2026-10-17; `scripts/seed_and_retune.sh`, `scripts/retune_32m.sh`)
+
+**Seed.** `seed=2` retrain of novels40 at 16M windows (5181 s), fresh split, same evals as the seed-1 row:
+
+| part | seed | no dyn old | no dyn tuned | dyn |
+|---|---|---|---|---|
+| 0 | 1 | 1.0173 | 1.0094 | 0.9829 |
+| 0 | 2 | 1.0183 | 1.0105 | 0.9839 |
+| 1 | 1 | 1.0506 | 1.0406 | 1.0208 |
+| 1 | 2 | 1.0531 | 1.0428 | 1.0226 |
+
+Seed noise is 0.0010-0.0025 per cell (seed 2 worse in all cells, so a model's evaluated number carries ~0.002 of training luck; model alone differs by 0.0026 on part 0, 0 on part 1). Consequences: the 32M dyn gain (-0.0047 part 0, -0.0057 part 1 against the two-seed mean) is 2-3x the noise and stands; the 32M no-dyn loss (+0.0025/+0.003 against the mean) is about 1-1.5x the noise, so "32M is not better without dyn" is the safe reading; novels40 vs novels90 (0.0013-0.0026) is inside the noise, as already concluded.
+
+**Retune of the 32M model, no dyn** (coordinate grid around `128:0.8:30:22:100`, chosen on part 1, checked on part 0; k above 128 is rejected by `tier_eval`, so 96 and 64 stand in for it):
+
+| change | part 1 | part 0 |
+|---|---|---|
+| base `128:0.8:30:22:100` | 1.0447 | 1.0125 |
+| lambda 0.7 | **1.0439** | **1.0115** |
+| lambda 0.9 | 1.0505 | 1.0181 |
+| temp_doc 30 / 16 | 1.0474 / 1.0448 | 1.0146 / 1.0133 |
+| temp 24 / 40 | 1.0488 / 1.0484 | 1.0184 / 1.0140 |
+| k 96 / 64 | 1.0459 / 1.0498 | 1.0143 / 1.0198 |
+
+The `0.8:30:22` weights sit at the optimum for the 32M model too; lambda 0.7 gains 0.0008-0.0010 on both parts, a tie with noise. Even so the 32M no-dyn stack (1.0115 / 1.0439) stays behind 16M (1.0094 / 1.0406), so the drop is not a calibration miss. Closed: kNN retuning for the 32M model.
