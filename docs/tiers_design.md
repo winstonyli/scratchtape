@@ -2032,7 +2032,7 @@ Same checkpoint, fresh split, `part=1/4`; the first no-dyn attempt hit a memory-
 
 | | model alone | no dyn, old weights | no dyn, `0.8:30:22` | dyn, old weights |
 |---|---|---|---|---|
-| part 0 | 1.1627 (no dyn) | 1.0173 | 1.0094 | 0.9829 |
-| part 1 | 1.2516 (no dyn) | 1.0506 | **1.0406** | **1.0208** |
+| part 0 | 1.1811 (no dyn) | 1.0173 | 1.0094 | 0.9829 |
+| part 1 | 1.2517 (no dyn) | 1.0506 | **1.0406** | **1.0208** |
 
-Part 1 is a harder slice (+0.033 no dyn tuned, +0.038 dyn) but the ordering holds: tuned weights beat old without dyn by 0.0100 (part 0: 0.0079), and dyn with old weights beats the tuned no-dyn stack by 0.0198 (part 0: 0.0265). Dyn's adapted model alone is 1.1064 on part 1. The novels40 16M gains were not a part-0 artefact. Not measured on part 1: the 4M and 64M models, so the cross-model gaps (0.0132/0.0060) are still part-0 only.
+Part 1 is a harder slice (+0.031 no dyn tuned, +0.038 dyn) but the ordering holds: tuned weights beat old without dyn by 0.0100 (part 0: 0.0079), and dyn with old weights beats the tuned no-dyn stack by 0.0198 (part 0: 0.0265). Dyn's adapted model alone is 1.1064 on part 1. The novels40 16M gains were not a part-0 artefact. Not measured on part 1: the 4M and 64M models, so the cross-model gaps (0.0132/0.0060) are still part-0 only.
