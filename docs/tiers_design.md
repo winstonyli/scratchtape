@@ -2025,3 +2025,14 @@ Same recipe and fresh-split evals (`part=0/4`) as the novels40 16M row:
 | novels90, 16M windows | 1.0200 | 1.0120 | 1.0378 | 0.9842 |
 
 Model alone, no tiers: novels90 1.1627 on this slice. Book count 40 -> 90 does not pay at 16M windows either: novels90 is 0.0026 worse without dyn and 0.0013 worse with dyn, the same tie-within-noise as at 4M (a plausible reason, untested: the same 16M windows spread over 2.25x more text, so each book is seen less often). Closed: more books beyond 40 at this budget. Part 1 and a seed repeat were not run, so "tie" is the safe reading, not "40 is better". Training took 9199 s (the run was not alone on the machine for part of it).
+
+### novels40 at 16M windows on part 1/4 (2026-10-16; `scripts/part1_novels40_16m.sh`, `part1_novels40_16m_nodyn.sh`)
+
+Same checkpoint, fresh split, `part=1/4`; the first no-dyn attempt hit a memory-allocation failure and was rerun.
+
+| | model alone | no dyn, old weights | no dyn, `0.8:30:22` | dyn, old weights |
+|---|---|---|---|---|
+| part 0 | 1.1627 (no dyn) | 1.0173 | 1.0094 | 0.9829 |
+| part 1 | 1.2516 (no dyn) | 1.0506 | **1.0406** | **1.0208** |
+
+Part 1 is a harder slice (+0.033 no dyn tuned, +0.038 dyn) but the ordering holds: tuned weights beat old without dyn by 0.0100 (part 0: 0.0079), and dyn with old weights beats the tuned no-dyn stack by 0.0198 (part 0: 0.0265). Dyn's adapted model alone is 1.1064 on part 1. The novels40 16M gains were not a part-0 artefact. Not measured on part 1: the 4M and 64M models, so the cross-model gaps (0.0132/0.0060) are still part-0 only.
