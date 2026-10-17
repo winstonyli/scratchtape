@@ -1,6 +1,10 @@
+---
+status: done
+---
+
 # Gating the memory tier by uncertainty
 
-Status: design, awaiting review (2026-10-07). Context: `docs/tiers_design.md` ("Order", step 3: how the tiers interact);
+Outcome: built and run, gate killed (2026-10-08; `docs/tiers_design.md`). Context: `docs/tiers_design.md` ("Order", step 3: how the tiers interact);
 README "Direction: tiered AI".
 
 ## Question

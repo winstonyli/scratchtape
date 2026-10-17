@@ -1,3 +1,7 @@
+---
+status: done
+---
+
 # Gating the words tier's weight by uncertainty (offline fit)
 
 Follow-up to `2026-10-07-uncertainty-gating-design.md`. That experiment gated the kNN weight and found about +0.001 nats
