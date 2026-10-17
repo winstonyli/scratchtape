@@ -2036,3 +2036,20 @@ Same checkpoint, fresh split, `part=1/4`; the first no-dyn attempt hit a memory-
 | part 1 | 1.2517 (no dyn) | 1.0506 | **1.0406** | **1.0208** |
 
 Part 1 is a harder slice (+0.031 no dyn tuned, +0.038 dyn) but the ordering holds: tuned weights beat old without dyn by 0.0100 (part 0: 0.0079), and dyn with old weights beats the tuned no-dyn stack by 0.0198 (part 0: 0.0265). Dyn's adapted model alone is 1.1064 on part 1. The novels40 16M gains were not a part-0 artefact. Not measured on part 1: the 4M and 64M models, so the cross-model gaps (0.0132/0.0060) are still part-0 only.
+
+### novels40 at 32M windows, and the 64M novels22 model on part 1 (2026-10-17; `scripts/train_novels40_32m.sh`, 10264 s training, `runs/novels40_s128_32m_m0.ckpt`)
+
+Fresh split, lexicon+words fixed. "tuned" = kNN `0.8:30:22`, dyn uses the old weights.
+
+| model | part | model alone | no dyn old | no dyn tuned | dyn |
+|---|---|---|---|---|---|
+| novels40 16M | 0 | 1.1811 | 1.0173 | 1.0094 | 0.9829 |
+| novels40 32M | 0 | 1.1792 | 1.0184 | 1.0125 | **0.9787** |
+| novels40 16M | 1 | 1.2517 | 1.0506 | **1.0406** | 1.0208 |
+| novels40 32M | 1 | 1.2390 | 1.0520 | 1.0447 | **1.0160** |
+| novels22 64M | 1 | 1.4020 | 1.0814 | 1.0706 | 1.0319 |
+
+- Doubling the budget gives a split result: the model alone improves (-0.002 part 0, -0.013 part 1), the frozen stack gets slightly *worse* (+0.003 / +0.004 tuned, same sign on both parts), and the dyn stack improves by 0.0042 (part 0) and 0.0048 (part 1). Best dyn stack: **0.9787** (part 0), **1.0160** (part 1). Best no-dyn stays novels40 16M.
+- Reading, untested: a longer-trained model gets sharper in ways the kNN mix already covers, so the memory adds less (kNN saving without dyn 0.1666 vs 0.1717 at 16M on part 0), while dyn can still use the extra capacity. Weights were not retuned for 32M, and the old/tuned gap is similar to 16M, so retuning is unlikely to flip the no-dyn sign.
+- Cross-model on part 1: novels40 16M beats the 64M novels22 model by 0.0300 without dyn (tuned) and 0.0111 with dyn (part 0: 0.0132 / 0.0060), so that lead is not a part-0 artefact.
+- Not repeated by seed: the 32M vs 16M differences (0.003-0.005) are about the size of the 40-vs-90 gap, so treat the sign as suggestive, but both parts agree.
