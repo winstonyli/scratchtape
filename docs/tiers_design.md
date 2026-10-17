@@ -2014,3 +2014,14 @@ Fresh split, `part=0/4`, lexicon+words fixed; model alone, then stack by kNN wei
 Training length and book count add: 4M -> 16M windows on novels40 is worth -0.0159 (no dyn) and -0.0202 (dyn), and the 16M novels40 model beats the 64M-window novels22 model by 0.0132 without dyn and 0.0060 with dyn. New best full stack: **0.9829** (dyn 0.04 x 2 windows, `dyn_nn=16`, lexicon 0.2, words 0.1, kNN `128:0.5:30:15:100`). The advantage from extra books shrinks under dyn (0.0132 -> 0.0060), consistent with dyn and extra text both adapting the model to unseen text. The 4M model's dyn deficit to the 64M model (0.0142) is therefore a training-length effect, not a data one: at equal 16M windows the 40-book model wins.
 
 Correction to the previous section: its last paragraph's comparison was muddled; the clean statement is the table above. Untested: 16M windows on novels90 (the 4M comparison of 40 vs 90 was a tie within noise); longer than 16M; the part-1 and original-split numbers for the 16M model; dyn on part 1.
+
+### novels90 at 16M windows: no gain over novels40 (2026-10-16; `scripts/train_novels90_16m.sh`, 9199 s training, `runs/novels90_s128_16m_m0.ckpt`)
+
+Same recipe and fresh-split evals (`part=0/4`) as the novels40 16M row:
+
+| model | no dyn, old weights | no dyn, `0.8:30:22` | dyn model alone | dyn, old weights |
+|---|---|---|---|---|
+| novels40, 16M windows | 1.0173 | **1.0094** | 1.0392 | **0.9829** |
+| novels90, 16M windows | 1.0200 | 1.0120 | 1.0378 | 0.9842 |
+
+Model alone, no tiers: novels90 1.1627 on this slice. Book count 40 -> 90 does not pay at 16M windows either: novels90 is 0.0026 worse without dyn and 0.0013 worse with dyn, the same tie-within-noise as at 4M (40 -> 90 is 16M windows of 2.25x more text, so each book is seen fewer times). Closed: more books beyond 40 at this budget. Part 1 and a seed repeat were not run, so "tie" is the safe reading, not "40 is better". Training took 9199 s (the run was not alone on the machine for part of it).
