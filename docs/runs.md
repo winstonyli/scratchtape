@@ -1,0 +1,4 @@
+| run id | kind | command | commit | start | end | exit | conditions | headline | raw path | size mb | notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-10-17-dynknn-64m | sweep | bash scripts/dyn_knn_64m.sh | ac118d4-dirty | 2026-10-17T22:34:35 | 2026-10-17T22:55:52 | 0 | cpu 13%, defender realtime False, gpus [AMD Radeon RX 9060 XT + AMD Radeon(TM) 780M], live gpu leases 0, priority Normal | 22:55:52 done | %LOCALAPPDATA%\claude-runs\scratchtape\2026-10-17-dynknn-64m | 0 | wrapper pid 47192, child pid 34256 |
+| 2026-10-17-novels40-d384-16m | train | bash scripts/train_novels40_d384.sh | ac118d4-dirty | 2026-10-17T22:55:55 |  |  | cpu 22%, defender realtime False, gpus [AMD Radeon RX 9060 XT + AMD Radeon(TM) 780M], live gpu leases 0, priority Normal |  | %LOCALAPPDATA%\claude-runs\scratchtape\2026-10-17-novels40-d384-16m |  | wrapper pid 46012, child pid 45228 |

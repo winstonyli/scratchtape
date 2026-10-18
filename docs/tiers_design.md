@@ -2091,3 +2091,18 @@ Continuation, not a bit-for-bit 64M run: `init=` the 32M checkpoint, `seed=3`, 3
 | novels40 64M (continued) | 1.0258 | **0.9765** | 1.0925 | **1.0131** |
 
 The dyn stack still improves but the step halves: 16M -> 32M gained 0.0047 / 0.0057, 32M -> 64M gains 0.0022 / 0.0029 (parts 0 / 1), about the size of the seed noise (~0.002) on part 0 and slightly above it on part 1. Each doubling now buys about half the last; extrapolating, 128M windows would gain ~0.001-0.002 for ~12 h, so the budget lever is essentially exhausted at this model size. New best dyn stack: **0.9765** (part 0), **1.0131** (part 1). No-dyn stack for 64M not run (32M was already behind 16M there).
+
+### kNN weights under dyn, 64M novels40 model (2026-10-18; `scripts/dyn_knn_64m.sh`, run `2026-10-17-dynknn-64m`)
+
+Grid around the old `128:0.5:30:15:100` with `dyn=0.04 dyn_every=2 dyn_nn=16 dyn_nn_lr=0.05`, chosen on part 1, checked on part 0:
+
+| change | part 1 | part 0 |
+|---|---|---|
+| base | 1.0131 | **0.9765** |
+| lambda 0.4 / 0.6 | 1.0157 / **1.0127** | 0.9778 / 0.9773 |
+| temp_doc 10 / 20 | 1.0133 / 1.0142 | 0.9765 / 0.9776 |
+| temp 24 / 40 | 1.0150 / 1.0162 | 0.9798 / 0.9778 |
+| k 96 | 1.0124 | 0.9765 |
+| tuned no-dyn `0.8:30:22` | 1.0216 | 0.9877 |
+
+The old weights are at the optimum under dyn: the best alternatives (lambda 0.6, k 96) gain 0.0004-0.0007 on part 1 and nothing on part 0. The no-dyn-tuned weights lose 0.0085-0.0112, confirming that kNN weights are per-configuration (frozen vs adapted model). Closed for 64M; the 32M dyn weights were not run but would sit in the same flat optimum.
