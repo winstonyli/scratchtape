@@ -2121,3 +2121,28 @@ d=384 (8 heads, d_ff 768, dropout 0.15, lr 0.05 not retuned, 4 blocks; 4.98M par
 d=384 wins every cell by 0.014-0.018 in the stack (dyn: -0.0174 part 0, -0.0165 part 1), 4x the pre-registered 0.004 bar and 8x the seed noise. Width pays far more here than the old round-18 evidence (~0.002 at matched steps on novels6 with the original tiers): the model-alone gain is 0.021-0.031 and the stack keeps most of it, because more data (novels40) and dyn make the extra capacity useful. At half memory, d=256 loses 0.0072 (dyn, part 0: 0.9901 vs 0.9829 at full memory), so d=384 at full memory would likely land near 0.965 (not measured: it does not fit). This d=384 16M model at half memory (0.9727) already beats the d=256 64M model at full memory (0.9765).
 
 Consequences: capacity, not training budget, is the binding lever. Open: whether the 125M-key memory can be made to fit at d=384 (keybits=1, fewer dims in the key, an fp16 key store), d=512 or more blocks, and dyn/kNN retunes for the wider model.
+
+### Key narrowing and the full memory at d=384 (2026-10-18; `scripts/eval_keyrank.sh`, `scripts/eval_d384_full.sh`, runs `keyrank-half`, `d384-full-memory`)
+
+**Change.** `whiten_rank` now narrows the stored keys: `whitening_matrix` returns `[rank, d]` (rows `c lam^(-alpha/2) v_k^T` for the top-`rank` directions), the random rotation acts in rank space, and the key store, memory writers and neighbour index take `key_width(cfg)`. Before, a rank below d zero-padded and saved no memory. The memcache key version is v3. d=256 is unaffected (regression check at half memory, dyn 0.9907 / 1.0287 vs 0.9901 / 1.0291 before; no-dyn tuned 1.0210 / 1.0536 vs 1.0208 / 1.0547: all within 0.0011).
+
+**Cost of narrowing d=384 to 256 dims** (half memory, `store=500000`):
+
+| | unnarrowed | rank 256 | cost |
+|---|---|---|---|
+| dyn part 0 / part 1 | 0.9727 / 1.0126 | 0.9758 / 1.0175 | +0.0031 / +0.0049 |
+| no dyn old, part 0 / part 1 | 1.0071 / 1.0432 | 1.0088 / 1.0458 | +0.0017 / +0.0026 |
+| no dyn tuned, part 0 / part 1 | 1.0064 / 1.0405 | 1.0102 / 1.0457 | +0.0038 / +0.0052 |
+
+Just over the 0.003 pre-registered bar on dyn, but the narrowed keys fit the full memory.
+
+**Full memory (125M keys), d=384, rank 256** (10.6 GB device memory, the same as d=256):
+
+| | model alone | no dyn old | no dyn tuned | dyn model alone | dyn |
+|---|---|---|---|---|---|
+| part 0 | 1.1499 | 1.0017 | **0.9989** | 1.0106 | **0.9689** |
+| part 1 | 1.2310 | 1.0368 | **1.0321** | 1.0786 | **1.0085** |
+
+New best stack on both parts. Against the previous best: dyn -0.0076 / -0.0046 (d=256, 64M windows: 0.9765 / 1.0131), no dyn tuned -0.0105 / -0.0085 (d=256 16M: 1.0094 / 1.0406). Full memory gains 0.0069 / 0.0090 over the narrowed half-memory d=384, as estimated from d=256 (~0.007). The d=384 model needed 7785 s and 16M windows, against 10218 s more on top of 32M for the 64M d=256 model.
+
+**Rank 320 does not fit:** 12.63 GB in use, then `out of device memory allocating 134217728 bytes` in the search (both parts, both modes) and a host `memory allocation of 501486080 bytes failed` once; the card's usable limit is between 10.6 and 12.6 GB. Rank 288 (~11.6 GB) is untried.

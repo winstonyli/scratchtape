@@ -1192,9 +1192,15 @@ impl NnIndex {
 /// distances keep their scale), Sigma estimated from a sample of train positions. Set once before the memory is built.
 static WHITEN: std::sync::OnceLock<(Vec<f32>, Vec<f32>)> = std::sync::OnceLock::new();
 
-/// The tap hidden states `x` ([rows, d]) as (x - mu) W^T on the device, in f32 so it equals the host formula to rounding; only the
-/// whitened rows cross the link, with no host matmul.
+/// The key width: the model width, or the whitener's rank (`whiten_rank`) once one is fitted.
+fn key_width(cfg: &Config) -> usize {
+    WHITEN.get().map_or(cfg.d, |(_, w)| w.len() / cfg.d)
+}
+
+/// The tap hidden states `x` ([rows, d]) as (x - mu) W^T ([rows, w.len() / d]) on the device, in f32 so it equals the host formula to
+/// rounding; only the whitened rows cross the link, with no host matmul.
 fn whiten_device(x: &Handle, rows: usize, mu: &[f32], w: &[f32], d: usize) -> Handle {
+    let kd = w.len() / d;
     // The matrix and bias go up once: the whitener is fixed, and each upload crosses the link.
     thread_local!(static UPLOADED: std::cell::OnceCell<(Handle, Handle)> = const { std::cell::OnceCell::new() });
     let (wd, cd) = UPLOADED.with(|u| {
@@ -1204,9 +1210,9 @@ fn whiten_device(x: &Handle, rows: usize, mu: &[f32], w: &[f32], d: usize) -> Ha
         })
         .clone()
     });
-    let out = client().empty(rows * d * 4);
+    let out = client().empty(rows * kd * 4);
     let epi = Epilogue { bias: Some((&cd, 0)), ..Epilogue::default() };
-    matmul_f32(MatRef::new(x), MatRef { trans: true, ..MatRef::new(&wd) }, MatRef::new(&out), 1, rows, d, d, epi);
+    matmul_f32(MatRef::new(x), MatRef { trans: true, ..MatRef::new(&wd) }, MatRef::new(&out), 1, rows, d, kd, epi);
     out
 }
 
@@ -1251,22 +1257,22 @@ fn jacobi_eigen(mut a: Vec<f64>, d: usize) -> (Vec<f64>, Vec<f64>) {
     ((0..d).map(|i| a[i * d + i]).collect(), v)
 }
 
-/// W = c V diag(lam^(-alpha/2)) V^T for the covariance `cov` (a ridge of 1e-3 of the mean eigenvalue keeps tiny
-/// eigenvalues from exploding), with c chosen so that W cov W has the trace of cov. Also returns the ridged eigenvalues.
+/// The [rank, d] matrix P whose rows are c lam_k^(-alpha/2) v_k^T for the top-`rank` eigen-directions of the covariance `cov` (a ridge
+/// of 1e-3 of the mean eigenvalue keeps tiny eigenvalues from exploding), with c chosen so that the full rank-d P cov P^T has the trace
+/// of cov. The distance |P x - P y| equals the symmetric Sigma^(-alpha/2) metric restricted to those directions, so `rank` < d narrows the
+/// keys (and the memory) with no other change. Also returns the ridged eigenvalues.
 fn whitening_matrix(cov: &[f64], d: usize, alpha: f64, rank: usize) -> (Vec<f32>, Vec<f64>) {
     let (lam, v) = jacobi_eigen(cov.to_vec(), d);
     let mean_lam = lam.iter().map(|l| l.max(0.0)).sum::<f64>() / d as f64;
     let lam: Vec<f64> = lam.iter().map(|l| l.max(0.0) + 1e-3 * mean_lam).collect();
     let scale = (lam.iter().sum::<f64>() / lam.iter().map(|l| l.powf(1.0 - alpha)).sum::<f64>()).sqrt();
-    // `rank` < d keeps only the top-`rank` eigen-directions (a rank-`rank` W; the keys stay d wide).
-    let mut sorted = lam.clone();
-    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
-    let keep = sorted[rank - 1];
-    let g: Vec<f64> = lam.iter().map(|l| if *l >= keep { scale * l.powf(-alpha / 2.0) } else { 0.0 }).collect();
-    let mut w = vec![0f32; d * d];
-    for i in 0..d {
+    let mut order: Vec<usize> = (0..d).collect();
+    order.sort_by(|&a, &b| lam[b].partial_cmp(&lam[a]).unwrap());
+    let mut w = vec![0f32; rank * d];
+    for (row, &k) in order[..rank].iter().enumerate() {
+        let g = scale * lam[k].powf(-alpha / 2.0);
         for j in 0..d {
-            w[i * d + j] = (0..d).map(|k| v[i * d + k] * g[k] * v[j * d + k]).sum::<f64>() as f32;
+            w[row * d + j] = (g * v[j * d + k]) as f32;
         }
     }
     (w, lam)
@@ -1322,8 +1328,8 @@ fn fit_whitener(dev: &DeviceParams, cfg: &Config, train: &[usize], tap: usize, a
     if let Some(seed) = rotate {
         // Keys and queries are rotated alike, so distances are unchanged; the coordinates become close to Gaussian with equal variance,
         // which is what the low-bit key quantiser (`keybits`) assumes (RaBitQ, arXiv 2405.12497).
-        let r = random_rotation(d, seed);
-        w = (0..d * d).map(|ij| (0..d).map(|k| r[ij / d * d + k] * w[k * d + ij % d] as f64).sum::<f64>() as f32).collect();
+        let r = random_rotation(rank, seed);
+        w = (0..rank * d).map(|ij| (0..rank).map(|k| r[ij / d * rank + k] * w[k * d + ij % d] as f64).sum::<f64>() as f32).collect();
     }
     let mut sorted = lam.clone();
     sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
@@ -1455,7 +1461,7 @@ fn main() {
         let cache = opt.get("memcache").zip(opt.get("ivf")).map(|(dir, ivf)| {
             let meta = std::fs::metadata(ckpt).unwrap_or_else(|e| panic!("{ckpt}: {e}"));
             let secs = meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-            let mut key = format!("v2 {ckpt} {} {secs} cells={}", meta.len(), ivf.split(':').next().unwrap_or(""));
+            let mut key = format!("v3 {ckpt} {} {secs} cells={}", meta.len(), ivf.split(':').next().unwrap_or(""));
             for k in ["corpus", "memory_corpus", "seq", "warm", "stride", "offset", "whiten", "whiten_rank", "tap", "store", "store_from", "keybits", "rotate", "memory", "d_model", "heads", "d_ff", "blocks"] {
                 key += &format!(" {k}={}", opt.get(k).map_or("", |v| v.as_str()));
             }
@@ -1474,7 +1480,7 @@ fn main() {
                 g
             }
             None => {
-                let mut g = KnnStore::new(cfg.d, 16384);
+                let mut g = KnnStore::new(key_width(&cfg), 16384);
                 if let Some(bits) = opt.get("keybits") {
                     g.set_key_bits(bits.parse().unwrap_or_else(|_| panic!("keybits=8|4|2, got {bits}")));
                 }
@@ -1531,7 +1537,7 @@ fn main() {
         println!(
             "memory: {} keys of {} floats from {n_train} train + {n_held} unscored held-out windows{} (tap = block {tap}), searched on the GPU in {}",
             gpu.len(),
-            cfg.d,
+            key_width(&cfg),
             if online { ", then written online as scored" } else { "" },
             if gpu.is_f16() { "f16 on matrix cores (KNN_F32=1 for exact f32)" } else { "f32" }
         );
@@ -1596,12 +1602,12 @@ fn main() {
         let stride = size("dyn_nn_stride", "8");
         let total = (memory_train.len() - 1) / seq_len();
         let starts: Vec<usize> = (0..total).step_by(stride).map(|w| w * seq_len()).collect();
-        let mut emb = Vec::with_capacity(starts.len() * cfg.d);
+        let mut emb = Vec::with_capacity(starts.len() * key_width(&cfg));
         for chunk in starts.chunks(2 * chunk_windows()) {
-            emb.extend(NnIndex::embed(&forward(&frozen, &cfg, memory_train, chunk, tap, true, false).hidden, cfg.d, warm));
+            emb.extend(NnIndex::embed(&forward(&frozen, &cfg, memory_train, chunk, tap, true, false).hidden, key_width(&cfg), warm));
         }
         println!("neighbour index: {} train windows embedded in {:.1}s", starts.len(), t0.elapsed().as_secs_f64());
-        NnIndex { starts, emb, d: cfg.d }
+        NnIndex { starts, emb, d: key_width(&cfg) }
     });
     let mut nn_rng = 0x9e3779b97f4a7c15u64;
     let dyn_docs = held_out_docs(&corpus);
@@ -1668,7 +1674,7 @@ fn main() {
                 }
                 phase[0] += t0.elapsed();
                 let t0 = std::time::Instant::now();
-                let base = store.as_ref().map_or(0, |st| st.write_chunk(&f.hidden, &f.targets, chunk, warm, cfg.d));
+                let base = store.as_ref().map_or(0, |st| st.write_chunk(&f.hidden, &f.targets, chunk, warm, key_width(&cfg)));
                 phase[3] += t0.elapsed();
                 if dyn_lr.is_some() {
                     // The step reads only text that has just been scored (or, for the control, text from far away).
@@ -1689,7 +1695,7 @@ fn main() {
                         } else {
                             let hidden = if frozen_keys { f.hidden.clone() } else { forward(&frozen, &cfg, &held_out, chunk, tap, true, false).hidden };
                             let per = nn_m.div_ceil(chunk.len());
-                            let mut v: Vec<usize> = NnIndex::embed(&hidden, cfg.d, warm).chunks(cfg.d).flat_map(|q| idx.nearest(q, per)).map(|j| idx.starts[j]).collect();
+                            let mut v: Vec<usize> = NnIndex::embed(&hidden, key_width(&cfg), warm).chunks(key_width(&cfg)).flat_map(|q| idx.nearest(q, per)).map(|j| idx.starts[j]).collect();
                             v.sort_unstable();
                             v.dedup();
                             v
@@ -1740,7 +1746,7 @@ fn main() {
                 cell.1 -= probs[f.targets[r]].ln();
             }
             ce_device += f.row_loss[r] as f64;
-            let hid = if need_hidden { &f.hidden[r * cfg.d..(r + 1) * cfg.d] } else { &[][..] };
+            let hid = if need_hidden { &f.hidden[r * key_width(&cfg)..(r + 1) * key_width(&cfg)] } else { &[][..] };
             let ctx = Ctx { row: r, window, context, target: f.targets[r], hidden: hid };
             for (i, spec_tiers) in tiers.iter_mut().enumerate() {
                 let mut p = probs.clone();
@@ -1922,16 +1928,19 @@ mod tests {
         assert_ne!(r, random_rotation(d, 4));
     }
 
-    /// alpha = 1 whitens: W cov W is c^2 times the identity up to the ridge (1%), and alpha = 0 leaves the metric alone (W = identity).
+    /// alpha = 1 whitens: P cov P^T is c^2 times the identity up to the ridge (1%); alpha = 0 leaves the metric alone (P has orthonormal rows,
+    /// so |Px| = |x|); `rank` < d gives a [rank, d] matrix whose rows are the top eigen-directions.
     #[test]
-    fn whitening_matrix_whitens_at_alpha_one_and_is_identity_at_zero() {
+    fn whitening_matrix_whitens_at_alpha_one_and_is_isometric_at_zero() {
         let d = 4;
         // A symmetric positive-definite covariance with correlated, unequal directions.
         let cov: Vec<f64> = vec![4.0, 1.0, 0.5, 0.0, 1.0, 3.0, 0.2, 0.1, 0.5, 0.2, 1.0, 0.3, 0.0, 0.1, 0.3, 0.5];
+        let gram = |p: &[f32], rows: usize, m: &[f64]| -> Vec<f64> {
+            let p: Vec<f64> = p.iter().map(|&x| x as f64).collect();
+            (0..rows * rows).map(|ij| (0..d).flat_map(|a| (0..d).map(move |b| (a, b))).map(|(a, b)| p[ij / rows * d + a] * m[a * d + b] * p[ij % rows * d + b]).sum()).collect()
+        };
         let (w, _) = whitening_matrix(&cov, d, 1.0, d);
-        let mul = |a: &[f64], b: &[f64]| -> Vec<f64> { (0..d * d).map(|ij| (0..d).map(|k| a[ij / d * d + k] * b[k * d + ij % d]).sum()).collect() };
-        let w: Vec<f64> = w.iter().map(|&x| x as f64).collect();
-        let m = mul(&mul(&w, &cov), &w);
+        let m = gram(&w, d, &cov);
         for i in 0..d {
             for j in 0..d {
                 if i == j {
@@ -1941,11 +1950,21 @@ mod tests {
                 }
             }
         }
+        let ident: Vec<f64> = (0..d * d).map(|ij| (ij / d == ij % d) as u8 as f64).collect();
         let (w0, _) = whitening_matrix(&cov, d, 0.0, d);
-        for i in 0..d {
-            for j in 0..d {
-                assert!((w0[i * d + j] - (i == j) as u8 as f32).abs() < 1e-5);
-            }
+        let m0 = gram(&w0, d, &ident);
+        for ij in 0..d * d {
+            assert!((m0[ij] - ident[ij]).abs() < 1e-5, "P P^T at {ij} = {}", m0[ij]);
         }
+        // Rank 2 keeps the two largest-variance directions: the same rows as the full matrix's first two (sorted by eigenvalue).
+        let (w2, lam) = whitening_matrix(&cov, d, 0.0, 2);
+        assert_eq!(w2.len(), 2 * d);
+        let mut order: Vec<usize> = (0..d).collect();
+        order.sort_by(|&a, &b| lam[b].partial_cmp(&lam[a]).unwrap());
+        let m2 = gram(&w2, 2, &ident);
+        assert!((m2[0] - 1.0).abs() < 1e-5 && (m2[3] - 1.0).abs() < 1e-5 && m2[1].abs() < 1e-5);
+        // The variance of the kept directions is the top two eigenvalues' sum.
+        let var = gram(&w2, 2, &cov);
+        assert!((var[0] + var[3] - lam[order[0]] - lam[order[1]]).abs() < 1e-2 * (lam[order[0]] + lam[order[1]]), "{} vs {}", var[0] + var[3], lam[order[0]] + lam[order[1]]);
     }
 }
