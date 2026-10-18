@@ -2079,3 +2079,15 @@ Seed noise is 0.0010-0.0025 per cell (seed 2 worse in all cells, so a model's ev
 | k 96 / 64 | 1.0459 / 1.0498 | 1.0143 / 1.0198 |
 
 The `0.8:30:22` weights sit at the optimum for the 32M model too; lambda 0.7 gains 0.0008-0.0010 on both parts, a tie with noise. Even so the 32M no-dyn stack (1.0115 / 1.0439) stays behind 16M (1.0094 / 1.0406), so the drop is not a calibration miss. Closed: kNN retuning for the 32M model.
+
+### novels40 at 64M windows, continued from 32M (2026-10-17; `scripts/train_novels40_64m.sh`, 10218 s for the extra 32.8M windows, `runs/novels40_s128_64m_m0.ckpt`)
+
+Continuation, not a bit-for-bit 64M run: `init=` the 32M checkpoint, `seed=3`, 3200-window warmup, same constant lr (momentum and data order restart). Dyn stack only (old kNN weights), fresh split:
+
+| model | part 0 model alone (dyn) | part 0 dyn | part 1 model alone (dyn) | part 1 dyn |
+|---|---|---|---|---|
+| novels40 16M (two-seed mean) | 1.0390 | 0.9834 | 1.1031 | 1.0217 |
+| novels40 32M | 1.0310 | 0.9787 | 1.0968 | 1.0160 |
+| novels40 64M (continued) | 1.0258 | **0.9765** | 1.0925 | **1.0131** |
+
+The dyn stack still improves but the step halves: 16M -> 32M gained 0.0047 / 0.0057, 32M -> 64M gains 0.0022 / 0.0029 (parts 0 / 1), about the size of the seed noise (~0.002) on part 0 and slightly above it on part 1. Each doubling now buys about half the last; extrapolating, 128M windows would gain ~0.001-0.002 for ~12 h, so the budget lever is essentially exhausted at this model size. New best dyn stack: **0.9765** (part 0), **1.0131** (part 1). No-dyn stack for 64M not run (32M was already behind 16M there).
