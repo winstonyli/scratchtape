@@ -1,4 +1,5 @@
 #!/bin/bash
+# NOTE: the eval half omitted d_model/heads/d_ff and failed; evals rerun by scripts/eval_d384.sh.
 # Width test: novels40 at d=384 (8 heads, d_ff 768, dropout 0.15, 4 blocks) for 16M windows, same recipe otherwise; stack on fresh-split parts 0 and 1
 # (no dyn old + tuned weights, dyn old weights), one memory build. Bar: dyn stack must beat the 16M two-seed mean (0.9834 / 1.0217) by > 0.004.
 cd "$(dirname "$0")/.."

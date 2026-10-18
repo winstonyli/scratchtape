@@ -2106,3 +2106,18 @@ Grid around the old `128:0.5:30:15:100` with `dyn=0.04 dyn_every=2 dyn_nn=16 dyn
 | tuned no-dyn `0.8:30:22` | 1.0216 | 0.9877 |
 
 The old weights are at the optimum under dyn: the best alternatives (lambda 0.6, k 96) gain 0.0004-0.0007 on part 1 and nothing on part 0. The no-dyn-tuned weights lose 0.0085-0.0112, confirming that kNN weights are per-configuration (frozen vs adapted model). Closed for 64M; the 32M dyn weights were not run but would sit in the same flat optimum.
+
+### Width test: d=384 vs d=256, novels40 at 16M windows, matched half memory (2026-10-18; `scripts/train_novels40_d384.sh`, `scripts/eval_d384_half.sh`, runs `2026-10-17-novels40-d384-16m`, `2026-10-18-d384-half-memory`)
+
+d=384 (8 heads, d_ff 768, dropout 0.15, lr 0.05 not retuned, 4 blocks; 4.98M parameters vs 2.27M), 16M windows, 7785 s (7.6 ms/step vs 5.0). Its full 125M-key memory does not fit on the 16 GB card (`out of device memory`), so both models were scored with `store=500000` windows (~64M keys) on the fresh split. The d=256 baseline is the seed-1 16M model.
+
+| | part | model alone | no dyn old | no dyn tuned | dyn model alone | dyn |
+|---|---|---|---|---|---|---|
+| d=256 | 0 | 1.1811 | 1.0246 | 1.0208 | 1.0392 | 0.9901 |
+| d=384 | 0 | 1.1499 | 1.0071 | 1.0064 | 1.0106 | **0.9727** |
+| d=256 | 1 | 1.2517 | 1.0601 | 1.0547 | 1.1064 | 1.0291 |
+| d=384 | 1 | 1.2310 | 1.0432 | 1.0405 | 1.0787 | **1.0126** |
+
+d=384 wins every cell by 0.014-0.018 in the stack (dyn: -0.0174 part 0, -0.0165 part 1), 4x the pre-registered 0.004 bar and 8x the seed noise. Width pays far more here than the old round-18 evidence (~0.002 at matched steps on novels6 with the original tiers): the model-alone gain is 0.021-0.031 and the stack keeps most of it, because more data (novels40) and dyn make the extra capacity useful. At half memory, d=256 loses 0.0072 (dyn, part 0: 0.9901 vs 0.9829 at full memory), so d=384 at full memory would likely land near 0.965 (not measured: it does not fit). This d=384 16M model at half memory (0.9727) already beats the d=256 64M model at full memory (0.9765).
+
+Consequences: capacity, not training budget, is the binding lever. Open: whether the 125M-key memory can be made to fit at d=384 (keybits=1, fewer dims in the key, an fp16 key store), d=512 or more blocks, and dyn/kNN retunes for the wider model.
