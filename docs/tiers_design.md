@@ -2162,7 +2162,7 @@ Spread is 0.0015 / 0.0013, under the ~0.002 seed noise measured for d=256. The m
 
 ## d=512 (2026-10-19)
 
-novels40, d=512 (8 heads, d_ff 1024, 4 blocks, dropout 0.15), 16M windows, seed 1 (`scripts/train_eval_d512.sh`, run `d512` in `docs/runs.md`: 10.5 ms/step, 3.0 h). Full memory, `whiten_rank=256`, dyn, old kNN weights:
+novels40, d=512 (8 heads, d_ff 1024, 4 blocks, dropout 0.15), 16M windows, seed 1 (`scripts/train_eval_width.sh 512 8 1024`, run `d512` in `docs/runs.md`: 10.5 ms/step, 3.0 h). Full memory, `whiten_rank=256`, dyn, old kNN weights:
 
 | | model alone | dyn stack | d=384 3-seed mean | gain |
 |---|---|---|---|---|
