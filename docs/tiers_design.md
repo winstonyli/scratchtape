@@ -2170,3 +2170,14 @@ novels40, d=512 (8 heads, d_ff 1024, 4 blocks, dropout 0.15), 16M windows, seed 
 | part 1 | 1.0546 | **0.9928** | 1.0087 | -0.0159 |
 
 New best on both parts, four times the 0.003 bar, from one seed (seed noise ~0.002, so the margin is ~6x noise). The gain from 256 to 384 was 0.014/0.013 and from 384 to 512 is 0.013/0.016: capacity is still the binding lever, with keys fixed at 256 dims. Train-probe CE 0.9923 against 1.0185 at d=384.
+
+## d=640 (2026-10-19)
+
+novels40, d=640 (10 heads, d_ff 1280, 4 blocks), 16M windows, seed 1 (`scripts/train_eval_width.sh 640 10 1280`, run `d640`: 15.45 ms/step, 4.4 h). Full memory, `whiten_rank=256`, dyn, old kNN weights:
+
+| | model alone | dyn stack | d=512 (1 seed) | gain |
+|---|---|---|---|---|
+| part 0 | 0.9757 | **0.9459** | 0.9568 | -0.0109 |
+| part 1 | 1.0385 | **0.9850** | 0.9928 | -0.0078 |
+
+New best on both parts. Gains per 128 of width: 256->384 0.014/0.013, 384->512 0.013/0.016, 512->640 0.011/0.008: still above the 0.003 bar but shrinking on part 1. The memory's saving over the model alone also shrinks (-0.0298 / -0.0535 against -0.0352 / -0.0618 at d=512), so a stronger model leaves the kNN less to add; keys stay 256 dims. Train-probe CE 0.9698. d=768 does not train yet (dispatch limit, `PARKED.md`).
