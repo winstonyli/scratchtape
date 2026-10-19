@@ -2159,3 +2159,14 @@ Seeds 2 and 3 of the d=384 16M-window novels40 model (`scripts/train_d384_seed.s
 | **mean** | **0.9694** | **1.0087** |
 
 Spread is 0.0015 / 0.0013, under the ~0.002 seed noise measured for d=256. The mean beats the d=256 64M model (0.9765 / 1.0131) by 0.0071 / 0.0044 and the d=256 16M two-seed mean (0.9834 / 1.0217) by 0.014 / 0.013, so the width win stands. No-dyn passes were not repeated (the dyn number decides).
+
+## d=512 (2026-10-19)
+
+novels40, d=512 (8 heads, d_ff 1024, 4 blocks, dropout 0.15), 16M windows, seed 1 (`scripts/train_eval_d512.sh`, run `d512` in `docs/runs.md`: 10.5 ms/step, 3.0 h). Full memory, `whiten_rank=256`, dyn, old kNN weights:
+
+| | model alone | dyn stack | d=384 3-seed mean | gain |
+|---|---|---|---|---|
+| part 0 | 0.9920 | **0.9568** | 0.9694 | -0.0126 |
+| part 1 | 1.0546 | **0.9928** | 1.0087 | -0.0159 |
+
+New best on both parts, four times the 0.003 bar, from one seed (seed noise ~0.002, so the margin is ~6x noise). The gain from 256 to 384 was 0.014/0.013 and from 384 to 512 is 0.013/0.016: capacity is still the binding lever, with keys fixed at 256 dims. Train-probe CE 0.9923 against 1.0185 at d=384.
