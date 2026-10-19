@@ -2146,3 +2146,16 @@ Just over the 0.003 pre-registered bar on dyn, but the narrowed keys fit the ful
 New best stack on both parts. Against the previous best: dyn -0.0076 / -0.0046 (d=256, 64M windows: 0.9765 / 1.0131), no dyn tuned -0.0105 / -0.0085 (d=256 16M: 1.0094 / 1.0406). Full memory gains 0.0069 / 0.0090 over the narrowed half-memory d=384, as estimated from d=256 (~0.007). The d=384 model needed 7785 s and 16M windows, against 10218 s more on top of 32M for the 64M d=256 model.
 
 **Rank 320 does not fit:** 12.63 GB in use, then `out of device memory allocating 134217728 bytes` in the search (both parts, both modes) and a host `memory allocation of 501486080 bytes failed` once; the card's usable limit is between 10.6 and 12.6 GB. Rank 288 (~11.6 GB) is untried.
+
+## d=384 seed repeat (2026-10-18)
+
+Seeds 2 and 3 of the d=384 16M-window novels40 model (`scripts/train_d384_seed.sh`, run together on the eGPU: 12.8-12.9 ms/step each against 7.4 solo, so ~14% more throughput than running them one after the other), evaluated at full memory, `whiten_rank=256`, dyn, old kNN weights (`scripts/eval_d384_seeds.sh`; runs `d384-seed2`, `d384-seed3`, `d384-seed-evals` in `docs/runs.md`):
+
+| dyn stack | part 0 | part 1 |
+|---|---|---|
+| seed 1 | 0.9689 | 1.0085 |
+| seed 2 | 0.9704 | 1.0094 |
+| seed 3 | 0.9690 | 1.0081 |
+| **mean** | **0.9694** | **1.0087** |
+
+Spread is 0.0015 / 0.0013, under the ~0.002 seed noise measured for d=256. The mean beats the d=256 64M model (0.9765 / 1.0131) by 0.0071 / 0.0044 and the d=256 16M two-seed mean (0.9834 / 1.0217) by 0.014 / 0.013, so the width win stands. No-dyn passes were not repeated (the dyn number decides).
