@@ -2184,7 +2184,7 @@ New best on both parts. Gains per 128 of width: 256->384 0.014/0.013, 384->512 0
 
 ## d=512 with 6 blocks (2026-10-20)
 
-novels40, d=512, 8 heads, d_ff 1024, **6 blocks** (4 in the width runs), dropout 0.15, 16M windows, seed 1 (`scripts/train_eval_width.sh 512 8 1024 1 6`, run `d512-b6`: 15.9 ms/step, 4.5 h; part 0 eval reran as `d512-b6-p0-rerun` via `scripts/eval_width_part.sh` after a host `memory allocation failed` in setup). Full memory, `whiten_rank=256`, dyn, old kNN weights:
+novels40, d=512, 8 heads, d_ff 1024, **6 blocks** (4 in the width runs), dropout 0.15, 16M windows, seed 1 (`scripts/train_eval_width.sh 512 8 1024 1 6`, run `d512-b6`: 15.9 ms/step, 4.5 h; part 0 eval reran as `d512-b6-p0-rerun` (then `eval_width_part.sh`, now `PARTS=0 scripts/train_eval_width.sh`) after a host `memory allocation failed` in setup). Full memory, `whiten_rank=256`, dyn, old kNN weights:
 
 | | model alone | dyn stack | d=640, 4 blocks | d=512, 4 blocks |
 |---|---|---|---|---|
