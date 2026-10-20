@@ -27,3 +27,15 @@ tiers() { local w; for w in "$@"; do printf 'tier=lexicon:0.2+words:1:0.1+knn:%s
 tev_begin() { TEV_BEFORE=$(ls runs/memcache); }
 tev_end() { local f; for f in $(ls runs/memcache); do echo "$TEV_BEFORE" | grep -qx "$f" || rm -f "runs/memcache/$f"; done; }
 tev() { local log=$1 ck=$2; shift 2; $E $ck $EVB store=${STORE:-1000000} "$@" > runs/$log.log 2>&1; }
+
+# train16 NAME [key=value ...]: the seq-128 fresh-split recipe (novels40, d_model 256, d_ff 512, 16.38M windows, batch 16, lr 0.05, f16, lr
+# constant after a 3200-window warmup); key=value arguments override the defaults and may add keys (heads=, blocks=, seed=, init=, ...).
+# fused_models_check rejects a key given twice, hence the merge here.
+train16() {
+  local name=$1; shift
+  local -A kv=([windows]=16384000 [dropout]=0.1 [weight_decay]=0.0002 [warmup_windows]=3200 [momentum]=0.9 [seq]=128 [score_tail]=32 [d_model]=256 [d_ff]=512 [corpus]=novels40)
+  local a k args=()
+  for a in "$@"; do kv[${a%%=*}]=${a#*=}; done
+  for k in "${!kv[@]}"; do args+=("$k=${kv[$k]}"); done
+  TRAIN_F16=1 fmc $name 1 16 0.05 "${args[@]}"
+}
