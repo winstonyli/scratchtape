@@ -23,9 +23,20 @@ pub use profile::{host_profile_cut, host_profile_start, host_profile_take, profi
 /// Units per cube for 1-D elementwise kernels.
 const EW_DIM: u32 = 256;
 
+/// A dispatch dimension holds at most this many groups (wgpu validation).
+const MAX_GROUPS: u32 = 65535;
+
+/// The (x, y) grid for `groups` cubes: x while it fits, else folded into y with fewer than y spare cubes. Kernels index with
+/// ABSOLUTE_POS, which cubecl linearizes over x and y, and bound-check it against their length.
+fn grid(groups: u32) -> (u32, u32) {
+    let y = groups.div_ceil(MAX_GROUPS).max(1);
+    (groups.div_ceil(y), y)
+}
+
 /// Cubes for a 1-D elementwise kernel over `units` elements (EW_DIM units each).
 fn cubes(units: usize) -> CubeCount {
-    CubeCount::Static((units as u32).div_ceil(EW_DIM), 1, 1)
+    let (x, y) = grid((units as u32).div_ceil(EW_DIM));
+    CubeCount::Static(x, y, 1)
 }
 
 static CLIENT: OnceLock<Client> = OnceLock::new();
@@ -310,6 +321,33 @@ mod tests {
     use crate::nn::Rng;
     use crate::optim::Sgd;
     use crate::tensor::NdArray;
+
+    /// `grid` leaves launches at or under the limit as they were (x only) and covers every group above it within the limit.
+    #[test]
+    fn grid_folds_only_past_the_dispatch_limit() {
+        assert_eq!(grid(0), (0, 1));
+        assert_eq!(grid(1), (1, 1));
+        assert_eq!(grid(MAX_GROUPS), (MAX_GROUPS, 1));
+        for g in [MAX_GROUPS + 1, 66_997, 75_787, 200_000, 5_000_000] {
+            let (x, y) = grid(g);
+            assert!(x <= MAX_GROUPS && y <= MAX_GROUPS, "{g}: ({x}, {y})");
+            assert!(x * y >= g && x * y - g < y, "{g}: ({x}, {y}) spare cubes");
+        }
+    }
+
+    /// Needs the discrete GPU. A parameter vector past 65535 * EW_DIM elements (the size of an 8-block d=512 model) trains: one
+    /// SGD step reaches the first and the very last element.
+    #[test]
+    #[ignore = "needs the discrete GPU"]
+    fn sgd_past_the_dispatch_limit_reaches_every_parameter() {
+        let n = 67_000 * EW_DIM as usize + 5;
+        let dev = DeviceParams::upload(&vec![1.0f32; n]);
+        let ones = upload_f32(&vec![1.0f32; n]);
+        let dev = DeviceParams { grads: ones, ..dev };
+        dev.sgd(0.5);
+        let got = dev.read(&dev.params);
+        assert!(got.iter().all(|&v| v == 0.5), "{} of {n} not updated", got.iter().filter(|&&v| v != 0.5).count());
+    }
 
     /// Needs the discrete GPU. Three models of 5 parameters average to
     /// their elementwise mean, in every model's slot.

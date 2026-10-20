@@ -2180,7 +2180,7 @@ novels40, d=640 (10 heads, d_ff 1280, 4 blocks), 16M windows, seed 1 (`scripts/t
 | part 0 | 0.9757 | **0.9459** | 0.9568 | -0.0109 |
 | part 1 | 1.0385 | **0.9850** | 0.9928 | -0.0078 |
 
-New best on both parts. Gains per 128 of width: 256->384 0.014/0.013, 384->512 0.013/0.016, 512->640 0.011/0.008: still above the 0.003 bar but shrinking on part 1. The memory's saving over the model alone also shrinks (-0.0298 / -0.0535 against -0.0352 / -0.0618 at d=512), so a stronger model leaves the kNN less to add; keys stay 256 dims. Train-probe CE 0.9698. d=768 does not train yet (dispatch limit, `PARKED.md`).
+New best on both parts. Gains per 128 of width: 256->384 0.014/0.013, 384->512 0.013/0.016, 512->640 0.011/0.008: still above the 0.003 bar but shrinking on part 1. The memory's saving over the model alone also shrinks (-0.0298 / -0.0535 against -0.0352 / -0.0618 at d=512), so a stronger model leaves the kNN less to add; keys stay 256 dims. Train-probe CE 0.9698. d=768 did not train until 2026-10-20 (dispatch limit, fixed in `cubes()` in `src/gpu_step/mod.rs`; see the d=512 8-block entry).
 
 ## d=512 with 6 blocks (2026-10-20)
 
@@ -2192,3 +2192,7 @@ novels40, d=512, 8 heads, d_ff 1024, **6 blocks** (4 in the width runs), dropout
 | part 1 | 1.0279 | **0.9820** | 0.9850 | 0.9928 |
 
 New best on both parts: -0.0050 / -0.0030 against d=640 and -0.0159 / -0.0108 against the same-width 4-block model, at 15.9 ms/step (d=640: 15.45, d=512 4 blocks: 10.5). The model alone gains more than the stack (0.9652 vs 0.9757 for d=640) because the kNN saving keeps shrinking (-0.0243 / -0.0459). Train-probe CE 0.9567. Depth beat width at matched step cost, by 0.003-0.005 (seed noise ~0.002, one seed each), so depth is the better next lever than d=768.
+
+## GPU dispatch limit fixed (2026-10-20)
+
+8 blocks at d=512 (and d=768 at 4 blocks) failed on the first step: `cubes()` in `src/gpu_step/mod.rs` launched 1-D elementwise kernels as one dispatch dimension of `ceil(units/256)` groups, and wgpu caps a dimension at 65535, so any model over about 16.7M parameters (the optimizer update over all parameters) was rejected (66,997 groups at 8 blocks, 75,787 at d=768). `cubes()` now folds into y past the limit through `grid()`; kernels index with `ABSOLUTE_POS`, which cubecl linearizes over x and y (`cubecl-spirv` `cube_pos()`), and all 23 call sites bound-check it. Tests: `grid_folds_only_past_the_dispatch_limit` (CPU) and the ignored GPU test `sgd_past_the_dispatch_limit_reaches_every_parameter` (67,000 groups, first and last element updated). Launches at or under the limit are unchanged (x only). Run `d512-b8-2`: 20.2 ms/step.
