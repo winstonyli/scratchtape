@@ -75,3 +75,4 @@ Deferred work moved to `PARKED.md` (2026-10-17); entries below that were pure de
 - **Update (2026-10-18): d=384 seed repeat.** Three seeds, dyn stack mean 0.9694 / 1.0087 (spread <0.0015); width win confirmed. Open: d=512 / more blocks, longer d=384.
 - **Update (2026-10-19): d=512.** One seed, dyn stack 0.9568 / 0.9928 (-0.013 / -0.016 vs the d=384 mean); width still pays. Open: d=640+ / more blocks, seed repeat of d=512.
 - **Update (2026-10-19): d=640.** One seed, dyn stack 0.9459 / 0.9850 (-0.011 / -0.008 vs d=512); gains are shrinking but still above the bar. Open: d=768 (dispatch limit parked), more blocks, seeds.
+- **Update (2026-10-20): depth.** d=512 with 6 blocks: dyn stack 0.9409 / 0.9820, best so far (-0.005 / -0.003 vs d=640 at the same step cost). Open: 8 blocks or d=640 with 6, 32M continuation, key width, seeds.

@@ -2181,3 +2181,14 @@ novels40, d=640 (10 heads, d_ff 1280, 4 blocks), 16M windows, seed 1 (`scripts/t
 | part 1 | 1.0385 | **0.9850** | 0.9928 | -0.0078 |
 
 New best on both parts. Gains per 128 of width: 256->384 0.014/0.013, 384->512 0.013/0.016, 512->640 0.011/0.008: still above the 0.003 bar but shrinking on part 1. The memory's saving over the model alone also shrinks (-0.0298 / -0.0535 against -0.0352 / -0.0618 at d=512), so a stronger model leaves the kNN less to add; keys stay 256 dims. Train-probe CE 0.9698. d=768 does not train yet (dispatch limit, `PARKED.md`).
+
+## d=512 with 6 blocks (2026-10-20)
+
+novels40, d=512, 8 heads, d_ff 1024, **6 blocks** (4 in the width runs), dropout 0.15, 16M windows, seed 1 (`scripts/train_eval_width.sh 512 8 1024 1 6`, run `d512-b6`: 15.9 ms/step, 4.5 h; part 0 eval reran as `d512-b6-p0-rerun` via `scripts/eval_width_part.sh` after a host `memory allocation failed` in setup). Full memory, `whiten_rank=256`, dyn, old kNN weights:
+
+| | model alone | dyn stack | d=640, 4 blocks | d=512, 4 blocks |
+|---|---|---|---|---|
+| part 0 | 0.9652 | **0.9409** | 0.9459 | 0.9568 |
+| part 1 | 1.0279 | **0.9820** | 0.9850 | 0.9928 |
+
+New best on both parts: -0.0050 / -0.0030 against d=640 and -0.0159 / -0.0108 against the same-width 4-block model, at 15.9 ms/step (d=640: 15.45, d=512 4 blocks: 10.5). The model alone gains more than the stack (0.9652 vs 0.9757 for d=640) because the kNN saving keeps shrinking (-0.0243 / -0.0459). Train-probe CE 0.9567. Depth beat width at matched step cost, by 0.003-0.005 (seed noise ~0.002, one seed each), so depth is the better next lever than d=768.
