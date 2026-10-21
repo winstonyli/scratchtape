@@ -2266,3 +2266,5 @@ The 8-block model gains 2.5x what the 6-block model did (-0.004), d=640 gains no
 | `128:0.4:40:7:100` | 0.9730 | 0.9322 |
 
 A plateau: the best is within 0.0002 of the 6-block weights, every other setting is within 0.002 on both parts. The 8-block weights stay `128:0.4:30:7:100` (no change above the bar). The large 8-block gain over the old weights (-0.010) is therefore not a grid artifact, but the old-weights baseline was still not rerun.
+
+**8-block old-weights rerun** (run `dynknn-b8-old`, logs `n40_d512_b8_dynknn_old_p*`): `128:0.5:30:15:100` with dyn gives 0.9413 / 0.9821 (parts 0 / 1), identical to the original baseline to four places. So the 8-block gain from `128:0.4:30:7:100` (-0.0096 / -0.0106) is real, not a baseline artifact. The kNN saving over the model alone is 0.0170 / 0.0358 at the old weights and 0.0265 / 0.0464 at the new ones: the old weights under-used the memory for this model.
