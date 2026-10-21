@@ -2196,3 +2196,14 @@ New best on both parts: -0.0050 / -0.0030 against d=640 and -0.0159 / -0.0108 ag
 ## GPU dispatch limit fixed (2026-10-20)
 
 8 blocks at d=512 (and d=768 at 4 blocks) failed on the first step: `cubes()` in `src/gpu_step/mod.rs` launched 1-D elementwise kernels as one dispatch dimension of `ceil(units/256)` groups, and wgpu caps a dimension at 65535, so any model over about 16.7M parameters (the optimizer update over all parameters) was rejected (66,997 groups at 8 blocks, 75,787 at d=768). `cubes()` now folds into y past the limit through `grid()`; kernels index with `ABSOLUTE_POS`, which cubecl linearizes over x and y (`cubecl-spirv` `cube_pos()`), and all 23 call sites bound-check it. Tests: `grid_folds_only_past_the_dispatch_limit` (CPU) and the ignored GPU test `sgd_past_the_dispatch_limit_reaches_every_parameter` (67,000 groups, first and last element updated). Launches at or under the limit are unchanged (x only). Run `d512-b8-2`: 20.2 ms/step.
+
+## d=512 with 8 blocks: the stack saturates (2026-10-21)
+
+novels40, d=512, 8 heads, d_ff 1024, **8 blocks**, dropout 0.15, 16M windows, seed 1 (`scripts/train_eval_width.sh 512 8 1024 1 8`, run `d512-b8-2`: 22.3 ms/step, 6.3 h, ~17M parameters; first possible after the dispatch fix). Full memory, `whiten_rank=256`, dyn, old kNN weights:
+
+| | model alone | dyn stack | 6 blocks | 4 blocks |
+|---|---|---|---|---|
+| part 0 | 0.9582 | **0.9413** | 0.9409 | 0.9568 |
+| part 1 | 1.0179 | **0.9821** | 0.9820 | 0.9928 |
+
+The stack is a tie with 6 blocks (+0.0004 / +0.0001, far under the ~0.002 seed noise) while the model alone keeps improving (0.9582 / 1.0179 against 0.9652 / 1.0279; held-out CE 1.0413, train-probe 0.9401). The kNN saving shrinks in step (-0.0170 / -0.0358 against -0.0243 / -0.0459): the extra capacity learns what the memory already supplied. Depth stops paying in the stack at 6 blocks at d=512; the stack, not the model, is now the limit, so further model-only scaling is unlikely to move it. Candidates that change what the memory sees (key width above 256 dims, retuned kNN weights for these stronger models, a longer budget) are next.
