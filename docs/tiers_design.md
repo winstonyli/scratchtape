@@ -2240,3 +2240,14 @@ Lowering temp_doc to 10 helps both parts (-0.0033 / -0.0029), right at the 0.003
 | `128:0.45:30:7:100` | 0.9781 | 0.9369 |
 
 The surface is flat past temp_doc 10 (all within 0.0006 on part 1, 0.0014 on part 0). Best `128:0.4:30:7:100` against the old weights: **-0.0038 on part 1 (tuned there) and -0.0043 on part 0 (validation)**, over the 0.003 bar on both. New best stack for the 6-block d=512 model: dyn **0.9782 / 0.9366** (was 0.9820 / 0.9409). Whether the 8-block model, d=640 and the 64M d=256 model also want these weights was not tested (the 64M d=256 model did not).
+
+### The 6-block weights `128:0.4:30:7:100` on the 8-block and d=640 models (runs `dynknn-b8-d640`, `dynknn-d640`)
+
+Dyn stack, full memory, `whiten_rank=256`, parts 0 / 1 (the d=640 first attempt died on a brief eGPU dropout and was rerun):
+
+| model | old weights | new weights | change |
+|---|---|---|---|
+| d=512, 8 blocks | 0.9413 / 0.9821 | **0.9317 / 0.9715** | -0.0096 / -0.0106 |
+| d=640, 4 blocks | 0.9459 / 0.9850 | 0.9445 / 0.9846 | -0.0014 / -0.0004 |
+
+The 8-block model gains 2.5x what the 6-block model did (-0.004), d=640 gains nothing; the retune does not transfer uniformly, so each model wants its own grid. The 8-block stack (0.9317 / 0.9715) is the best so far, ~0.005 under the 6-block stack with its tuned weights. The 8-block old-weights baseline was not rerun; the gap is larger than the 6-block gain, so a rerun would confirm it is not a baseline artifact.
