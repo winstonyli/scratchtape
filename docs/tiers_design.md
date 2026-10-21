@@ -2251,3 +2251,18 @@ Dyn stack, full memory, `whiten_rank=256`, parts 0 / 1 (the d=640 first attempt 
 | d=640, 4 blocks | 0.9459 / 0.9850 | 0.9445 / 0.9846 | -0.0014 / -0.0004 |
 
 The 8-block model gains 2.5x what the 6-block model did (-0.004), d=640 gains nothing; the retune does not transfer uniformly, so each model wants its own grid. The 8-block stack (0.9317 / 0.9715) is the best so far, ~0.005 under the 6-block stack with its tuned weights. The 8-block old-weights baseline was not rerun; the gap is larger than the 6-block gain, so a rerun would confirm it is not a baseline artifact.
+
+**8-block kNN grid** (run `dynknn-b8-grid`, logs `n40_d512_b8_dynknn_g1_p*`; dyn, part 1 / part 0):
+
+| weights | part 1 | part 0 |
+|---|---|---|
+| `128:0.4:30:7:100` (previous) | 0.9715 | 0.9317 |
+| `128:0.4:30:5:100` | **0.9713** | **0.9315** |
+| `128:0.4:30:10:100` | 0.9732 | 0.9332 |
+| `128:0.3:30:7:100` | 0.9729 | 0.9323 |
+| `128:0.5:30:7:100` | 0.9721 | 0.9330 |
+| `128:0.3:30:5:100` | 0.9727 | 0.9321 |
+| `128:0.4:30:3:100` | 0.9720 | 0.9320 |
+| `128:0.4:40:7:100` | 0.9730 | 0.9322 |
+
+A plateau: the best is within 0.0002 of the 6-block weights, every other setting is within 0.002 on both parts. The 8-block weights stay `128:0.4:30:7:100` (no change above the bar). The large 8-block gain over the old weights (-0.010) is therefore not a grid artifact, but the old-weights baseline was still not rerun.
