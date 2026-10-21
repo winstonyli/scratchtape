@@ -2207,3 +2207,36 @@ novels40, d=512, 8 heads, d_ff 1024, **8 blocks**, dropout 0.15, 16M windows, se
 | part 1 | 1.0179 | **0.9821** | 0.9820 | 0.9928 |
 
 The stack is a tie with 6 blocks (+0.0004 / +0.0001, far under the ~0.002 seed noise) while the model alone keeps improving (0.9582 / 1.0179 against 0.9652 / 1.0279; held-out CE 1.0413, train-probe 0.9401). The kNN saving shrinks in step (-0.0170 / -0.0358 against -0.0243 / -0.0459): the extra capacity learns what the memory already supplied. Depth stops paying in the stack at 6 blocks at d=512; the stack, not the model, is now the limit, so further model-only scaling is unlikely to move it. Candidates that change what the memory sees (key width above 256 dims, retuned kNN weights for these stronger models, a longer budget) are next.
+
+## kNN weights under dyn for the 6-block d=512 model, round 1 (2026-10-21)
+
+Run `dynknn-b6` (`scripts/dyn_knn_b6.sh`, the 64M grid of `scripts/dyn_knn_64m.sh`, 33 min, one memory build, `whiten_rank=256`, dyn). Weights are k:lambda:temp:temp_doc:shift; the old weights are `128:0.5:30:15:100`. (The raw log was overwritten by round 2, which reused its name; these are the numbers as read.)
+
+| weights | part 1 | part 0 |
+|---|---|---|
+| `128:0.5:30:15:100` (old) | 0.9820 | 0.9409 |
+| `128:0.4:30:15:100` | 0.9811 | 0.9393 |
+| `128:0.6:30:15:100` | 0.9850 | 0.9443 |
+| `128:0.5:30:10:100` | **0.9787** | **0.9380** |
+| `128:0.5:30:20:100` | 0.9888 | 0.9466 |
+| `128:0.5:24:15:100` | 0.9868 | 0.9464 |
+| `128:0.5:40:15:100` | 0.9821 | 0.9398 |
+| `128:0.8:30:22:100` (tuned no dyn) | 1.0142 | 0.9709 |
+| `96:0.5:30:15:100` | 0.9820 | 0.9414 |
+
+Lowering temp_doc to 10 helps both parts (-0.0033 / -0.0029), right at the 0.003 bar; temp_doc 20 hurts. Unlike the 64M d=256 model, the old weights are not optimal here.
+
+**Round 2** (run `dynknn-b6-r2`, ~30 min; same memory, dyn): exploring below temp_doc 10.
+
+| weights | part 1 | part 0 |
+|---|---|---|
+| `128:0.5:30:10:100` (round 1 best) | 0.9787 | 0.9380 |
+| `128:0.5:30:7:100` | 0.9786 | 0.9377 |
+| `128:0.5:30:5:100` | 0.9793 | 0.9382 |
+| `128:0.5:30:3:100` | 0.9806 | 0.9391 |
+| `128:0.4:30:10:100` | 0.9783 | 0.9368 |
+| `128:0.4:30:7:100` | **0.9782** | **0.9366** |
+| `128:0.4:30:5:100` | 0.9787 | 0.9369 |
+| `128:0.45:30:7:100` | 0.9781 | 0.9369 |
+
+The surface is flat past temp_doc 10 (all within 0.0006 on part 1, 0.0014 on part 0). Best `128:0.4:30:7:100` against the old weights: **-0.0038 on part 1 (tuned there) and -0.0043 on part 0 (validation)**, over the 0.003 bar on both. New best stack for the 6-block d=512 model: dyn **0.9782 / 0.9366** (was 0.9820 / 0.9409). Whether the 8-block model, d=640 and the 64M d=256 model also want these weights was not tested (the 64M d=256 model did not).
