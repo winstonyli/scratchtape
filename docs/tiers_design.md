@@ -2295,3 +2295,17 @@ A plateau: the best is within 0.0002 of the 6-block weights, every other setting
 | `128:0.4:40:7:100` | 0.9684 | 0.9269 |
 
 Best `128:0.4:30:5:100` is -0.0012 / -0.0011 against the previous weights: under the 0.003 bar, a plateau for `temp_doc` 3-5. The 10-block weights stay `128:0.4:30:7:100`; the stack is 0.9276 / 0.9682 (0.9265 / 0.9670 at the plateau's edge). Retuned weights therefore do not change the 8 -> 10 block comparison (both used the same weights).
+
+### d=512 with 12 blocks (run `d512-b12`, 2026-10-22/23): depth saturates
+
+`scripts/train_eval_width.sh 512 8 1024 1 12` with `W=128:0.4:30:7:100`, 16M windows, seed 1, ~30 ms/step. Full memory, `whiten_rank=256`, dyn (parts 0 / 1):
+
+| blocks | alone | dyn stack | stack change vs previous |
+|---|---|---|---|
+| 8 | 0.9582 / 1.0179 | 0.9317 / 0.9715 | -0.0096 / -0.0106 (weights retune) |
+| 10 | 0.9497 / 1.0100 | 0.9276 / 0.9682 | -0.0041 / -0.0033 |
+| 12 | 0.9469 / 1.0063 | **0.9259 / 0.9669** | -0.0017 / -0.0013 |
+
+12 vs 10 blocks: stack -0.0017 / -0.0013, under the 0.003 bar on both parts (within seed noise); model alone -0.0028 / -0.0037. Depth saturates in the stack at 10 blocks, as width did at d=640 and model size did at 8 blocks under the old weights. The kNN saving over the model alone keeps shrinking (0.0210 / 0.0395 at 12 blocks).
+
+The half-budget proxy overpredicted: the 12-block mean model-alone CE over steps 496000-528000 was 1.0511 vs 1.0577 for 10 blocks (-0.0066), but the final model-alone gap was only -0.0028 / -0.0037. Mid-run rows at 8M windows do not predict the final gain; the 10-block run's 8M gap (-0.0038 vs 8 blocks) was also half its final one, in the other direction. Treat 8M-window rows as a sign test only.
