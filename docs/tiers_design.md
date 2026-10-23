@@ -2280,3 +2280,18 @@ A plateau: the best is within 0.0002 of the 6-block weights, every other setting
 | d=512 | 10 (same weights, no grid) | 0.9497 / 1.0100 | **0.9276 / 0.9682** |
 
 10 vs 8 blocks: stack -0.0041 / -0.0033 (both over the 0.003 bar, by 0.0003-0.0011, one seed each, seed noise ~0.002); model alone -0.0085 / -0.0079. The kNN saving over the model alone shrinks again (0.0265 -> 0.0221 on part 0, 0.0464 -> 0.0418 on part 1), so the stack gets about half of the model's gain. Depth still pays but at a shrinking rate: 6 -> 8 blocks gave -0.005 / -0.007, 8 -> 10 gives -0.004 / -0.003. Training step cost grew from 22.3 ms (8 blocks) to roughly 28 ms (10 blocks, contended). The weights were not regridded for 10 blocks.
+
+**10-block kNN grid** (run `dynknn-b10-grid`, logs `n40_d512_b10_dynknn_g1_p*`; dyn, part 1 / part 0):
+
+| weights | part 1 | part 0 |
+|---|---|---|
+| `128:0.4:30:7:100` (previous) | 0.9682 | 0.9276 |
+| `128:0.4:30:5:100` | **0.9670** | 0.9265 |
+| `128:0.4:30:10:100` | 0.9722 | 0.9311 |
+| `128:0.3:30:7:100` | 0.9687 | 0.9272 |
+| `128:0.5:30:7:100` | 0.9697 | 0.9297 |
+| `128:0.3:30:5:100` | 0.9678 | **0.9264** |
+| `128:0.4:30:3:100` | 0.9671 | 0.9265 |
+| `128:0.4:40:7:100` | 0.9684 | 0.9269 |
+
+Best `128:0.4:30:5:100` is -0.0012 / -0.0011 against the previous weights: under the 0.003 bar, a plateau for `temp_doc` 3-5. The 10-block weights stay `128:0.4:30:7:100`; the stack is 0.9276 / 0.9682 (0.9265 / 0.9670 at the plateau's edge). Retuned weights therefore do not change the 8 -> 10 block comparison (both used the same weights).
