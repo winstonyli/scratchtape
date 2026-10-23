@@ -2268,3 +2268,15 @@ The 8-block model gains 2.5x what the 6-block model did (-0.004), d=640 gains no
 A plateau: the best is within 0.0002 of the 6-block weights, every other setting is within 0.002 on both parts. The 8-block weights stay `128:0.4:30:7:100` (no change above the bar). The large 8-block gain over the old weights (-0.010) is therefore not a grid artifact, but the old-weights baseline was still not rerun.
 
 **8-block old-weights rerun** (run `dynknn-b8-old`, logs `n40_d512_b8_dynknn_old_p*`): `128:0.5:30:15:100` with dyn gives 0.9413 / 0.9821 (parts 0 / 1), identical to the original baseline to four places. So the 8-block gain from `128:0.4:30:7:100` (-0.0096 / -0.0106) is real, not a baseline artifact. The kNN saving over the model alone is 0.0170 / 0.0358 at the old weights and 0.0265 / 0.0464 at the new ones: the old weights under-used the memory for this model.
+
+### d=512 with 10 blocks (run `d512-b10`, 2026-10-21/22)
+
+`scripts/train_eval_width.sh 512 8 1024 1 10` with `W=128:0.4:30:7:100`, novels40, 16M windows, seed 1. The first run died at step 382000 (machine rebooted unexpectedly twice, 20:46 and 21:00; no cause found) and was resumed from the step-379000 `.resume`. Full memory, `whiten_rank=256`, dyn (parts 0 / 1):
+
+| model | blocks | alone | dyn stack |
+|---|---|---|---|
+| d=512 | 6 (tuned weights) | - | 0.9366 / 0.9782 |
+| d=512 | 8 (tuned weights) | 0.9582 / 1.0179 | 0.9317 / 0.9715 |
+| d=512 | 10 (same weights, no grid) | 0.9497 / 1.0100 | **0.9276 / 0.9682** |
+
+10 vs 8 blocks: stack -0.0041 / -0.0033 (both over the 0.003 bar, by 0.0003-0.0011, one seed each, seed noise ~0.002); model alone -0.0085 / -0.0079. The kNN saving over the model alone shrinks again (0.0265 -> 0.0221 on part 0, 0.0464 -> 0.0418 on part 1), so the stack gets about half of the model's gain. Depth still pays but at a shrinking rate: 6 -> 8 blocks gave -0.005 / -0.007, 8 -> 10 gives -0.004 / -0.003. Training step cost grew from 22.3 ms (8 blocks) to roughly 28 ms (10 blocks, contended). The weights were not regridded for 10 blocks.
